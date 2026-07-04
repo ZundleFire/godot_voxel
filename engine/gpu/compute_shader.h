@@ -5,6 +5,8 @@
 #include "../../util/godot/core/string.h"
 #include "../../util/memory/memory.h"
 
+#include <atomic>
+
 ZN_GODOT_FORWARD_DECLARE(class RenderingDevice)
 
 namespace zylann::voxel {
@@ -50,8 +52,21 @@ public:
 	// Only use on GPU task thread
 	RID get_rid() const;
 
+	// Thread-safe: returns true once the GPU thread has finished compiling (whether it succeeded or failed).
+	bool is_compilation_complete() const {
+		return _compilation_complete.load(std::memory_order_acquire);
+	}
+
+	// Thread-safe: returns true if compilation completed AND the shader RID is valid.
+	// Always returns false before compilation is complete.
+	bool is_valid() const {
+		return _compilation_succeeded.load(std::memory_order_acquire);
+	}
+
 private:
 	ComputeShaderInternal _internal;
+	std::atomic<bool> _compilation_complete{ false };
+	std::atomic<bool> _compilation_succeeded{ false };
 };
 
 } // namespace zylann::voxel

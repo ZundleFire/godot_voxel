@@ -35,20 +35,16 @@ TaskPriority PriorityDependency::evaluate(uint8_t lod_index, uint8_t band2_prior
 	// which led blocks to subdivide too much compared to their neighbors, making cracks more likely to happen
 	const int distance = static_cast<int>(Math::sqrt(closest_distance_sq));
 
-	// TODO Prioritizing LOD makes generation slower... but not prioritizing makes cracks more likely to appear...
-	// This could be fixed by allowing the volume to preemptively request blocks of the next LOD?
-	//
-	// Higher lod indexes come first to allow the octree to subdivide.
-	// Then comes distance, which is modified by how much in view the block is
-	// priority += (constants::MAX_LOD - lod_index) * 10000;
-
 	// Closer is higher priority. Decreases over distance.
 	// Scaled by LOD because we segment priority by LOD too in band 1.
 	priority.band0 = math::max(TaskPriority::BAND_MAX - math::arithmetic_rshift(distance, 4 + lod_index), 0);
-	// Note: in the past, making lower LOD indices (aka closer detailed ones) have higher priority made cracks between
-	// meshes more likely to appear somehow, so for a while I had it inverted. But that priority makes sense so I
-	// changed it back. Will see later if that really causes any issue.
-	priority.band1 = constants::MAX_LOD - lod_index;
+	// Higher LOD indices (coarser) get higher band1 priority so the LOD cascade can proceed
+	// top-down: LOD_max loads first, then the subdivision cascade activates finer LODs progressively.
+	// In clipbox streaming, a child LOD can only become visible after its parent is active and all 8
+	// siblings are loaded, so coarser LODs must be prioritized to avoid stalling the cascade.
+	// The previous approach (LOD0 = highest) caused LOD0 data/mesh to load first but remain invisible
+	// because the cascade hadn't reached it yet from the root, leading to "LOD0 never arrives".
+	priority.band1 = lod_index;
 	priority.band2 = band2_priority;
 	priority.band3 = constants::TASK_PRIORITY_BAND3_DEFAULT;
 

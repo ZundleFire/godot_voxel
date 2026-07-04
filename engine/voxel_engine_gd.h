@@ -40,6 +40,12 @@ public:
 
 	int get_thread_count() const;
 	void set_thread_count(int count);
+	int get_hardware_thread_count() const;
+	int get_generation_thread_count() const;
+	void set_generation_thread_count(int count);
+
+	int get_main_thread_time_budget_usec() const;
+	void set_main_thread_time_budget_usec(int usec);
 
 #ifdef TOOLS_ENABLED
 	void set_editor_camera_info(Vector3 position, Vector3 direction);

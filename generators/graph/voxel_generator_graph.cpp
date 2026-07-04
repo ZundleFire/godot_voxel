@@ -5,7 +5,11 @@
 #include "../../util/containers/container_funcs.h"
 #include "../../util/godot/classes/engine.h"
 #include "../../util/godot/classes/image.h"
+#include "../../util/godot/classes/material.h"
 #include "../../util/godot/classes/object.h"
+#include "../../util/godot/classes/shader.h"
+#include "../../util/godot/classes/shader_material.h"
+#include "../../util/godot/classes/standard_material_3d.h"
 #include "../../util/godot/core/array.h"
 #include "../../util/godot/core/packed_arrays.h"
 #include "../../util/godot/core/string.h"
@@ -19,6 +23,10 @@
 #include "../../util/string/format.h"
 #include "node_type_db.h"
 #include "voxel_graph_function.h"
+#include "voxel_graph_shader_generator.h"
+
+#include <functional>
+#include <unordered_map>
 
 namespace zylann::voxel {
 
@@ -43,6 +51,7 @@ VoxelGeneratorGraph::Cache &VoxelGeneratorGraph::get_tls_cache() {
 void VoxelGeneratorGraph::clear() {
 	ERR_FAIL_COND(_main_function.is_null());
 	_main_function->clear();
+	_final_material.unref();
 
 	{
 		RWLockWrite wlock(_runtime_lock);
@@ -52,6 +61,10 @@ void VoxelGeneratorGraph::clear() {
 
 Ref<pg::VoxelGraphFunction> VoxelGeneratorGraph::get_main_function() const {
 	return _main_function;
+}
+
+Ref<Material> VoxelGeneratorGraph::get_final_material() const {
+	return _final_material;
 }
 
 bool VoxelGeneratorGraph::is_using_optimized_execution_map() const {
@@ -338,6 +351,1202 @@ void VoxelGeneratorGraph::gather_texturing_data_from_weight_outputs(
 }
 
 namespace {
+
+static const char *AUTO_SPATIAL_MATERIAL_SHADER = R"SHADER(shader_type spatial;
+render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
+
+uniform int u_transition_mask;
+uniform vec2 u_lod_fade;
+uniform bool u_auto_material_use_flat_shading = true;
+uniform vec4 u_auto_material_albedo[16];
+uniform vec4 u_auto_material_emission[16];
+uniform float u_auto_material_roughness[16];
+uniform float u_auto_material_metallic[16];
+uniform float u_auto_material_specular[16];
+
+varying flat vec4 v_indices;
+varying vec4 v_weights;
+varying vec3 v_auto_material_world_pos;
+
+float get_transvoxel_secondary_factor(int idata) {
+	int transition_mask = u_transition_mask & 0xff;
+	int cell_border_mask = idata & 63;
+	int vertex_border_mask = (idata >> 8) & 63;
+	int m = transition_mask & cell_border_mask;
+	float t = float(m != 0);
+	t *= float((vertex_border_mask & ~transition_mask) == 0);
+	return t;
+}
+
+vec3 get_transvoxel_position(vec3 vertex_pos, vec4 fdata) {
+	int idata = floatBitsToInt(fdata.a);
+	float secondary_factor = get_transvoxel_secondary_factor(idata);
+	vec3 secondary_position = fdata.xyz;
+	vec3 pos = mix(vertex_pos, secondary_position, secondary_factor);
+	int itransition = (idata >> 16) & 0xff;
+	float transition_cull = float(itransition == 0 || (itransition & u_transition_mask) != 0);
+	return pos * transition_cull;
+}
+
+vec4 decode_8bit_vec4(float v) {
+	uint i = floatBitsToUint(v);
+	return vec4(
+		float(i & 0xffu),
+		float((i >> 8u) & 0xffu),
+		float((i >> 16u) & 0xffu),
+		float((i >> 24u) & 0xffu));
+}
+
+float get_hash(vec2 c) {
+	return fract(sin(dot(c.xy, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+bool get_lod_fade_discard(vec2 screen_uv) {
+	float h = get_hash(screen_uv);
+	if (u_lod_fade.y > 0.5) {
+		return u_lod_fade.x < h;
+	}
+	return u_lod_fade.x > h;
+}
+
+vec3 get_layer_albedo(int index) {
+	return u_auto_material_albedo[clamp(index, 0, 15)].rgb;
+}
+
+vec3 get_layer_emission(int index) {
+	return u_auto_material_emission[clamp(index, 0, 15)].rgb;
+}
+
+float get_layer_roughness(int index) {
+	return u_auto_material_roughness[clamp(index, 0, 15)];
+}
+
+float get_layer_metallic(int index) {
+	return u_auto_material_metallic[clamp(index, 0, 15)];
+}
+
+float get_layer_specular(int index) {
+	return u_auto_material_specular[clamp(index, 0, 15)];
+}
+
+void vertex() {
+	VERTEX = get_transvoxel_position(VERTEX, CUSTOM0);
+	v_auto_material_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	v_indices = decode_8bit_vec4(CUSTOM1.x);
+	v_weights = decode_8bit_vec4(CUSTOM1.y) / 255.0;
+	float sum_w = v_weights.x + v_weights.y + v_weights.z + v_weights.w;
+	if (sum_w > 0.0001) {
+		v_weights /= sum_w;
+	} else {
+		v_indices = vec4(0.0, 1.0, 2.0, 3.0);
+		v_weights = vec4(1.0, 0.0, 0.0, 0.0);
+	}
+}
+
+void fragment() {
+	int i0 = int(v_indices.x + 0.5);
+	int i1 = int(v_indices.y + 0.5);
+	int i2 = int(v_indices.z + 0.5);
+	int i3 = int(v_indices.w + 0.5);
+
+	if (u_auto_material_use_flat_shading) {
+		vec3 flat_dx = dFdx(v_auto_material_world_pos);
+		vec3 flat_dy = dFdy(v_auto_material_world_pos);
+		vec3 flat_normal = normalize(cross(flat_dx, flat_dy));
+		vec3 view_normal = normalize((VIEW_MATRIX * vec4(flat_normal, 0.0)).xyz);
+		vec3 base_normal = normalize(NORMAL);
+		if (dot(view_normal, base_normal) < 0.0) {
+			view_normal = -view_normal;
+		}
+		NORMAL = view_normal;
+	}
+
+	ALBEDO =
+		get_layer_albedo(i0) * v_weights.x +
+		get_layer_albedo(i1) * v_weights.y +
+		get_layer_albedo(i2) * v_weights.z +
+		get_layer_albedo(i3) * v_weights.w;
+	EMISSION =
+		get_layer_emission(i0) * v_weights.x +
+		get_layer_emission(i1) * v_weights.y +
+		get_layer_emission(i2) * v_weights.z +
+		get_layer_emission(i3) * v_weights.w;
+	ROUGHNESS =
+		get_layer_roughness(i0) * v_weights.x +
+		get_layer_roughness(i1) * v_weights.y +
+		get_layer_roughness(i2) * v_weights.z +
+		get_layer_roughness(i3) * v_weights.w;
+	METALLIC =
+		get_layer_metallic(i0) * v_weights.x +
+		get_layer_metallic(i1) * v_weights.y +
+		get_layer_metallic(i2) * v_weights.z +
+		get_layer_metallic(i3) * v_weights.w;
+	SPECULAR =
+		get_layer_specular(i0) * v_weights.x +
+		get_layer_specular(i1) * v_weights.y +
+		get_layer_specular(i2) * v_weights.z +
+		get_layer_specular(i3) * v_weights.w;
+
+	if (get_lod_fade_discard(SCREEN_UV)) {
+		discard;
+	}
+}
+)SHADER";
+
+struct MaterialLayerWeights {
+	FixedArray<uint32_t, 16> node_ids;
+	FixedArray<bool, 16> used_layers;
+
+	MaterialLayerWeights() {
+		fill(node_ids, ProgramGraph::NULL_ID);
+		fill(used_layers, false);
+	}
+};
+
+struct MaterialWeightBuildState {
+	Ref<pg::VoxelGraphFunction> graph;
+	std::unordered_map<uint32_t, MaterialLayerWeights> cache;
+	std::unordered_map<uint32_t, int> material_layers;
+	FixedArray<Ref<StandardMaterial3D>, 16> layer_materials;
+	FixedArray<bool, 16> occupied_layers;
+	bool has_error = false;
+	String error_message;
+	uint32_t error_node_id = ProgramGraph::NULL_ID;
+	int next_auto_layer = 0;
+	uint32_t constant_zero_node_id = ProgramGraph::NULL_ID;
+	uint32_t constant_one_node_id = ProgramGraph::NULL_ID;
+
+	MaterialWeightBuildState() {
+		fill(occupied_layers, false);
+	}
+};
+
+struct MaterialShaderControlRequest {
+	enum Operation {
+		OP_DIRECT,
+		OP_SUBTRACT,
+	};
+
+	Operation operation = OP_DIRECT;
+	ProgramGraph::PortLocation a{ ProgramGraph::NULL_ID, 0 };
+	ProgramGraph::PortLocation b{ ProgramGraph::NULL_ID, 0 };
+	float a_default = 0.f;
+	float b_default = 0.f;
+	bool step_from_zero = false;
+};
+
+struct MaterialGraphShaderBuildState {
+	const pg::VoxelGraphFunction *source_graph = nullptr;
+	MaterialWeightBuildState *weight_state = nullptr;
+	StdVector<MaterialShaderControlRequest> controls;
+	bool has_error = false;
+	String error_message;
+	uint32_t error_node_id = ProgramGraph::NULL_ID;
+};
+
+inline bool graph_has_node_type(const ProgramGraph &graph, pg::VoxelGraphFunction::NodeTypeID node_type_id) {
+	for (unsigned int i = 0; i < graph.get_nodes_count(); ++i) {
+		const ProgramGraph::Node &node = graph.get_node(i);
+		if (node.type_id == node_type_id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void set_material_build_error(MaterialWeightBuildState &state, uint32_t node_id, String message) {
+	if (state.has_error) {
+		return;
+	}
+	state.has_error = true;
+	state.error_node_id = node_id;
+	state.error_message = message;
+}
+
+uint32_t create_constant_node(pg::VoxelGraphFunction &graph, const float value) {
+	const uint32_t node_id = graph.create_node(pg::VoxelGraphFunction::NODE_CONSTANT);
+	graph.set_node_param(node_id, 0, value);
+	return node_id;
+}
+
+ProgramGraph::PortLocation get_or_create_constant_output(MaterialWeightBuildState &state, const float value) {
+	if (Math::is_equal_approx(value, 0.f)) {
+		if (state.constant_zero_node_id == ProgramGraph::NULL_ID) {
+			state.constant_zero_node_id = create_constant_node(**state.graph, 0.f);
+		}
+		return ProgramGraph::PortLocation{ state.constant_zero_node_id, 0 };
+	}
+	if (Math::is_equal_approx(value, 1.f)) {
+		if (state.constant_one_node_id == ProgramGraph::NULL_ID) {
+			state.constant_one_node_id = create_constant_node(**state.graph, 1.f);
+		}
+		return ProgramGraph::PortLocation{ state.constant_one_node_id, 0 };
+	}
+	return ProgramGraph::PortLocation{ create_constant_node(**state.graph, value), 0 };
+}
+
+ProgramGraph::PortLocation get_input_source_or_default(
+		MaterialWeightBuildState &state,
+		const ProgramGraph::Node &node,
+		const uint32_t input_index,
+		const float fallback_value
+) {
+	ProgramGraph::PortLocation src;
+	if (state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, input_index }, src)) {
+		return src;
+	}
+
+	float value = fallback_value;
+	if (input_index < node.default_inputs.size()) {
+		const Variant &default_value = node.default_inputs[input_index];
+		if (default_value.get_type() != Variant::NIL) {
+			value = default_value;
+		}
+	}
+	return get_or_create_constant_output(state, value);
+}
+
+uint32_t create_binary_math_node(
+		MaterialWeightBuildState &state,
+		const pg::VoxelGraphFunction::NodeTypeID node_type,
+		const ProgramGraph::PortLocation a,
+		const ProgramGraph::PortLocation b
+) {
+	uint32_t node_id = state.graph->create_node(node_type);
+	state.graph->add_connection(a.node_id, a.port_index, node_id, 0);
+	state.graph->add_connection(b.node_id, b.port_index, node_id, 1);
+	return node_id;
+}
+
+uint32_t create_select_node(
+		MaterialWeightBuildState &state,
+		const ProgramGraph::PortLocation a,
+		const ProgramGraph::PortLocation b,
+		const ProgramGraph::PortLocation selector_minus_threshold
+) {
+	uint32_t node_id = state.graph->create_node(pg::VoxelGraphFunction::NODE_SELECT);
+	state.graph->set_node_param(node_id, 0, 0.f);
+	state.graph->add_connection(a.node_id, a.port_index, node_id, 0);
+	state.graph->add_connection(b.node_id, b.port_index, node_id, 1);
+	state.graph->add_connection(selector_minus_threshold.node_id, selector_minus_threshold.port_index, node_id, 2);
+	return node_id;
+}
+
+int assign_layer_to_material_node(MaterialWeightBuildState &state, const ProgramGraph::Node &node) {
+	const auto it = state.material_layers.find(node.id);
+	if (it != state.material_layers.end()) {
+		return it->second;
+	}
+
+	int requested_layer = -1;
+	if (node.params.size() >= 2) {
+		requested_layer = node.params[1];
+	}
+
+	Ref<StandardMaterial3D> material;
+	if (node.params.size() >= 1) {
+		material = node.params[0];
+	}
+
+	int layer = requested_layer;
+	if (layer < 0) {
+		while (state.next_auto_layer < 16 && state.occupied_layers[state.next_auto_layer]) {
+			++state.next_auto_layer;
+		}
+		if (state.next_auto_layer >= 16) {
+			set_material_build_error(
+					state,
+					node.id,
+					"MaterialOutput supports up to 16 unique material layers when bridging to spatial voxel weights");
+			return -1;
+		}
+		layer = state.next_auto_layer;
+		++state.next_auto_layer;
+	}
+
+	if (layer < 0 || layer >= 16) {
+		set_material_build_error(state, node.id, "Material layer must be in the range -1..15");
+		return -1;
+	}
+
+	if (state.occupied_layers[layer] && state.layer_materials[layer].is_valid() && material.is_valid() &&
+			state.layer_materials[layer].ptr() != material.ptr()) {
+		set_material_build_error(
+				state,
+				node.id,
+				String("Material layer {0} is already used by a different StandardMaterial3D").format(varray(layer)));
+		return -1;
+	}
+
+	state.occupied_layers[layer] = true;
+	if (material.is_valid()) {
+		state.layer_materials[layer] = material;
+	}
+	state.material_layers[node.id] = layer;
+	return layer;
+}
+
+void set_material_shader_error(MaterialGraphShaderBuildState &state, uint32_t node_id, String message) {
+	if (state.has_error) {
+		return;
+	}
+	state.has_error = true;
+	state.error_node_id = node_id;
+	state.error_message = message;
+}
+
+bool get_node_input_source_or_default(
+		const pg::VoxelGraphFunction &graph,
+		const ProgramGraph::Node &node,
+		const uint32_t input_index,
+		const float fallback_value,
+		ProgramGraph::PortLocation &out_src,
+		float &out_default
+) {
+	out_default = fallback_value;
+	if (input_index < node.default_inputs.size()) {
+		const Variant &default_value = node.default_inputs[input_index];
+		if (default_value.get_type() != Variant::NIL) {
+			out_default = default_value;
+		}
+	}
+	return graph.try_get_connection_to(ProgramGraph::PortLocation{ node.id, input_index }, out_src);
+}
+
+int add_material_shader_control_direct(
+		MaterialGraphShaderBuildState &state,
+		const ProgramGraph::PortLocation src,
+		const float fallback_value,
+		const bool step_from_zero
+) {
+	MaterialShaderControlRequest request;
+	request.operation = MaterialShaderControlRequest::OP_DIRECT;
+	request.a = src;
+	request.a_default = fallback_value;
+	request.step_from_zero = step_from_zero;
+	const int index = state.controls.size();
+	state.controls.push_back(request);
+	return index;
+}
+
+int add_material_shader_control_subtract(
+		MaterialGraphShaderBuildState &state,
+		const ProgramGraph::PortLocation a,
+		const float a_default,
+		const ProgramGraph::PortLocation b,
+		const float b_default,
+		const bool step_from_zero
+) {
+	MaterialShaderControlRequest request;
+	request.operation = MaterialShaderControlRequest::OP_SUBTRACT;
+	request.a = a;
+	request.b = b;
+	request.a_default = a_default;
+	request.b_default = b_default;
+	request.step_from_zero = step_from_zero;
+	const int index = state.controls.size();
+	state.controls.push_back(request);
+	return index;
+}
+
+StdString build_material_shader_expr(MaterialGraphShaderBuildState &state, const uint32_t node_id);
+
+StdString build_material_shader_input_expr(
+		MaterialGraphShaderBuildState &state,
+		const ProgramGraph::Node &node,
+		const uint32_t input_index
+) {
+	ProgramGraph::PortLocation src;
+	if (!state.source_graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, input_index }, src)) {
+		return StdString();
+	}
+	return build_material_shader_expr(state, src.node_id);
+}
+
+StdString build_material_shader_expr(MaterialGraphShaderBuildState &state, const uint32_t node_id) {
+	if (state.has_error) {
+		return StdString();
+	}
+
+	const ProgramGraph &source_graph = state.source_graph->get_graph();
+	const ProgramGraph::Node &node = source_graph.get_node(node_id);
+
+	switch (node.type_id) {
+		case pg::VoxelGraphFunction::NODE_MATERIAL: {
+			const int layer = assign_layer_to_material_node(*state.weight_state, node);
+			if (layer < 0) {
+				set_material_shader_error(state, node.id, "Failed to assign a material layer for MaterialOutput shading");
+				return StdString();
+			}
+			return format("make_material_props({})", layer);
+		}
+
+		case pg::VoxelGraphFunction::NODE_BLEND_MATERIAL: {
+			const StdString a_expr = build_material_shader_input_expr(state, node, 0);
+			const StdString b_expr = build_material_shader_input_expr(state, node, 1);
+			if (a_expr.empty()) {
+				return b_expr;
+			}
+			if (b_expr.empty()) {
+				return a_expr;
+			}
+			ProgramGraph::PortLocation alpha_src{ ProgramGraph::NULL_ID, 0 };
+			float alpha_default = 0.5f;
+			get_node_input_source_or_default(*state.source_graph, node, 2, 0.5f, alpha_src, alpha_default);
+			const int control_index = add_material_shader_control_direct(state, alpha_src, alpha_default, false);
+			return format(
+					"mix_material_props({}, {}, clamp(auto_material_control_{}, 0.0, 1.0))",
+					a_expr,
+					b_expr,
+					control_index);
+		}
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_SWITCH: {
+			const StdString a_expr = build_material_shader_input_expr(state, node, 0);
+			const StdString b_expr = build_material_shader_input_expr(state, node, 1);
+			if (a_expr.empty()) {
+				return b_expr;
+			}
+			if (b_expr.empty()) {
+				return a_expr;
+			}
+			ProgramGraph::PortLocation selector_src{ ProgramGraph::NULL_ID, 0 };
+			ProgramGraph::PortLocation threshold_src{ ProgramGraph::NULL_ID, 0 };
+			float selector_default = 0.f;
+			float threshold_default = 0.5f;
+			get_node_input_source_or_default(*state.source_graph, node, 2, 0.f, selector_src, selector_default);
+			get_node_input_source_or_default(*state.source_graph, node, 3, 0.5f, threshold_src, threshold_default);
+			const int control_index = add_material_shader_control_subtract(
+					state,
+					selector_src,
+					selector_default,
+					threshold_src,
+					threshold_default,
+					true);
+			return format(
+					"mix_material_props({}, {}, step(0.0, auto_material_control_{}))",
+					a_expr,
+					b_expr,
+					control_index);
+		}
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_PROPERTY_OVERRIDE:
+		case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL:
+			return build_material_shader_input_expr(state, node, 0);
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_STACK: {
+			StdString base_expr = build_material_shader_input_expr(state, node, 0);
+			StdString middle_expr = build_material_shader_input_expr(state, node, 1);
+			StdString top_expr = build_material_shader_input_expr(state, node, 2);
+			if (base_expr.empty()) {
+				base_expr = middle_expr;
+			}
+			if (base_expr.empty()) {
+				base_expr = top_expr;
+			}
+			if (base_expr.empty()) {
+				return StdString();
+			}
+			if (!middle_expr.empty()) {
+				ProgramGraph::PortLocation middle_alpha_src{ ProgramGraph::NULL_ID, 0 };
+				float middle_alpha_default = 0.5f;
+				get_node_input_source_or_default(
+						*state.source_graph,
+						node,
+						3,
+						0.5f,
+						middle_alpha_src,
+						middle_alpha_default);
+				const int middle_control_index =
+						add_material_shader_control_direct(state, middle_alpha_src, middle_alpha_default, false);
+				base_expr = format(
+						"mix_material_props({}, {}, clamp(auto_material_control_{}, 0.0, 1.0))",
+						base_expr,
+						middle_expr,
+						middle_control_index);
+			}
+			if (!top_expr.empty()) {
+				ProgramGraph::PortLocation top_alpha_src{ ProgramGraph::NULL_ID, 0 };
+				float top_alpha_default = 0.5f;
+				get_node_input_source_or_default(*state.source_graph, node, 4, 0.5f, top_alpha_src, top_alpha_default);
+				const int top_control_index = add_material_shader_control_direct(state, top_alpha_src, top_alpha_default, false);
+				base_expr = format(
+						"mix_material_props({}, {}, clamp(auto_material_control_{}, 0.0, 1.0))",
+						base_expr,
+						top_expr,
+						top_control_index);
+			}
+			return base_expr;
+		}
+
+		default:
+			set_material_shader_error(
+					state,
+					node.id,
+					"MaterialOutput must be connected to a supported material chain for per-pixel shading");
+			return StdString();
+	}
+}
+
+MaterialLayerWeights combine_material_layer_weights(
+		MaterialWeightBuildState &state,
+		const MaterialLayerWeights &a_layers,
+		const MaterialLayerWeights &b_layers,
+		const ProgramGraph::PortLocation alpha_src
+) {
+	MaterialLayerWeights result;
+	const ProgramGraph::PortLocation one_src = get_or_create_constant_output(state, 1.f);
+	const ProgramGraph::PortLocation inv_alpha_src{
+		create_binary_math_node(state, pg::VoxelGraphFunction::NODE_SUBTRACT, one_src, alpha_src),
+		0 };
+
+	for (unsigned int layer = 0; layer < result.used_layers.size(); ++layer) {
+		ProgramGraph::PortLocation a_weight_src{ ProgramGraph::NULL_ID, 0 };
+		ProgramGraph::PortLocation b_weight_src{ ProgramGraph::NULL_ID, 0 };
+		bool has_a = a_layers.used_layers[layer];
+		bool has_b = b_layers.used_layers[layer];
+
+		if (has_a) {
+			a_weight_src = ProgramGraph::PortLocation{ a_layers.node_ids[layer], 0 };
+			a_weight_src.node_id = create_binary_math_node(
+					state,
+					pg::VoxelGraphFunction::NODE_MULTIPLY,
+					a_weight_src,
+					inv_alpha_src);
+		}
+		if (has_b) {
+			b_weight_src = ProgramGraph::PortLocation{ b_layers.node_ids[layer], 0 };
+			b_weight_src.node_id = create_binary_math_node(
+					state,
+					pg::VoxelGraphFunction::NODE_MULTIPLY,
+					b_weight_src,
+					alpha_src);
+		}
+
+		if (has_a && has_b) {
+			result.used_layers[layer] = true;
+			result.node_ids[layer] = create_binary_math_node(
+					state,
+					pg::VoxelGraphFunction::NODE_ADD,
+					a_weight_src,
+					b_weight_src);
+		} else if (has_a) {
+			result.used_layers[layer] = true;
+			result.node_ids[layer] = a_weight_src.node_id;
+		} else if (has_b) {
+			result.used_layers[layer] = true;
+			result.node_ids[layer] = b_weight_src.node_id;
+		}
+	}
+
+	return result;
+}
+
+MaterialLayerWeights select_material_layer_weights(
+		MaterialWeightBuildState &state,
+		const MaterialLayerWeights &a_layers,
+		const MaterialLayerWeights &b_layers,
+		const ProgramGraph::PortLocation selector_src,
+		const ProgramGraph::PortLocation threshold_src
+) {
+	MaterialLayerWeights result;
+	const ProgramGraph::PortLocation zero_src = get_or_create_constant_output(state, 0.f);
+	const ProgramGraph::PortLocation selector_minus_threshold{
+		create_binary_math_node(state, pg::VoxelGraphFunction::NODE_SUBTRACT, selector_src, threshold_src),
+		0 };
+
+	for (unsigned int layer = 0; layer < result.used_layers.size(); ++layer) {
+		if (!a_layers.used_layers[layer] && !b_layers.used_layers[layer]) {
+			continue;
+		}
+		result.used_layers[layer] = true;
+		const ProgramGraph::PortLocation a_weight_src = a_layers.used_layers[layer] ?
+				ProgramGraph::PortLocation{ a_layers.node_ids[layer], 0 } : zero_src;
+		const ProgramGraph::PortLocation b_weight_src = b_layers.used_layers[layer] ?
+				ProgramGraph::PortLocation{ b_layers.node_ids[layer], 0 } : zero_src;
+		result.node_ids[layer] = create_select_node(state, a_weight_src, b_weight_src, selector_minus_threshold);
+	}
+
+	return result;
+}
+
+MaterialLayerWeights build_material_layer_weights(MaterialWeightBuildState &state, const uint32_t node_id) {
+	const auto cached_it = state.cache.find(node_id);
+	if (cached_it != state.cache.end()) {
+		return cached_it->second;
+	}
+
+	MaterialLayerWeights result;
+	const ProgramGraph &graph = state.graph->get_graph();
+	const ProgramGraph::Node &node = graph.get_node(node_id);
+
+	switch (node.type_id) {
+		case pg::VoxelGraphFunction::NODE_MATERIAL: {
+			const int layer = assign_layer_to_material_node(state, node);
+			if (layer >= 0) {
+				result.used_layers[layer] = true;
+				result.node_ids[layer] = get_or_create_constant_output(state, 1.f).node_id;
+			}
+		} break;
+
+		case pg::VoxelGraphFunction::NODE_BLEND_MATERIAL: {
+			ProgramGraph::PortLocation src;
+			if (state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 0 }, src)) {
+				const MaterialLayerWeights a_layers = build_material_layer_weights(state, src.node_id);
+				if (state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 1 }, src)) {
+					const MaterialLayerWeights b_layers = build_material_layer_weights(state, src.node_id);
+					const ProgramGraph::PortLocation alpha_src = get_input_source_or_default(state, node, 2, 0.5f);
+					result = combine_material_layer_weights(state, a_layers, b_layers, alpha_src);
+				} else {
+					result = a_layers;
+				}
+			} else if (state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 1 }, src)) {
+				result = build_material_layer_weights(state, src.node_id);
+			}
+		} break;
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_SWITCH: {
+			ProgramGraph::PortLocation a_src;
+			ProgramGraph::PortLocation b_src;
+			const bool has_a = state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 0 }, a_src);
+			const bool has_b = state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 1 }, b_src);
+			if (has_a && has_b) {
+				const MaterialLayerWeights a_layers = build_material_layer_weights(state, a_src.node_id);
+				const MaterialLayerWeights b_layers = build_material_layer_weights(state, b_src.node_id);
+				const ProgramGraph::PortLocation selector_src = get_input_source_or_default(state, node, 2, 0.f);
+				const ProgramGraph::PortLocation threshold_src = get_input_source_or_default(state, node, 3, 0.5f);
+				result = select_material_layer_weights(state, a_layers, b_layers, selector_src, threshold_src);
+			} else if (has_a) {
+				result = build_material_layer_weights(state, a_src.node_id);
+			} else if (has_b) {
+				result = build_material_layer_weights(state, b_src.node_id);
+			}
+		} break;
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_PROPERTY_OVERRIDE:
+		case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL: {
+			ProgramGraph::PortLocation src;
+			if (state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 0 }, src)) {
+				result = build_material_layer_weights(state, src.node_id);
+			}
+		} break;
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_STACK: {
+			ProgramGraph::PortLocation base_src;
+			ProgramGraph::PortLocation middle_src;
+			ProgramGraph::PortLocation top_src;
+			const bool has_base = state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 0 }, base_src);
+			const bool has_middle = state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 1 }, middle_src);
+			const bool has_top = state.graph->try_get_connection_to(ProgramGraph::PortLocation{ node.id, 2 }, top_src);
+			if (has_base || has_middle || has_top) {
+				MaterialLayerWeights base_layers;
+				MaterialLayerWeights middle_layers;
+				MaterialLayerWeights top_layers;
+				if (has_base) {
+					base_layers = build_material_layer_weights(state, base_src.node_id);
+				}
+				if (has_middle) {
+					middle_layers = build_material_layer_weights(state, middle_src.node_id);
+				}
+				if (has_top) {
+					top_layers = build_material_layer_weights(state, top_src.node_id);
+				}
+				const ProgramGraph::PortLocation middle_alpha_src = get_input_source_or_default(state, node, 3, 0.5f);
+				const ProgramGraph::PortLocation top_alpha_src = get_input_source_or_default(state, node, 4, 0.5f);
+				result = combine_material_layer_weights(state, base_layers, middle_layers, middle_alpha_src);
+				result = combine_material_layer_weights(state, result, top_layers, top_alpha_src);
+			}
+		} break;
+
+		default:
+			break;
+	}
+
+	state.cache[node_id] = result;
+	return result;
+}
+
+bool add_implicit_material_output_weights(
+		MaterialWeightBuildState &state,
+		const uint32_t material_output_node_id,
+		unsigned int &out_used_layer_count
+) {
+	ProgramGraph::PortLocation material_src;
+	if (!state.graph->try_get_connection_to(ProgramGraph::PortLocation{ material_output_node_id, 0 }, material_src)) {
+		return false;
+	}
+
+	const MaterialLayerWeights layers = build_material_layer_weights(state, material_src.node_id);
+	if (state.has_error) {
+		return false;
+	}
+
+	unsigned int used_layer_count = 0;
+	for (unsigned int layer = 0; layer < layers.used_layers.size(); ++layer) {
+		if (!layers.used_layers[layer]) {
+			continue;
+		}
+		++used_layer_count;
+		const uint32_t out_node = state.graph->create_node(pg::VoxelGraphFunction::NODE_OUTPUT_WEIGHT);
+		state.graph->set_node_param(out_node, 0, static_cast<int>(layer));
+		state.graph->add_connection(layers.node_ids[layer], 0, out_node, 0);
+	}
+
+	out_used_layer_count = used_layer_count;
+	return used_layer_count > 0;
+}
+
+bool build_material_controls_shader_source(
+		const Ref<pg::VoxelGraphFunction> &source_graph,
+		const StdVector<MaterialShaderControlRequest> &controls,
+		StdString &out_shader_source,
+		String &out_error_message
+) {
+	out_shader_source.clear();
+	if (controls.size() == 0) {
+		return true;
+	}
+
+	Ref<pg::VoxelGraphFunction> shader_graph;
+	shader_graph.instantiate();
+	const Dictionary graph_data = source_graph->get_graph_as_variant_data();
+	if (!shader_graph->load_graph_from_variant_data(graph_data)) {
+		out_error_message = "Failed to clone the voxel graph for MaterialOutput shader generation";
+		return false;
+	}
+
+	auto connect_or_set_default = [&](const ProgramGraph::PortLocation src,
+												const float default_value,
+												const uint32_t dst_node_id,
+												const uint32_t dst_port_index) {
+		if (src.node_id != ProgramGraph::NULL_ID) {
+			shader_graph->add_connection(src.node_id, src.port_index, dst_node_id, dst_port_index);
+		} else {
+			shader_graph->set_node_default_input(dst_node_id, dst_port_index, default_value);
+		}
+	};
+
+	for (unsigned int i = 0; i < controls.size(); ++i) {
+		const MaterialShaderControlRequest &control = controls[i];
+		const uint32_t output_node_id = shader_graph->create_node(pg::VoxelGraphFunction::NODE_OUTPUT_SINGLE_TEXTURE);
+		switch (control.operation) {
+			case MaterialShaderControlRequest::OP_DIRECT:
+				connect_or_set_default(control.a, control.a_default, output_node_id, 0);
+				break;
+			case MaterialShaderControlRequest::OP_SUBTRACT: {
+				const uint32_t subtract_node_id = shader_graph->create_node(pg::VoxelGraphFunction::NODE_SUBTRACT);
+				connect_or_set_default(control.a, control.a_default, subtract_node_id, 0);
+				connect_or_set_default(control.b, control.b_default, subtract_node_id, 1);
+				shader_graph->add_connection(subtract_node_id, 0, output_node_id, 0);
+			} break;
+			default:
+				break;
+		}
+	}
+
+	shader_graph->auto_pick_inputs_and_outputs();
+	StdVector<pg::ShaderParameter> shader_params;
+	StdVector<pg::ShaderOutput> shader_outputs;
+	const pg::VoxelGraphFunction::NodeTypeID restricted_outputs[] = {
+		pg::VoxelGraphFunction::NODE_OUTPUT_SINGLE_TEXTURE
+	};
+	const pg::CompilationResult shader_result = pg::generate_shader(
+			shader_graph->get_graph(),
+			shader_graph->get_input_definitions(),
+			out_shader_source,
+			shader_params,
+			shader_outputs,
+			Span<const pg::VoxelGraphFunction::NodeTypeID>(restricted_outputs, 1));
+	if (!shader_result.success) {
+		out_error_message = shader_result.message;
+		return false;
+	}
+	if (shader_params.size() != 0) {
+		out_error_message =
+				"MaterialOutput per-pixel shading currently supports only graph controls that do not require external GPU resources";
+		return false;
+	}
+
+	const StdString source_name = "void generate(vec3 pos";
+	const size_t source_name_pos = out_shader_source.find(source_name);
+	if (source_name_pos != StdString::npos) {
+		out_shader_source.replace(
+				source_name_pos,
+				source_name.size(),
+				"void generate_auto_material_controls(vec3 pos");
+	}
+	return true;
+}
+
+Ref<Material> create_spatial_material_from_graph(
+		const Ref<pg::VoxelGraphFunction> &source_graph,
+		MaterialWeightBuildState &material_weight_state,
+		const uint32_t material_output_node_id
+) {
+	MaterialGraphShaderBuildState shader_build_state;
+	shader_build_state.source_graph = source_graph.ptr();
+	shader_build_state.weight_state = &material_weight_state;
+
+	const StdString material_expr = build_material_shader_expr(shader_build_state, material_output_node_id);
+	if (shader_build_state.has_error || material_expr.empty()) {
+		return Ref<Material>();
+	}
+
+	StdString controls_shader_source;
+	String controls_error_message;
+	if (!build_material_controls_shader_source(
+				source_graph, shader_build_state.controls, controls_shader_source, controls_error_message)) {
+		const CharString controls_error_utf8 =
+				String("Falling back to voxel-weight MaterialOutput shading: {0}")
+						.format(varray(controls_error_message))
+						.utf8();
+		ZN_PRINT_WARNING(controls_error_utf8.get_data());
+		return Ref<Material>();
+	}
+
+	PackedColorArray albedo_array;
+	PackedColorArray emission_array;
+	PackedFloat32Array roughness_array;
+	PackedFloat32Array metallic_array;
+	PackedFloat32Array specular_array;
+	albedo_array.resize(16);
+	emission_array.resize(16);
+	roughness_array.resize(16);
+	metallic_array.resize(16);
+	specular_array.resize(16);
+
+	for (int i = 0; i < 16; ++i) {
+		Ref<StandardMaterial3D> material = material_weight_state.layer_materials[i];
+		Color albedo(1.f, 1.f, 1.f, 1.f);
+		Color emission(0.f, 0.f, 0.f, 1.f);
+		float roughness = 1.f;
+		float metallic = 0.f;
+		float specular = 0.5f;
+		if (material.is_valid()) {
+			albedo = material->get_albedo();
+			emission = material->get_emission();
+			roughness = material->get_roughness();
+			metallic = material->get_metallic();
+			specular = material->get_specular();
+		}
+		albedo_array.set(i, albedo);
+		emission_array.set(i, emission);
+		roughness_array.set(i, roughness);
+		metallic_array.set(i, metallic);
+		specular_array.set(i, specular);
+	}
+
+	StdString shader_code = R"SHADER(shader_type spatial;
+render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
+
+uniform int u_transition_mask;
+uniform vec2 u_lod_fade;
+uniform int u_voxel_lod_info;
+uniform bool u_auto_material_per_pixel = true;
+uniform bool u_auto_material_per_pixel_lod0_only = true;
+uniform bool u_auto_material_use_flat_shading = true;
+uniform vec4 u_auto_material_albedo[16];
+uniform vec4 u_auto_material_emission[16];
+uniform float u_auto_material_roughness[16];
+uniform float u_auto_material_metallic[16];
+uniform float u_auto_material_specular[16];
+
+varying flat vec4 v_indices;
+varying vec4 v_weights;
+varying vec3 v_auto_material_world_pos;
+
+float get_transvoxel_secondary_factor(int idata) {
+	int transition_mask = u_transition_mask & 0xff;
+	int cell_border_mask = idata & 63;
+	int vertex_border_mask = (idata >> 8) & 63;
+	int m = transition_mask & cell_border_mask;
+	float t = float(m != 0);
+	t *= float((vertex_border_mask & ~transition_mask) == 0);
+	return t;
+}
+
+vec3 get_transvoxel_position(vec3 vertex_pos, vec4 fdata) {
+	int idata = floatBitsToInt(fdata.a);
+	float secondary_factor = get_transvoxel_secondary_factor(idata);
+	vec3 secondary_position = fdata.xyz;
+	vec3 pos = mix(vertex_pos, secondary_position, secondary_factor);
+	int itransition = (idata >> 16) & 0xff;
+	float transition_cull = float(itransition == 0 || (itransition & u_transition_mask) != 0);
+	return pos * transition_cull;
+}
+
+vec4 decode_8bit_vec4(float v) {
+	uint i = floatBitsToUint(v);
+	return vec4(
+		float(i & 0xffu),
+		float((i >> 8u) & 0xffu),
+		float((i >> 16u) & 0xffu),
+		float((i >> 24u) & 0xffu));
+}
+
+float get_hash(vec2 c) {
+	return fract(sin(dot(c.xy, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+bool get_lod_fade_discard(vec2 screen_uv) {
+	float h = get_hash(screen_uv);
+	if (u_lod_fade.y > 0.5) {
+		return u_lod_fade.x < h;
+	}
+	return u_lod_fade.x > h;
+}
+
+struct AutoMaterialProps {
+	vec3 albedo;
+	vec3 emission;
+	float roughness;
+	float metallic;
+	float specular;
+};
+
+AutoMaterialProps make_material_props(int index) {
+	int layer = clamp(index, 0, 15);
+	AutoMaterialProps m;
+	m.albedo = u_auto_material_albedo[layer].rgb;
+	m.emission = u_auto_material_emission[layer].rgb;
+	m.roughness = u_auto_material_roughness[layer];
+	m.metallic = u_auto_material_metallic[layer];
+	m.specular = u_auto_material_specular[layer];
+	return m;
+}
+
+AutoMaterialProps mix_material_props(AutoMaterialProps a, AutoMaterialProps b, float weight) {
+	float w = clamp(weight, 0.0, 1.0);
+	AutoMaterialProps m;
+	m.albedo = mix(a.albedo, b.albedo, w);
+	m.emission = mix(a.emission, b.emission, w);
+	m.roughness = mix(a.roughness, b.roughness, w);
+	m.metallic = mix(a.metallic, b.metallic, w);
+	m.specular = mix(a.specular, b.specular, w);
+	return m;
+}
+
+AutoMaterialProps get_weight_material_props(vec4 indices, vec4 weights) {
+	int i0 = int(indices.x + 0.5);
+	int i1 = int(indices.y + 0.5);
+	int i2 = int(indices.z + 0.5);
+	int i3 = int(indices.w + 0.5);
+
+	AutoMaterialProps m;
+	m.albedo =
+		u_auto_material_albedo[clamp(i0, 0, 15)].rgb * weights.x +
+		u_auto_material_albedo[clamp(i1, 0, 15)].rgb * weights.y +
+		u_auto_material_albedo[clamp(i2, 0, 15)].rgb * weights.z +
+		u_auto_material_albedo[clamp(i3, 0, 15)].rgb * weights.w;
+	m.emission =
+		u_auto_material_emission[clamp(i0, 0, 15)].rgb * weights.x +
+		u_auto_material_emission[clamp(i1, 0, 15)].rgb * weights.y +
+		u_auto_material_emission[clamp(i2, 0, 15)].rgb * weights.z +
+		u_auto_material_emission[clamp(i3, 0, 15)].rgb * weights.w;
+	m.roughness =
+		u_auto_material_roughness[clamp(i0, 0, 15)] * weights.x +
+		u_auto_material_roughness[clamp(i1, 0, 15)] * weights.y +
+		u_auto_material_roughness[clamp(i2, 0, 15)] * weights.z +
+		u_auto_material_roughness[clamp(i3, 0, 15)] * weights.w;
+	m.metallic =
+		u_auto_material_metallic[clamp(i0, 0, 15)] * weights.x +
+		u_auto_material_metallic[clamp(i1, 0, 15)] * weights.y +
+		u_auto_material_metallic[clamp(i2, 0, 15)] * weights.z +
+		u_auto_material_metallic[clamp(i3, 0, 15)] * weights.w;
+	m.specular =
+		u_auto_material_specular[clamp(i0, 0, 15)] * weights.x +
+		u_auto_material_specular[clamp(i1, 0, 15)] * weights.y +
+		u_auto_material_specular[clamp(i2, 0, 15)] * weights.z +
+		u_auto_material_specular[clamp(i3, 0, 15)] * weights.w;
+	return m;
+}
+
+)SHADER";
+	shader_code += controls_shader_source;
+	shader_code +=
+			"\nvoid vertex() {\n"
+			"\tVERTEX = get_transvoxel_position(VERTEX, CUSTOM0);\n"
+			"\tv_auto_material_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;\n"
+			"\tv_indices = decode_8bit_vec4(CUSTOM1.x);\n"
+			"\tv_weights = decode_8bit_vec4(CUSTOM1.y) / 255.0;\n"
+			"\tfloat sum_w = v_weights.x + v_weights.y + v_weights.z + v_weights.w;\n"
+			"\tif (sum_w > 0.0001) {\n"
+			"\t\tv_weights /= sum_w;\n"
+			"\t} else {\n"
+			"\t\tv_indices = vec4(0.0, 1.0, 2.0, 3.0);\n"
+			"\t\tv_weights = vec4(1.0, 0.0, 0.0, 0.0);\n"
+			"\t}\n"
+			"}\n\n";
+	shader_code += "void fragment() {\n";
+	for (unsigned int i = 0; i < shader_build_state.controls.size(); ++i) {
+		shader_code += format("\tfloat auto_material_control_{} = 0.0;\n", i);
+	}
+	if (shader_build_state.controls.size() > 0) {
+		shader_code += "\tgenerate_auto_material_controls(v_auto_material_world_pos";
+		for (unsigned int i = 0; i < shader_build_state.controls.size(); ++i) {
+			shader_code += format(", auto_material_control_{}", i);
+		}
+		shader_code += ");\n";
+	}
+	shader_code +=
+			"\tif (u_auto_material_use_flat_shading) {\n"
+			"\t\tvec3 flat_dx = dFdx(v_auto_material_world_pos);\n"
+			"\t\tvec3 flat_dy = dFdy(v_auto_material_world_pos);\n"
+			"\t\tvec3 flat_normal = normalize(cross(flat_dx, flat_dy));\n"
+			"\t\tvec3 view_normal = normalize((VIEW_MATRIX * vec4(flat_normal, 0.0)).xyz);\n"
+			"\t\tvec3 base_normal = normalize(NORMAL);\n"
+			"\t\tif (dot(view_normal, base_normal) < 0.0) {\n"
+			"\t\t\tview_normal = -view_normal;\n"
+			"\t\t}\n"
+			"\t\tNORMAL = view_normal;\n"
+			"\t}\n";
+	shader_code +=
+			"\tbool use_per_pixel = u_auto_material_per_pixel;\n"
+			"\tif (u_auto_material_per_pixel_lod0_only && ((u_voxel_lod_info & 0xff) != 0)) {\n"
+			"\t\tuse_per_pixel = false;\n"
+			"\t}\n"
+			"\tAutoMaterialProps material_props;\n"
+			"\tif (use_per_pixel) {\n";
+	shader_code += format("\t\tmaterial_props = {};\n", material_expr);
+	shader_code +=
+			"\t} else {\n"
+			"\t\tmaterial_props = get_weight_material_props(v_indices, v_weights);\n"
+			"\t}\n"
+			"\tALBEDO = material_props.albedo;\n"
+			"\tEMISSION = material_props.emission;\n"
+			"\tROUGHNESS = material_props.roughness;\n"
+			"\tMETALLIC = material_props.metallic;\n"
+			"\tSPECULAR = material_props.specular;\n"
+			"\tif (get_lod_fade_discard(SCREEN_UV)) {\n"
+			"\t\tdiscard;\n"
+			"\t}\n"
+			"}\n";
+
+	Ref<Shader> shader;
+	shader.instantiate();
+	shader->set_code(shader_code.c_str());
+
+	Ref<ShaderMaterial> material;
+	material.instantiate();
+	material->set_shader(shader);
+	material->set_shader_parameter("u_auto_material_per_pixel", true);
+	material->set_shader_parameter("u_auto_material_per_pixel_lod0_only", true);
+	material->set_shader_parameter("u_auto_material_use_flat_shading", true);
+	material->set_shader_parameter("u_auto_material_albedo", albedo_array);
+	material->set_shader_parameter("u_auto_material_emission", emission_array);
+	material->set_shader_parameter("u_auto_material_roughness", roughness_array);
+	material->set_shader_parameter("u_auto_material_metallic", metallic_array);
+	material->set_shader_parameter("u_auto_material_specular", specular_array);
+	return material;
+}
+
+Ref<Material> create_spatial_material_from_layers(const FixedArray<Ref<StandardMaterial3D>, 16> &layer_materials) {
+	PackedColorArray albedo_array;
+	PackedColorArray emission_array;
+	PackedFloat32Array roughness_array;
+	PackedFloat32Array metallic_array;
+	PackedFloat32Array specular_array;
+	albedo_array.resize(16);
+	emission_array.resize(16);
+	roughness_array.resize(16);
+	metallic_array.resize(16);
+	specular_array.resize(16);
+
+	for (int i = 0; i < 16; ++i) {
+		Ref<StandardMaterial3D> material = layer_materials[i];
+		Color albedo(1.f, 1.f, 1.f, 1.f);
+		Color emission(0.f, 0.f, 0.f, 1.f);
+		float roughness = 1.f;
+		float metallic = 0.f;
+		float specular = 0.5f;
+		if (material.is_valid()) {
+			albedo = material->get_albedo();
+			emission = material->get_emission();
+			roughness = material->get_roughness();
+			metallic = material->get_metallic();
+			specular = material->get_specular();
+		}
+		albedo_array.set(i, albedo);
+		emission_array.set(i, emission);
+		roughness_array.set(i, roughness);
+		metallic_array.set(i, metallic);
+		specular_array.set(i, specular);
+	}
+
+	Ref<Shader> shader;
+	shader.instantiate();
+	shader->set_code(AUTO_SPATIAL_MATERIAL_SHADER);
+
+	Ref<ShaderMaterial> material;
+	material.instantiate();
+	material->set_shader(shader);
+	material->set_shader_parameter("u_auto_material_use_flat_shading", true);
+	material->set_shader_parameter("u_auto_material_albedo", albedo_array);
+	material->set_shader_parameter("u_auto_material_emission", emission_array);
+	material->set_shader_parameter("u_auto_material_roughness", roughness_array);
+	material->set_shader_parameter("u_auto_material_metallic", metallic_array);
+	material->set_shader_parameter("u_auto_material_specular", specular_array);
+	return material;
+}
+
+Ref<pg::VoxelGraphFunction> clone_graph_function(const Ref<pg::VoxelGraphFunction> &src_graph) {
+	Ref<pg::VoxelGraphFunction> cloned_graph;
+	cloned_graph.instantiate();
+	const Dictionary graph_data = src_graph->get_graph_as_variant_data();
+	ERR_FAIL_COND_V(!cloned_graph->load_graph_from_variant_data(graph_data), Ref<pg::VoxelGraphFunction>());
+	return cloned_graph;
+}
+
+Ref<Material> duplicate_material_resource(Ref<Material> material) {
+	if (material.is_null()) {
+		return Ref<Material>();
+	}
+	Ref<Resource> duplicated_resource = material->duplicate(false);
+	Ref<Material> duplicated_material = duplicated_resource;
+	if (duplicated_material.is_valid()) {
+		return duplicated_material;
+	}
+	return material;
+}
+
+Ref<Material> blend_standard_material_resources(Ref<Material> a_material, Ref<Material> b_material, float alpha) {
+	alpha = math::clamp(alpha, 0.f, 1.f);
+
+	if (a_material.is_null()) {
+		return duplicate_material_resource(b_material);
+	}
+	if (b_material.is_null()) {
+		return duplicate_material_resource(a_material);
+	}
+	if (alpha <= 0.0001f) {
+		return duplicate_material_resource(a_material);
+	}
+	if (alpha >= 0.9999f) {
+		return duplicate_material_resource(b_material);
+	}
+
+	Ref<StandardMaterial3D> a = a_material;
+	Ref<StandardMaterial3D> b = b_material;
+	if (a.is_null() || b.is_null()) {
+		return duplicate_material_resource(alpha < 0.5f ? a_material : b_material);
+	}
+
+	Ref<Resource> duplicated_resource = (alpha < 0.5f ? a : b)->duplicate(false);
+	Ref<StandardMaterial3D> out = duplicated_resource;
+	if (out.is_null()) {
+		out.instantiate();
+	}
+
+	out->set_albedo(a->get_albedo().lerp(b->get_albedo(), alpha));
+	out->set_roughness(Math::lerp(a->get_roughness(), b->get_roughness(), alpha));
+	out->set_metallic(Math::lerp(a->get_metallic(), b->get_metallic(), alpha));
+	out->set_specular(Math::lerp(a->get_specular(), b->get_specular(), alpha));
+	out->set_emission(a->get_emission().lerp(b->get_emission(), alpha));
+	out->set_emission_energy_multiplier(
+			Math::lerp(a->get_emission_energy_multiplier(), b->get_emission_energy_multiplier(), alpha));
+
+	return out;
+}
 
 void fill_texturing_data_from_single_texture_index(
 		VoxelBuffer &out_buffer,
@@ -1102,7 +2311,7 @@ bool has_output_type(
 	for (unsigned int other_output_index = 0; other_output_index < runtime.get_output_count(); ++other_output_index) {
 		const pg::Runtime::OutputInfo output = runtime.get_output_info(other_output_index);
 		const ProgramGraph::Node &node = graph.get_node(output.node_id);
-		if (node.type_id == pg::VoxelGraphFunction::NODE_OUTPUT_WEIGHT) {
+		if (node.type_id == node_type_id) {
 			return true;
 		}
 	}
@@ -1121,9 +2330,56 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 
 	std::shared_ptr<Runtime> r = make_shared_instance<Runtime>();
 
+	Ref<pg::VoxelGraphFunction> compile_function = _main_function;
+	MaterialWeightBuildState material_weight_state;
+	unsigned int implicit_material_layer_count = 0;
+	bool implicit_material_output_weights = false;
+	bool has_material_output_node = false;
+	bool has_explicit_texture_outputs = false;
+	int first_material_output_node_id = -1;
+	{
+		const PackedInt32Array node_ids = _main_function->get_node_ids();
+		for (int i = 0; i < node_ids.size(); ++i) {
+			const uint32_t node_id = node_ids[i];
+			switch (_main_function->get_node_type_id(node_id)) {
+				case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL:
+					has_material_output_node = true;
+					if (first_material_output_node_id == -1) {
+						first_material_output_node_id = node_id;
+					}
+					break;
+				case pg::VoxelGraphFunction::NODE_OUTPUT_WEIGHT:
+				case pg::VoxelGraphFunction::NODE_OUTPUT_SINGLE_TEXTURE:
+					has_explicit_texture_outputs = true;
+					break;
+				default:
+					break;
+			}
+		}
+	}
+
+	if (has_material_output_node && !has_explicit_texture_outputs) {
+		compile_function = clone_graph_function(_main_function);
+		ERR_FAIL_COND_V(
+				compile_function.is_null(),
+				pg::CompilationResult::make_error("Failed to clone voxel graph for MaterialOutput compilation"));
+		material_weight_state.graph = compile_function;
+		implicit_material_output_weights = add_implicit_material_output_weights(
+				material_weight_state,
+				first_material_output_node_id,
+				implicit_material_layer_count);
+		if (material_weight_state.has_error) {
+			pg::CompilationResult error;
+			error.success = false;
+			error.node_id = material_weight_state.error_node_id;
+			error.message = material_weight_state.error_message;
+			return error;
+		}
+	}
+
 	// We usually expect X, Y, Z and SDF inputs. Custom inputs are not supported.
-	_main_function->auto_pick_inputs_and_outputs();
-	Span<const pg::VoxelGraphFunction::Port> input_defs = _main_function->get_input_definitions();
+	compile_function->auto_pick_inputs_and_outputs();
+	Span<const pg::VoxelGraphFunction::Port> input_defs = compile_function->get_input_definitions();
 	for (unsigned int input_index = 0; input_index < input_defs.size(); ++input_index) {
 		const pg::VoxelGraphFunction::Port &port = input_defs[input_index];
 		switch (port.type) {
@@ -1149,18 +2405,146 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 	// TODO This bypasses VoxelGraphFunction's compiling method, we should probably use it now
 	// Core compilation
 	pg::Runtime &runtime = r->runtime;
-	const pg::CompilationResult result = runtime.compile(**_main_function, debug);
+	const pg::CompilationResult result = runtime.compile(**compile_function, debug);
 
 	if (!result.success) {
 		return result;
 	}
 
+	const ProgramGraph &compiled_source_graph = compile_function->get_graph();
 	const ProgramGraph &source_graph = _main_function->get_graph();
+	int material_output_node_id = -1;
+	bool material_output_uses_non_constant_inputs = false;
+
+	auto sample_material_scalar = [&](const ProgramGraph::Node &node, const uint32_t input_index, float fallback) {
+		if (input_index < node.default_inputs.size()) {
+			const Variant &default_value = node.default_inputs[input_index];
+			if (default_value.get_type() != Variant::NIL) {
+				fallback = default_value;
+			}
+		}
+
+		ProgramGraph::PortLocation src;
+		if (!_main_function->try_get_connection_to(ProgramGraph::PortLocation{ node.id, input_index }, src)) {
+			return fallback;
+		}
+
+		uint16_t buffer_address = 0;
+		if (!runtime.try_get_output_port_address(src, buffer_address)) {
+			return fallback;
+		}
+
+		pg::Runtime::State state;
+		runtime.prepare_state(state, 1, false);
+		QueryInputs<math::Interval> interval_inputs(
+				*r,
+				math::Interval(-1.f, 1.f),
+				math::Interval(-1.f, 1.f),
+				math::Interval(-1.f, 1.f),
+				math::Interval(-1.f, 1.f));
+		runtime.analyze_range(state, interval_inputs.get());
+		const math::Interval alpha_range = state.get_range(buffer_address);
+		if (!alpha_range.is_single_value()) {
+			material_output_uses_non_constant_inputs = true;
+		}
+
+		QueryInputs<float> sample_inputs(*r, 0.f, 0.f, 0.f, 0.f);
+		runtime.generate_single(state, sample_inputs.get(), nullptr);
+		const pg::Runtime::Buffer &buffer = state.get_buffer(buffer_address);
+		if (buffer.is_constant) {
+			return buffer.constant_value;
+		}
+		if (buffer.data != nullptr) {
+			return buffer.data[0];
+		}
+		return fallback;
+	};
+
+	std::function<Ref<Material>(uint32_t)> evaluate_material_node;
+	auto evaluate_material_input = [&](const uint32_t node_id, const uint32_t input_index) -> Ref<Material> {
+		ProgramGraph::PortLocation src;
+		if (!_main_function->try_get_connection_to(ProgramGraph::PortLocation{ node_id, input_index }, src)) {
+			return Ref<Material>();
+		}
+		return evaluate_material_node(src.node_id);
+	};
+	
+	evaluate_material_node = [&](const uint32_t node_id) -> Ref<Material> {
+		const ProgramGraph::Node &node = source_graph.get_node(node_id);
+		switch (node.type_id) {
+			case pg::VoxelGraphFunction::NODE_MATERIAL: {
+				if (node.params.size() == 0) {
+					return Ref<Material>();
+				}
+				Ref<Material> material = node.params[0];
+				return duplicate_material_resource(material);
+			}
+
+			case pg::VoxelGraphFunction::NODE_BLEND_MATERIAL: {
+				Ref<Material> a_material = evaluate_material_input(node.id, 0);
+				Ref<Material> b_material = evaluate_material_input(node.id, 1);
+				const float alpha = math::clamp(sample_material_scalar(node, 2, 0.5f), 0.f, 1.f);
+				return blend_standard_material_resources(a_material, b_material, alpha);
+			}
+
+			case pg::VoxelGraphFunction::NODE_MATERIAL_SWITCH: {
+				Ref<Material> a_material = evaluate_material_input(node.id, 0);
+				Ref<Material> b_material = evaluate_material_input(node.id, 1);
+				const float selector = sample_material_scalar(node, 2, 0.f);
+				const float threshold = sample_material_scalar(node, 3, 0.5f);
+				return duplicate_material_resource(selector < threshold ? a_material : b_material);
+			}
+
+			case pg::VoxelGraphFunction::NODE_MATERIAL_PROPERTY_OVERRIDE: {
+				Ref<Material> input_material = evaluate_material_input(node.id, 0);
+				Ref<StandardMaterial3D> material = duplicate_material_resource(input_material);
+				if (material.is_null()) {
+					material.instantiate();
+				}
+
+				Color albedo = material->get_albedo();
+				albedo.r = math::clamp(sample_material_scalar(node, 1, albedo.r), 0.f, 1.f);
+				albedo.g = math::clamp(sample_material_scalar(node, 2, albedo.g), 0.f, 1.f);
+				albedo.b = math::clamp(sample_material_scalar(node, 3, albedo.b), 0.f, 1.f);
+				material->set_albedo(albedo);
+				material->set_roughness(math::clamp(sample_material_scalar(node, 4, material->get_roughness()), 0.f, 1.f));
+				material->set_metallic(math::clamp(sample_material_scalar(node, 5, material->get_metallic()), 0.f, 1.f));
+				material->set_specular(math::clamp(sample_material_scalar(node, 6, material->get_specular()), 0.f, 1.f));
+
+				Color emission = material->get_emission();
+				emission.r = math::max(sample_material_scalar(node, 7, emission.r), 0.f);
+				emission.g = math::max(sample_material_scalar(node, 8, emission.g), 0.f);
+				emission.b = math::max(sample_material_scalar(node, 9, emission.b), 0.f);
+				material->set_emission(emission);
+				material->set_emission_energy_multiplier(
+						math::max(sample_material_scalar(node, 10, material->get_emission_energy_multiplier()), 0.f));
+				material->set_normal_scale(math::max(sample_material_scalar(node, 11, material->get_normal_scale()), 0.f));
+				return material;
+			}
+
+			case pg::VoxelGraphFunction::NODE_MATERIAL_STACK: {
+				Ref<Material> base_material = evaluate_material_input(node.id, 0);
+				Ref<Material> middle_material = evaluate_material_input(node.id, 1);
+				Ref<Material> top_material = evaluate_material_input(node.id, 2);
+				const float middle_alpha = math::clamp(sample_material_scalar(node, 3, 0.5f), 0.f, 1.f);
+				const float top_alpha = math::clamp(sample_material_scalar(node, 4, 0.5f), 0.f, 1.f);
+				Ref<Material> stacked_material =
+						blend_standard_material_resources(base_material, middle_material, middle_alpha);
+				return blend_standard_material_resources(stacked_material, top_material, top_alpha);
+			}
+
+			case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL:
+				return evaluate_material_input(node.id, 0);
+
+			default:
+				return Ref<Material>();
+		}
+	};
 
 	// Extra steps
 	for (unsigned int output_index = 0; output_index < runtime.get_output_count(); ++output_index) {
 		const pg::Runtime::OutputInfo output = runtime.get_output_info(output_index);
-		const ProgramGraph::Node &node = source_graph.get_node(output.node_id);
+		const ProgramGraph::Node &node = compiled_source_graph.get_node(output.node_id);
 
 		// TODO Allow specifying max count in pg::NodeTypeDB so we can make some of these checks more generic
 		switch (node.type_id) {
@@ -1244,7 +2628,7 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 					error.node_id = output.node_id;
 					return error;
 				}
-				if (has_output_type(runtime, source_graph, pg::VoxelGraphFunction::NODE_OUTPUT_WEIGHT)) {
+				if (has_output_type(runtime, compiled_source_graph, pg::VoxelGraphFunction::NODE_OUTPUT_WEIGHT)) {
 					pg::CompilationResult error;
 					error.success = false;
 					error.message =
@@ -1254,6 +2638,17 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 				}
 				r->single_texture_output_index = output_index;
 				r->single_texture_output_buffer_index = output.buffer_address;
+				break;
+
+			case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL:
+				if (material_output_node_id != -1) {
+					pg::CompilationResult error;
+					error.success = false;
+					error.message = ZN_TTR("Multiple material outputs are not supported");
+					error.node_id = output.node_id;
+					return error;
+				}
+				material_output_node_id = output.node_id;
 				break;
 
 			default:
@@ -1286,7 +2681,7 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 		FixedArray<uint8_t, 4> spare_indices;
 		fill(used_indices_map, false);
 		unsigned int used_indices_count = 0;
-		for (unsigned int i = 0; i < r->weight_outputs.size(); ++i) {
+		for (unsigned int i = 0; i < r->weight_outputs_count; ++i) {
 			const unsigned int layer_index = r->weight_outputs[i].layer_index;
 			used_indices_count += static_cast<unsigned int>(!used_indices_map[layer_index]);
 			used_indices_map[layer_index] = true;
@@ -1305,9 +2700,42 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 		r->spare_texture_indices = spare_indices;
 	}
 
+	Ref<Material> compiled_material;
+	if (material_output_node_id != -1) {
+		compiled_material = evaluate_material_node(material_output_node_id);
+		if (compiled_material.is_null()) {
+			pg::CompilationResult error;
+			error.success = false;
+			error.message = ZN_TTR(
+					"MaterialOutput must be connected to a supported material chain (Material, BlendMaterial, MaterialSwitch, MaterialPropertyOverride or MaterialStack)");
+			error.node_id = material_output_node_id;
+			return error;
+		}
+		if (implicit_material_output_weights && material_output_uses_non_constant_inputs && implicit_material_layer_count > 1) {
+			Ref<Material> spatial_material =
+					create_spatial_material_from_graph(_main_function, material_weight_state, material_output_node_id);
+			if (spatial_material.is_null()) {
+				spatial_material = create_spatial_material_from_layers(material_weight_state.layer_materials);
+			}
+			if (spatial_material.is_valid()) {
+				compiled_material = spatial_material;
+			}
+		} else if (material_output_uses_non_constant_inputs && !implicit_material_output_weights &&
+					r->weight_outputs_count == 0) {
+			ZN_PRINT_WARNING(
+					"Voxel graph MaterialOutput depends on non-constant values but no voxel weight outputs are available for spatial blending. Add OutputWeight nodes or keep the implicit MaterialOutput bridge enabled."
+			);
+		}
+	}
+
 	// Store valid result
-	RWLockWrite wlock(_runtime_lock);
-	_runtime = r;
+	{
+		RWLockWrite wlock(_runtime_lock);
+		_runtime = r;
+		_final_material = compiled_material;
+	}
+
+	emit_changed();
 
 	const int64_t time_spent = Time::get_singleton()->get_ticks_usec() - time_before;
 	ZN_PRINT_VERBOSE(format("Voxel graph compiled in {} us", time_spent));
@@ -2478,6 +3906,11 @@ float VoxelGeneratorGraph::_b_debug_measure_microseconds_per_voxel(bool singular
 }
 
 void VoxelGeneratorGraph::_on_subresource_changed() {
+	{
+		RWLockWrite wlock(_runtime_lock);
+		_runtime.reset();
+	}
+	_final_material.unref();
 	emit_changed();
 }
 
@@ -2500,6 +3933,7 @@ void VoxelGeneratorGraph::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("clear"), &Self::clear);
 	ClassDB::bind_method(D_METHOD("get_main_function"), &Self::get_main_function);
+	ClassDB::bind_method(D_METHOD("get_final_material"), &Self::get_final_material);
 
 	ClassDB::bind_method(D_METHOD("set_sdf_clip_threshold", "threshold"), &Self::set_sdf_clip_threshold);
 	ClassDB::bind_method(D_METHOD("get_sdf_clip_threshold"), &Self::get_sdf_clip_threshold);

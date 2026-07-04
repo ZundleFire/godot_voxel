@@ -1,0 +1,273 @@
+// Voxel ISPC minimal header — self-contained math types and utilities.
+// Replaces UE5 VoxelPlugin's VoxelMinimal.isph with only what we need.
+// Copyright (c) 2024 GodotEden contributors. MIT License.
+
+#pragma once
+
+// ============================================================================
+// Basic math types
+// ============================================================================
+
+struct float2 {
+    float x, y;
+};
+
+struct float3 {
+    float x, y, z;
+};
+
+struct int2 {
+    int32 x, y;
+};
+
+struct int3 {
+    int32 x, y, z;
+};
+
+// ============================================================================
+// Constructors
+// ============================================================================
+
+inline float2 MakeFloat2(float x, float y) {
+    float2 r;
+    r.x = x;
+    r.y = y;
+    return r;
+}
+
+inline float3 MakeFloat3(float x, float y, float z) {
+    float3 r;
+    r.x = x;
+    r.y = y;
+    r.z = z;
+    return r;
+}
+
+inline int2 MakeInt2(float2 f) {
+    int2 r;
+    r.x = (int32)f.x;
+    r.y = (int32)f.y;
+    return r;
+}
+
+inline int2 MakeInt2(int32 x, int32 y) {
+    int2 r;
+    r.x = x;
+    r.y = y;
+    return r;
+}
+
+inline int3 MakeInt3(float3 f) {
+    int3 r;
+    r.x = (int32)f.x;
+    r.y = (int32)f.y;
+    r.z = (int32)f.z;
+    return r;
+}
+
+inline int3 MakeInt3(int32 x, int32 y, int32 z) {
+    int3 r;
+    r.x = x;
+    r.y = y;
+    r.z = z;
+    return r;
+}
+
+// ============================================================================
+// Arithmetic on struct types
+// ============================================================================
+
+inline float2 operator+(float2 a, float2 b) {
+    return MakeFloat2(a.x + b.x, a.y + b.y);
+}
+inline float2 operator+(float2 a, float s) {
+    return MakeFloat2(a.x + s, a.y + s);
+}
+inline float2 operator-(float2 a, float2 b) {
+    return MakeFloat2(a.x - b.x, a.y - b.y);
+}
+inline float2 operator-(float2 a, float s) {
+    return MakeFloat2(a.x - s, a.y - s);
+}
+inline float2 operator*(float2 a, float s) {
+    return MakeFloat2(a.x * s, a.y * s);
+}
+inline float2 operator*(float s, float2 a) {
+    return MakeFloat2(a.x * s, a.y * s);
+}
+inline float2 operator/(float2 a, float s) {
+    return MakeFloat2(a.x / s, a.y / s);
+}
+
+inline float3 operator+(float3 a, float3 b) {
+    return MakeFloat3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+inline float3 operator+(float3 a, float s) {
+    return MakeFloat3(a.x + s, a.y + s, a.z + s);
+}
+inline float3 operator-(float3 a, float3 b) {
+    return MakeFloat3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+inline float3 operator-(float3 a, float s) {
+    return MakeFloat3(a.x - s, a.y - s, a.z - s);
+}
+inline float3 operator*(float3 a, float s) {
+    return MakeFloat3(a.x * s, a.y * s, a.z * s);
+}
+inline float3 operator*(float s, float3 a) {
+    return MakeFloat3(a.x * s, a.y * s, a.z * s);
+}
+inline float3 operator/(float3 a, float s) {
+    return MakeFloat3(a.x / s, a.y / s, a.z / s);
+}
+
+inline int2 operator*(int2 a, int2 b) {
+    return MakeInt2(a.x * b.x, a.y * b.y);
+}
+inline int2 operator+(int2 a, int2 b) {
+    return MakeInt2(a.x + b.x, a.y + b.y);
+}
+
+inline int3 operator*(int3 a, int3 b) {
+    return MakeInt3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+inline int3 operator+(int3 a, int3 b) {
+    return MakeInt3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+// ============================================================================
+// Math utilities
+// ============================================================================
+
+inline float dot(float2 a, float2 b) {
+    return a.x * b.x + a.y * b.y;
+}
+
+inline float dot(float3 a, float3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+inline float DistanceSquared(float2 a, float2 b) {
+    float2 d = a - b;
+    return dot(d, d);
+}
+
+inline float DistanceSquared(float3 a, float3 b) {
+    float3 d = a - b;
+    return dot(d, d);
+}
+
+inline float2 normalize(float2 v) {
+    float len = sqrt(dot(v, v));
+    if (len > 0.0f) {
+        return v / len;
+    }
+    return MakeFloat2(0.0f, 0.0f);
+}
+
+inline float3 normalize(float3 v) {
+    float len = sqrt(dot(v, v));
+    if (len > 0.0f) {
+        return v / len;
+    }
+    return MakeFloat3(0.0f, 0.0f, 0.0f);
+}
+
+inline float2 floor(float2 v) {
+    return MakeFloat2(floor(v.x), floor(v.y));
+}
+
+inline float3 floor(float3 v) {
+    return MakeFloat3(floor(v.x), floor(v.y), floor(v.z));
+}
+
+inline bool IsFinite(float v) {
+    return !isnan(v) && !isinf(v);
+}
+
+// ============================================================================
+// Integer constants
+// ============================================================================
+
+#define MAX_int32 2147483647
+#define MAX_uint16 65535
+
+// ============================================================================
+// Interpolation
+// ============================================================================
+
+inline float BilinearInterpolation(
+    float v00, float v10, float v01, float v11,
+    float tx, float ty
+) {
+    float a = v00 + (v10 - v00) * tx;
+    float b = v01 + (v11 - v01) * tx;
+    return a + (b - a) * ty;
+}
+
+inline float TrilinearInterpolation(
+    float v000, float v100, float v010, float v110,
+    float v001, float v101, float v011, float v111,
+    float tx, float ty, float tz
+) {
+    float a = BilinearInterpolation(v000, v100, v010, v110, tx, ty);
+    float b = BilinearInterpolation(v001, v101, v011, v111, tx, ty);
+    return a + (b - a) * tz;
+}
+
+// ============================================================================
+// Additional math utilities
+// ============================================================================
+
+inline float lerp(const float A, const float B, const float Alpha) {
+    return A + Alpha * (B - A);
+}
+
+inline float2 lerp(const float2 A, const float2 B, const float Alpha) {
+    return MakeFloat2(
+        A.x + Alpha * (B.x - A.x),
+        A.y + Alpha * (B.y - A.y));
+}
+
+inline float3 lerp(const float3 A, const float3 B, const float Alpha) {
+    return MakeFloat3(
+        A.x + Alpha * (B.x - A.x),
+        A.y + Alpha * (B.y - A.y),
+        A.z + Alpha * (B.z - A.z));
+}
+
+inline float InvSqrt(const float X) {
+    return rsqrt(X);
+}
+
+inline float InterpHermite(const float Value) {
+    return Value * Value * (3.0f - (Value * 2.0f));
+}
+
+inline float2 InterpHermite(const float2 Value) {
+    return MakeFloat2(InterpHermite(Value.x), InterpHermite(Value.y));
+}
+
+inline float3 InterpHermite(const float3 Value) {
+    return MakeFloat3(InterpHermite(Value.x), InterpHermite(Value.y), InterpHermite(Value.z));
+}
+
+inline float SmoothStep(const float X) {
+    return X * X * (3.0f - 2.0f * X);
+}
+
+// ============================================================================
+// Bit manipulation (for gradient noise sign tricks)
+// ============================================================================
+// intbits() and floatbits() are ISPC builtins — no wrappers needed.
+
+// MakeRegister — construct SIMD register with per-lane constants
+// These are used for SIMD-optimized gradient lookups via shuffle()
+#if TARGET_WIDTH == 8
+#define MakeRegister(A, B, C, D, E, F, G, H) { A, B, C, D, E, F, G, H }
+#elif TARGET_WIDTH == 4
+#define MakeRegister(A, B, C, D) { A, B, C, D }
+#endif
+
+// VOXEL_ASSUME — hint to the compiler that a condition is always true
+#define VOXEL_ASSUME(cond) /* no-op in ISPC, used for switch default */

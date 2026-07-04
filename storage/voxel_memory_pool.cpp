@@ -11,6 +11,12 @@ namespace {
 VoxelMemoryPool *g_memory_pool = nullptr;
 } // namespace
 
+// Thread-local cache instance – one per thread, lazily initialized.
+VoxelMemoryPool::TLSCache &VoxelMemoryPool::get_tls_cache() {
+	thread_local TLSCache tls_cache;
+	return tls_cache;
+}
+
 void VoxelMemoryPool::create_singleton() {
 	ZN_ASSERT(g_memory_pool == nullptr);
 	g_memory_pool = ZN_NEW(VoxelMemoryPool);
@@ -119,26 +125,44 @@ uint8_t *VoxelMemoryPool::allocate(size_t size) {
 #endif
 	} else {
 		const unsigned int pot = get_pool_index_from_size(size);
-		Pool &pool = _pot_pools[pot];
-		pool.mutex.lock();
-		if (pool.blocks.size() > 0) {
-			block = pool.blocks.back();
-			pool.blocks.pop_back();
-			pool.mutex.unlock();
+
+		// --- Try thread-local cache first (no lock) ---
+		TLSCache &tls = get_tls_cache();
+		TLSPoolBucket &tls_bucket = tls.buckets[pot];
+		if (tls_bucket.count > 0) {
+			block = tls_bucket.blocks[--tls_bucket.count];
 		} else {
-			pool.mutex.unlock();
-			ZN_PROFILE_SCOPE_NAMED("new alloc");
-			// All allocations done in this pool have the same size,
-			// which must be greater or equal to `size`
-			const size_t capacity = get_size_from_pool_index(pot);
+			// TLS cache empty – try to refill from the shared pool in one lock
+			Pool &pool = _pot_pools[pot];
+			pool.mutex.lock();
+			const unsigned int available = static_cast<unsigned int>(pool.blocks.size());
+			if (available > 0) {
+				const unsigned int grab = (available < TLS_REFILL_COUNT) ? available : TLS_REFILL_COUNT;
+				// Take the first block for the caller
+				block = pool.blocks.back();
+				pool.blocks.pop_back();
+				// Fill TLS cache with the rest
+				for (unsigned int i = 1; i < grab; ++i) {
+					tls_bucket.blocks[tls_bucket.count++] = pool.blocks.back();
+					pool.blocks.pop_back();
+				}
+				pool.mutex.unlock();
+			} else {
+				pool.mutex.unlock();
+				ZN_PROFILE_SCOPE_NAMED("new alloc");
+				// All allocations done in this pool have the same size,
+				// which must be greater or equal to `size`
+				const size_t capacity = get_size_from_pool_index(pot);
 #ifdef DEBUG_ENABLED
-			ZN_ASSERT(capacity >= size);
+				ZN_ASSERT(capacity >= size);
 #endif
-			block = (uint8_t *)ZN_ALLOC(capacity * sizeof(uint8_t));
-			_total_memory += size;
+				block = (uint8_t *)ZN_ALLOC(capacity * sizeof(uint8_t));
+				_total_memory += size;
+			}
 		}
 #ifdef DEBUG_ENABLED
 		if (block != nullptr) {
+			Pool &pool = _pot_pools[pot];
 			pool.debug_used_blocks.add(block);
 		}
 #endif
@@ -170,16 +194,49 @@ void VoxelMemoryPool::recycle(uint8_t *block, size_t size) {
 		_total_memory -= size;
 	} else {
 		const unsigned int pot = get_pool_index_from_size(size);
-		Pool &pool = _pot_pools[pot];
 #ifdef DEBUG_ENABLED
-		// Make sure this allocation was done by this pool in this scenario
-		pool.debug_used_blocks.remove(block);
+		{
+			Pool &pool = _pot_pools[pot];
+			// Make sure this allocation was done by this pool in this scenario
+			pool.debug_used_blocks.remove(block);
+		}
 #endif
-		MutexLock lock(pool.mutex);
-		pool.blocks.push_back(block);
+		// --- Try thread-local cache first (no lock) ---
+		TLSCache &tls = get_tls_cache();
+		TLSPoolBucket &tls_bucket = tls.buckets[pot];
+		if (tls_bucket.count < TLS_CACHE_CAPACITY) {
+			tls_bucket.blocks[tls_bucket.count++] = block;
+		} else {
+			// TLS cache full – flush half of the cache (including this block) back to the shared pool
+			Pool &pool = _pot_pools[pot];
+			MutexLock lock(pool.mutex);
+			pool.blocks.push_back(block);
+			const unsigned int flush_count = TLS_CACHE_CAPACITY / 2;
+			for (unsigned int i = 0; i < flush_count; ++i) {
+				pool.blocks.push_back(tls_bucket.blocks[--tls_bucket.count]);
+			}
+		}
 	}
 	--_used_blocks;
 	_used_memory -= size;
+}
+
+void VoxelMemoryPool::flush_tls_caches() {
+	// Flush the calling thread's TLS cache back to the shared pool.
+	// NOTE: This only flushes the current thread's cache. For a full flush across all threads,
+	// each thread must call this (e.g., before a thread exits).
+	TLSCache &tls = get_tls_cache();
+	for (unsigned int pot = 0; pot < _pot_pools.size(); ++pot) {
+		TLSPoolBucket &tls_bucket = tls.buckets[pot];
+		if (tls_bucket.count > 0) {
+			Pool &pool = _pot_pools[pot];
+			MutexLock lock(pool.mutex);
+			for (unsigned int i = 0; i < tls_bucket.count; ++i) {
+				pool.blocks.push_back(tls_bucket.blocks[i]);
+			}
+			tls_bucket.count = 0;
+		}
+	}
 }
 
 void VoxelMemoryPool::clear_unused_blocks() {

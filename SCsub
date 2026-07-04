@@ -89,6 +89,28 @@ if env["tracy"]:
 
 # ----------------------------------------------------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------------------------------------------------
+# ISPC SIMD noise
+
+ISPC_ENABLED = False
+if env["voxel_ispc"] and env["arch"].startswith("x86"):
+	import ispc_builder
+	ISPC_ENABLED = ispc_builder.setup_ispc(env_voxel, env)
+	if ISPC_ENABLED:
+		# Compile the ISPC kernels — returns list of [dispatch_obj, sse4_obj, avx2_obj, ...]
+		ispc_objs = env_voxel.ISPC("util/noise/voxel_advanced_noise_ispc.ispc")
+		ispc_objs += env_voxel.ISPC("util/noise/voxel_domain_warp_ispc.ispc")
+		ispc_objs += env_voxel.ISPC("generators/graph/voxel_graph_math_ops_ispc.ispc")
+		ispc_objs += env_voxel.ISPC("util/noise/voxel_procedural_noise_ispc.ispc")
+		# Add ALL ISPC objects (dispatch + per-target) to the module sources
+		for obj in ispc_objs:
+			env.modules_sources += [obj]
+		# Add the C++ dispatch wrapper
+		voxel_files += ["util/noise/voxel_advanced_noise_simd.cpp"]
+		voxel_files += ["util/noise/voxel_procedural_noise_simd.cpp"]
+
+# ----------------------------------------------------------------------------------------------------------------------
+
 for f in voxel_files:
 	env_voxel.add_source_files(env.modules_sources, f)
 

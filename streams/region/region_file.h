@@ -8,6 +8,7 @@
 #include "../../util/math/color8.h"
 #include "../../util/math/vector3i.h"
 #include "../compressed_data.h"
+#include "region_file_mmap.h"
 
 namespace zylann::voxel {
 
@@ -124,6 +125,10 @@ private:
 
 	Ref<FileAccess> _file_access;
 	bool _header_modified = false;
+
+	// Optional memory-mapped read path – avoids FileAccess seeks / copies for load_block()
+	RegionFileMMap _mmap;
+	bool _use_mmap = false;
 
 	Header _header;
 

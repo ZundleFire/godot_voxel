@@ -83,6 +83,10 @@ CompilationResult generate_shader(
 	expanded_graph.find_dependencies(to_span(terminal_nodes), order);
 
 	CodeGenHelper codegen;
+	StdUnorderedMap<uint32_t, StdString> output_node_var_names;
+	unsigned int sdf_output_count = 0;
+	unsigned int single_texture_output_count = 0;
+	unsigned int type_output_count = 0;
 
 	codegen.add("void generate(vec3 pos");
 
@@ -91,17 +95,29 @@ CompilationResult generate_shader(
 		const NodeType &node_type = type_db.get_type(node.type_id);
 
 		if (node_type.category == CATEGORY_OUTPUT) {
+			StdString output_name;
 			switch (node.type_id) {
 				case VoxelGraphFunction::NODE_OUTPUT_SDF:
-					codegen.add(", out float out_sd");
+					output_name = sdf_output_count == 0 ? StdString("out_sd") : format("out_sd_{}", sdf_output_count);
+					++sdf_output_count;
+					codegen.add_format(", out float {}", output_name);
+					output_node_var_names.insert({ node_id, output_name });
 					outputs.push_back(ShaderOutput{ ShaderOutput::TYPE_SDF });
 					break;
 				case VoxelGraphFunction::NODE_OUTPUT_SINGLE_TEXTURE:
-					codegen.add(", out float out_single_texture");
+					output_name = single_texture_output_count == 0 ?
+							StdString("out_single_texture") :
+							format("out_single_texture_{}", single_texture_output_count);
+					++single_texture_output_count;
+					codegen.add_format(", out float {}", output_name);
+					output_node_var_names.insert({ node_id, output_name });
 					outputs.push_back(ShaderOutput{ ShaderOutput::TYPE_SINGLE_TEXTURE });
 					break;
 				case VoxelGraphFunction::NODE_OUTPUT_TYPE:
-					codegen.add(", out float out_type");
+					output_name = type_output_count == 0 ? StdString("out_type") : format("out_type_{}", type_output_count);
+					++type_output_count;
+					codegen.add_format(", out float {}", output_name);
+					output_node_var_names.insert({ node_id, output_name });
 					outputs.push_back(ShaderOutput{ ShaderOutput::TYPE_TYPE });
 					break;
 				default:
@@ -157,42 +173,20 @@ CompilationResult generate_shader(
 				codegen.add_format("float {} = {};\n", name, float(node.params[0]));
 				continue;
 			}
-			case VoxelGraphFunction::NODE_OUTPUT_SDF: {
-				ZN_ASSERT(node.outputs.size() == 1);
-				const ProgramGraph::Port &input_port = node.inputs[0];
-				if (input_port.connections.size() > 0) {
-					ZN_ASSERT(input_port.connections.size() == 1);
-					auto it = port_to_var.find(input_port.connections[0]);
-					ZN_ASSERT(it != port_to_var.end());
-					codegen.add_format("out_sd = {};\n", it->second);
-				} else {
-					codegen.add_format("out_sd = {};\n", float(node.default_inputs[0]));
-				}
-				continue;
-			}
-			case VoxelGraphFunction::NODE_OUTPUT_SINGLE_TEXTURE: {
-				ZN_ASSERT(node.outputs.size() == 1);
-				const ProgramGraph::Port &input_port = node.inputs[0];
-				if (input_port.connections.size() > 0) {
-					ZN_ASSERT(input_port.connections.size() == 1);
-					auto it = port_to_var.find(input_port.connections[0]);
-					ZN_ASSERT(it != port_to_var.end());
-					codegen.add_format("out_single_texture = {};\n", it->second);
-				} else {
-					codegen.add_format("out_single_texture = {};\n", float(node.default_inputs[0]));
-				}
-				continue;
-			}
+			case VoxelGraphFunction::NODE_OUTPUT_SDF:
+			case VoxelGraphFunction::NODE_OUTPUT_SINGLE_TEXTURE:
 			case VoxelGraphFunction::NODE_OUTPUT_TYPE: {
 				ZN_ASSERT(node.outputs.size() == 1);
+				auto out_name_it = output_node_var_names.find(node.id);
+				ZN_ASSERT(out_name_it != output_node_var_names.end());
 				const ProgramGraph::Port &input_port = node.inputs[0];
 				if (input_port.connections.size() > 0) {
 					ZN_ASSERT(input_port.connections.size() == 1);
 					auto it = port_to_var.find(input_port.connections[0]);
 					ZN_ASSERT(it != port_to_var.end());
-					codegen.add_format("out_type = {};\n", it->second);
+					codegen.add_format("{} = {};\n", out_name_it->second, it->second);
 				} else {
-					codegen.add_format("out_type = {};\n", float(node.default_inputs[0]));
+					codegen.add_format("{} = {};\n", out_name_it->second, float(node.default_inputs[0]));
 				}
 				continue;
 			}

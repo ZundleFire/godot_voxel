@@ -1,15 +1,19 @@
 #include "test_voxel_graph.h"
+#include "../../../eden_planet_gen/planet_tectonics.h"
 #include "../../generators/graph/curve_utility.h"
 #include "../../generators/graph/image_range_grid.h"
 #include "../../generators/graph/image_utility.h"
 #include "../../generators/graph/node_type_db.h"
 #include "../../generators/graph/voxel_generator_graph.h"
+#include "../../terrain/variable_lod/voxel_lod_terrain.h"
 #include "../../storage/mixel4.h"
 #include "../../storage/voxel_buffer.h"
 #include "../../util/containers/container_funcs.h"
 #include "../../util/containers/std_vector.h"
 #include "../../util/godot/classes/fast_noise_lite.h"
 #include "../../util/godot/classes/image.h"
+#include "../../util/godot/classes/shader_material.h"
+#include "../../util/godot/classes/standard_material_3d.h"
 #include "../../util/godot/core/random_pcg.h"
 #include "../../util/io/std_string_text_writer.h"
 #include "../../util/math/conv.h"
@@ -806,6 +810,449 @@ void test_voxel_graph_generate_block_with_input_sdf() {
 	L::test(false, BLOCK_SIZE / 2);
 	L::test(true, BLOCK_SIZE / 2);
 }
+
+void test_voxel_graph_planet_nodes() {
+	Ref<VoxelGeneratorGraph> generator;
+	generator.instantiate();
+	Ref<VoxelGraphFunction> graph = generator->get_main_function();
+	ZN_TEST_ASSERT(graph.is_valid());
+
+	graph->clear();
+	uint32_t n_x = graph->create_node(VoxelGraphFunction::NODE_INPUT_X);
+	uint32_t n_y = graph->create_node(VoxelGraphFunction::NODE_INPUT_Y);
+	uint32_t n_z = graph->create_node(VoxelGraphFunction::NODE_INPUT_Z);
+	uint32_t n_alt = graph->create_node(VoxelGraphFunction::NODE_PLANET_ALTITUDE);
+	uint32_t n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->add_connection(n_x, 0, n_alt, 0);
+	graph->add_connection(n_y, 0, n_alt, 1);
+	graph->add_connection(n_z, 0, n_alt, 2);
+	graph->add_connection(n_alt, 0, n_out, 0);
+	graph->set_node_param(n_alt, 0, 10.f);
+	pg::CompilationResult result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile altitude graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(Math::abs(generator->generate_single(Vector3i(0, 10, 0), VoxelBuffer::CHANNEL_SDF).f) < 0.001f);
+	ZN_TEST_ASSERT(generator->generate_single(Vector3i(0, 0, 0), VoxelBuffer::CHANNEL_SDF).f < -9.9f);
+
+	graph->clear();
+	n_x = graph->create_node(VoxelGraphFunction::NODE_INPUT_X);
+	n_y = graph->create_node(VoxelGraphFunction::NODE_INPUT_Y);
+	n_z = graph->create_node(VoxelGraphFunction::NODE_INPUT_Z);
+	uint32_t n_climate = graph->create_node(VoxelGraphFunction::NODE_PLANET_CLIMATE);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->add_connection(n_x, 0, n_climate, 0);
+	graph->add_connection(n_y, 0, n_climate, 1);
+	graph->add_connection(n_z, 0, n_climate, 2);
+	graph->add_connection(n_climate, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile climate graph: {0}").format(varray(result.message)));
+	const float equator_temp = generator->generate_single(Vector3i(10, 0, 0), VoxelBuffer::CHANNEL_SDF).f;
+	const float pole_temp = generator->generate_single(Vector3i(0, 10, 0), VoxelBuffer::CHANNEL_SDF).f;
+	ZN_TEST_ASSERT(equator_temp > pole_temp);
+
+	graph->clear();
+	uint32_t n_biome = graph->create_node(VoxelGraphFunction::NODE_PLANET_BIOME);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->add_connection(n_biome, 2, n_out, 0);
+	graph->set_node_default_input(n_biome, 0, 30.f);
+	graph->set_node_default_input(n_biome, 1, 0.9f);
+	graph->set_node_default_input(n_biome, 2, 80.f);
+	graph->set_node_default_input(n_biome, 3, 0.f);
+	graph->set_node_default_input(n_biome, 4, 0.8f);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile biome graph: {0}").format(varray(result.message)));
+	const float tropical_weight = generator->generate_single(Vector3i(0, 0, 0), VoxelBuffer::CHANNEL_SDF).f;
+	ZN_TEST_ASSERT(tropical_weight > 0.2f);
+
+	Ref<PlanetTectonics> tectonics;
+	tectonics.instantiate();
+	Dictionary config;
+	config["n_points"] = 120;
+	config["n_plates"] = 8;
+	tectonics->configure(config);
+	tectonics->generate(12345);
+	graph->clear();
+	n_x = graph->create_node(VoxelGraphFunction::NODE_INPUT_X);
+	n_y = graph->create_node(VoxelGraphFunction::NODE_INPUT_Y);
+	n_z = graph->create_node(VoxelGraphFunction::NODE_INPUT_Z);
+	uint32_t n_cell_noise = graph->create_node(VoxelGraphFunction::NODE_PLANET_CELL_NOISE);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->add_connection(n_x, 0, n_cell_noise, 0);
+	graph->add_connection(n_y, 0, n_cell_noise, 1);
+	graph->add_connection(n_z, 0, n_cell_noise, 2);
+	graph->add_connection(n_cell_noise, 0, n_out, 0);
+	graph->set_node_param(n_cell_noise, 1, 120);
+	graph->set_node_param(n_cell_noise, 2, 77);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile cell-noise graph: {0}").format(varray(result.message)));
+	const float cell_noise = generator->generate_single(Vector3i(10, 0, 0), VoxelBuffer::CHANNEL_SDF).f;
+	ZN_TEST_ASSERT(cell_noise >= 0.f && cell_noise <= 1.f);
+
+	graph->clear();
+	n_x = graph->create_node(VoxelGraphFunction::NODE_INPUT_X);
+	n_y = graph->create_node(VoxelGraphFunction::NODE_INPUT_Y);
+	n_z = graph->create_node(VoxelGraphFunction::NODE_INPUT_Z);
+	uint32_t n_tectonics = graph->create_node(VoxelGraphFunction::NODE_PLANET_TECTONICS);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->add_connection(n_x, 0, n_tectonics, 0);
+	graph->add_connection(n_y, 0, n_tectonics, 1);
+	graph->add_connection(n_z, 0, n_tectonics, 2);
+	graph->add_connection(n_tectonics, 0, n_out, 0);
+	graph->set_node_param(n_tectonics, 0, tectonics);
+	graph->set_node_param(n_tectonics, 1, 10.f);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile tectonics graph: {0}").format(varray(result.message)));
+	const float falloff = generator->generate_single(Vector3i(10, 0, 0), VoxelBuffer::CHANNEL_SDF).f;
+	ZN_TEST_ASSERT(Math::is_finite(falloff));
+}
+
+void test_voxel_graph_material_nodes() {
+	Ref<VoxelGeneratorGraph> generator;
+	generator.instantiate();
+	Ref<VoxelGraphFunction> graph = generator->get_main_function();
+	ZN_TEST_ASSERT(graph.is_valid());
+
+	pg::CompilationResult result;
+
+	graph->clear();
+	const uint32_t n_splitter = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	uint32_t n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_splitter, 0, 10.f);
+	graph->set_node_default_input(n_splitter, 1, 10.f);
+	graph->set_node_default_input(n_splitter, 2, 2.f);
+	graph->add_connection(n_splitter, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile HeightSplitter lower-edge graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(Math::is_equal_approx(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f, 0.f));
+
+	graph->clear();
+	const uint32_t n_splitter_mid = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_splitter_mid, 0, 11.f);
+	graph->set_node_default_input(n_splitter_mid, 1, 10.f);
+	graph->set_node_default_input(n_splitter_mid, 2, 2.f);
+	graph->add_connection(n_splitter_mid, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile HeightSplitter midpoint graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(Math::is_equal_approx(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f, 0.5f));
+
+	graph->clear();
+	const uint32_t n_splitter_above = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_splitter_above, 0, 12.f);
+	graph->set_node_default_input(n_splitter_above, 1, 10.f);
+	graph->set_node_default_input(n_splitter_above, 2, 2.f);
+	graph->add_connection(n_splitter_above, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile HeightSplitter upper-edge graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f > 0.99f);
+
+	graph->clear();
+	const uint32_t n_splitter_below = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_splitter_below, 0, 11.f);
+	graph->set_node_default_input(n_splitter_below, 1, 10.f);
+	graph->set_node_default_input(n_splitter_below, 2, 2.f);
+	graph->add_connection(n_splitter_below, 1, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile HeightSplitter reversed graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(Math::is_equal_approx(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f, 0.5f));
+
+	graph->clear();
+	const uint32_t n_splitter_reference = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_splitter_reference, 0, 1150.f);
+	graph->set_node_default_input(n_splitter_reference, 1, 100.f);
+	graph->set_node_default_input(n_splitter_reference, 2, 100.f);
+	graph->set_node_default_input(n_splitter_reference, 3, 1000.f);
+	graph->add_connection(n_splitter_reference, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile HeightSplitter reference graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(Math::is_equal_approx(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f, 0.5f));
+
+	graph->clear();
+	const uint32_t n_altitude_mask = graph->create_node(VoxelGraphFunction::NODE_ALTITUDE_MASK);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_altitude_mask, 0, 50.f);
+	graph->set_node_default_input(n_altitude_mask, 1, 10.f);
+	graph->set_node_default_input(n_altitude_mask, 2, 100.f);
+	graph->set_node_default_input(n_altitude_mask, 3, 5.f);
+	graph->add_connection(n_altitude_mask, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile AltitudeMask graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f > 0.99f);
+
+	graph->clear();
+	const uint32_t n_noise_mask = graph->create_node(VoxelGraphFunction::NODE_NOISE_MASK);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_noise_mask, 0, 0.8f);
+	graph->set_node_default_input(n_noise_mask, 1, 0.5f);
+	graph->set_node_default_input(n_noise_mask, 2, 0.05f);
+	graph->add_connection(n_noise_mask, 0, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile NoiseMask graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f > 0.99f);
+
+	graph->clear();
+	const uint32_t n_slope_mask = graph->create_node(VoxelGraphFunction::NODE_SLOPE_MASK);
+	n_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_default_input(n_slope_mask, 0, 1.f);
+	graph->set_node_default_input(n_slope_mask, 1, 20.f);
+	graph->set_node_default_input(n_slope_mask, 2, 50.f);
+	graph->add_connection(n_slope_mask, 1, n_out, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile SlopeMask graph: {0}").format(varray(result.message)));
+	ZN_TEST_ASSERT(generator->generate_single(Vector3i(), VoxelBuffer::CHANNEL_SDF).f > 0.99f);
+
+	graph->clear();
+	const uint32_t n_mat_a = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_mat_b = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_blend = graph->create_node(VoxelGraphFunction::NODE_BLEND_MATERIAL);
+	const uint32_t n_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_sdf_const = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+
+	Ref<StandardMaterial3D> material_a;
+	material_a.instantiate();
+	material_a->set_albedo(Color(0.2f, 0.4f, 0.8f));
+	material_a->set_roughness(0.1f);
+	material_a->set_metallic(0.0f);
+
+	Ref<StandardMaterial3D> material_b;
+	material_b.instantiate();
+	material_b->set_albedo(Color(0.8f, 0.6f, 0.2f));
+	material_b->set_roughness(0.9f);
+	material_b->set_metallic(0.5f);
+
+	Ref<StandardMaterial3D> material_c;
+	material_c.instantiate();
+	material_c->set_albedo(Color(0.1f, 0.9f, 0.3f));
+	material_c->set_roughness(0.2f);
+	material_c->set_metallic(0.9f);
+
+	graph->set_node_param(n_mat_a, 0, material_a);
+	graph->set_node_param(n_mat_b, 0, material_b);
+	graph->set_node_param(n_sdf_const, 0, 0.f);
+	graph->set_node_default_input(n_blend, 2, 0.25f);
+
+	graph->add_connection(n_mat_a, 0, n_blend, 0);
+	graph->add_connection(n_mat_b, 0, n_blend, 1);
+	graph->add_connection(n_blend, 0, n_out_material, 0);
+	graph->add_connection(n_sdf_const, 0, n_out_sdf, 0);
+
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile material graph: {0}").format(varray(result.message)));
+
+	Ref<Material> final_material = generator->get_final_material();
+	Ref<StandardMaterial3D> final_standard_material = final_material;
+	ZN_TEST_ASSERT(final_standard_material.is_valid());
+
+	const Color expected_albedo = material_a->get_albedo().lerp(material_b->get_albedo(), 0.25f);
+	const Color final_albedo = final_standard_material->get_albedo();
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_albedo.r, expected_albedo.r));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_albedo.g, expected_albedo.g));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_albedo.b, expected_albedo.b));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_roughness(), Math::lerp(0.1f, 0.9f, 0.25f)));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_metallic(), Math::lerp(0.0f, 0.5f, 0.25f)));
+
+	graph->clear();
+	const uint32_t n_spatial_y = graph->create_node(VoxelGraphFunction::NODE_INPUT_Y);
+	const uint32_t n_spatial_splitter = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	const uint32_t n_spatial_mat_a = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_spatial_mat_b = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_spatial_blend = graph->create_node(VoxelGraphFunction::NODE_BLEND_MATERIAL);
+	const uint32_t n_spatial_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_spatial_sdf = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_spatial_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_spatial_mat_a, 0, material_a);
+	graph->set_node_param(n_spatial_mat_b, 0, material_b);
+	graph->set_node_param(n_spatial_sdf, 0, 0.f);
+	graph->set_node_default_input(n_spatial_splitter, 1, 0.f);
+	graph->set_node_default_input(n_spatial_splitter, 2, 2.f);
+	graph->set_node_default_input(n_spatial_splitter, 3, 2.f);
+	graph->add_connection(n_spatial_y, 0, n_spatial_splitter, 0);
+	graph->add_connection(n_spatial_mat_a, 0, n_spatial_blend, 0);
+	graph->add_connection(n_spatial_mat_b, 0, n_spatial_blend, 1);
+	graph->add_connection(n_spatial_splitter, 0, n_spatial_blend, 2);
+	graph->add_connection(n_spatial_blend, 0, n_spatial_out_material, 0);
+	graph->add_connection(n_spatial_sdf, 0, n_spatial_out_sdf, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile spatial MaterialOutput graph: {0}").format(varray(result.message)));
+	Ref<ShaderMaterial> spatial_material = generator->get_final_material();
+	ZN_TEST_ASSERT(spatial_material.is_valid());
+	if (spatial_material.is_valid()) {
+		Ref<Shader> spatial_shader = spatial_material->get_shader();
+		ZN_TEST_ASSERT(spatial_shader.is_valid());
+		if (spatial_shader.is_valid()) {
+			const String shader_code = spatial_shader->get_code();
+			ZN_TEST_ASSERT(shader_code.contains("varying vec3 v_auto_material_world_pos;"));
+			ZN_TEST_ASSERT(shader_code.contains("v_auto_material_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;"));
+			ZN_TEST_ASSERT(shader_code.contains("generate_auto_material_controls(v_auto_material_world_pos"));
+			ZN_TEST_ASSERT(shader_code.contains("uniform bool u_auto_material_use_flat_shading = true;"));
+			ZN_TEST_ASSERT(shader_code.contains("uniform bool u_auto_material_per_pixel_lod0_only = true;"));
+			ZN_TEST_ASSERT(shader_code.contains("uniform vec2 u_lod_fade;"));
+			ZN_TEST_ASSERT(shader_code.contains("uniform int u_voxel_lod_info;"));
+			ZN_TEST_ASSERT(shader_code.contains("bool use_per_pixel = u_auto_material_per_pixel;"));
+			ZN_TEST_ASSERT(shader_code.contains("u_auto_material_per_pixel_lod0_only && ((u_voxel_lod_info & 0xff) != 0)"));
+			ZN_TEST_ASSERT(shader_code.contains("vec3 flat_dx = dFdx(v_auto_material_world_pos);"));
+			ZN_TEST_ASSERT(shader_code.contains("vec3 flat_dy = dFdy(v_auto_material_world_pos);"));
+			ZN_TEST_ASSERT(shader_code.contains("if (get_lod_fade_discard(SCREEN_UV))"));
+			ZN_TEST_ASSERT(shader_code.contains("NORMAL = view_normal;"));
+			ZN_TEST_ASSERT(!shader_code.contains("generate_auto_material_controls(v_auto_material_pos"));
+			ZN_TEST_ASSERT(!shader_code.contains("generate_auto_material_controls(VERTEX"));
+		}
+		const Variant per_pixel_marker = spatial_material->get_shader_parameter("u_auto_material_per_pixel");
+		ZN_TEST_ASSERT(per_pixel_marker.get_type() == Variant::BOOL);
+		if (per_pixel_marker.get_type() == Variant::BOOL) {
+			ZN_TEST_ASSERT(bool(per_pixel_marker) == true);
+		}
+		const Variant flat_shading_marker = spatial_material->get_shader_parameter("u_auto_material_use_flat_shading");
+		ZN_TEST_ASSERT(flat_shading_marker.get_type() == Variant::BOOL);
+		if (flat_shading_marker.get_type() == Variant::BOOL) {
+			ZN_TEST_ASSERT(bool(flat_shading_marker) == true);
+		}
+	}
+	VoxelBuffer spatial_buffer(VoxelBuffer::ALLOCATOR_DEFAULT);
+	spatial_buffer.create(Vector3i(8, 8, 8));
+	spatial_buffer.set_channel_depth(VoxelBuffer::CHANNEL_INDICES, VoxelBuffer::DEPTH_16_BIT);
+	spatial_buffer.set_channel_depth(VoxelBuffer::CHANNEL_WEIGHTS, VoxelBuffer::DEPTH_16_BIT);
+	VoxelGenerator::VoxelQueryData spatial_query{ spatial_buffer, Vector3i(0, 0, 0), 0 };
+	generator->generate_block(spatial_query);
+	const uint16_t packed_indices_low = spatial_buffer.get_voxel(0, 0, 0, VoxelBuffer::CHANNEL_INDICES);
+	const uint16_t packed_weights_low = spatial_buffer.get_voxel(0, 0, 0, VoxelBuffer::CHANNEL_WEIGHTS);
+	const uint16_t packed_indices_high = spatial_buffer.get_voxel(0, 6, 0, VoxelBuffer::CHANNEL_INDICES);
+	const uint16_t packed_weights_high = spatial_buffer.get_voxel(0, 6, 0, VoxelBuffer::CHANNEL_WEIGHTS);
+	const FixedArray<uint8_t, 4> indices_low = mixel4::decode_indices_from_packed_u16(packed_indices_low);
+	const FixedArray<uint8_t, 4> weights_low = mixel4::decode_weights_from_packed_u16(packed_weights_low);
+	const FixedArray<uint8_t, 4> indices_high = mixel4::decode_indices_from_packed_u16(packed_indices_high);
+	const FixedArray<uint8_t, 4> weights_high = mixel4::decode_weights_from_packed_u16(packed_weights_high);
+	ZN_TEST_ASSERT(indices_low[0] == 0 && indices_low[1] == 1);
+	ZN_TEST_ASSERT(indices_high[0] == 0 && indices_high[1] == 1);
+	ZN_TEST_ASSERT(weights_low[0] > weights_low[1]);
+	ZN_TEST_ASSERT(weights_high[1] > weights_high[0]);
+
+	graph->clear();
+	const uint32_t n_switch_a = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_switch_b = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_material_switch = graph->create_node(VoxelGraphFunction::NODE_MATERIAL_SWITCH);
+	const uint32_t n_switch_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_switch_sdf = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_switch_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_switch_a, 0, material_a);
+	graph->set_node_param(n_switch_b, 0, material_b);
+	graph->set_node_param(n_switch_sdf, 0, 0.f);
+	graph->set_node_default_input(n_material_switch, 2, 0.8f);
+	graph->set_node_default_input(n_material_switch, 3, 0.5f);
+	graph->add_connection(n_switch_a, 0, n_material_switch, 0);
+	graph->add_connection(n_switch_b, 0, n_material_switch, 1);
+	graph->add_connection(n_material_switch, 0, n_switch_out_material, 0);
+	graph->add_connection(n_switch_sdf, 0, n_switch_out_sdf, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile MaterialSwitch graph: {0}").format(varray(result.message)));
+	final_standard_material = generator->get_final_material();
+	ZN_TEST_ASSERT(final_standard_material.is_valid());
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().r, material_b->get_albedo().r));
+
+	graph->clear();
+	const uint32_t n_override_source = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_material_override = graph->create_node(VoxelGraphFunction::NODE_MATERIAL_PROPERTY_OVERRIDE);
+	const uint32_t n_override_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_override_sdf = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_override_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_override_source, 0, material_a);
+	graph->set_node_param(n_override_sdf, 0, 0.f);
+	graph->set_node_default_input(n_material_override, 1, 0.9f);
+	graph->set_node_default_input(n_material_override, 2, 0.1f);
+	graph->set_node_default_input(n_material_override, 3, 0.7f);
+	graph->set_node_default_input(n_material_override, 4, 0.35f);
+	graph->set_node_default_input(n_material_override, 5, 0.65f);
+	graph->set_node_default_input(n_material_override, 6, 0.4f);
+	graph->set_node_default_input(n_material_override, 7, 0.2f);
+	graph->set_node_default_input(n_material_override, 8, 0.3f);
+	graph->set_node_default_input(n_material_override, 9, 0.4f);
+	graph->set_node_default_input(n_material_override, 10, 2.5f);
+	graph->set_node_default_input(n_material_override, 11, 1.75f);
+	graph->add_connection(n_override_source, 0, n_material_override, 0);
+	graph->add_connection(n_material_override, 0, n_override_out_material, 0);
+	graph->add_connection(n_override_sdf, 0, n_override_out_sdf, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile MaterialPropertyOverride graph: {0}").format(varray(result.message)));
+	final_standard_material = generator->get_final_material();
+	ZN_TEST_ASSERT(final_standard_material.is_valid());
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().r, 0.9f));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().g, 0.1f));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().b, 0.7f));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_roughness(), 0.35f));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_metallic(), 0.65f));
+
+	graph->clear();
+	const uint32_t n_stack_a = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_stack_b = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_stack_c = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_material_stack = graph->create_node(VoxelGraphFunction::NODE_MATERIAL_STACK);
+	const uint32_t n_stack_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_stack_sdf = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_stack_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_stack_a, 0, material_a);
+	graph->set_node_param(n_stack_b, 0, material_b);
+	graph->set_node_param(n_stack_c, 0, material_c);
+	graph->set_node_param(n_stack_sdf, 0, 0.f);
+	graph->set_node_default_input(n_material_stack, 3, 0.5f);
+	graph->set_node_default_input(n_material_stack, 4, 0.5f);
+	graph->add_connection(n_stack_a, 0, n_material_stack, 0);
+	graph->add_connection(n_stack_b, 0, n_material_stack, 1);
+	graph->add_connection(n_stack_c, 0, n_material_stack, 2);
+	graph->add_connection(n_material_stack, 0, n_stack_out_material, 0);
+	graph->add_connection(n_stack_sdf, 0, n_stack_out_sdf, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(result.success, String("Failed to compile MaterialStack graph: {0}").format(varray(result.message)));
+	final_standard_material = generator->get_final_material();
+	ZN_TEST_ASSERT(final_standard_material.is_valid());
+	const Color expected_stack_albedo = material_a->get_albedo().lerp(material_b->get_albedo(), 0.5f).lerp(
+				material_c->get_albedo(), 0.5f);
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().r, expected_stack_albedo.r));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().g, expected_stack_albedo.g));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().b, expected_stack_albedo.b));
+
+	Ref<VoxelLodTerrain> lod_terrain;
+	lod_terrain.instantiate();
+	lod_terrain->set_generator(generator);
+	final_standard_material = lod_terrain->get_material();
+	ZN_TEST_ASSERT(final_standard_material.is_valid());
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().g, expected_stack_albedo.g));
+
+	graph->clear();
+	const uint32_t n_live_material = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_live_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_live_sdf = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_live_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_live_material, 0, material_b);
+	graph->set_node_param(n_live_sdf, 0, 0.f);
+	graph->add_connection(n_live_material, 0, n_live_out_material, 0);
+	graph->add_connection(n_live_sdf, 0, n_live_out_sdf, 0);
+	final_standard_material = lod_terrain->get_material();
+	ZN_TEST_ASSERT(final_standard_material.is_valid());
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().r, material_b->get_albedo().r));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().g, material_b->get_albedo().g));
+	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().b, material_b->get_albedo().b));
+
+	graph->clear();
+	const uint32_t n_sdf_only = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_sdf_only_out = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_sdf_only, 0, 0.f);
+	graph->add_connection(n_sdf_only, 0, n_sdf_only_out, 0);
+	ZN_TEST_ASSERT(lod_terrain->get_material().is_null());
+
+	graph->clear();
+	const uint32_t n_invalid_material = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_invalid_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_invalid_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_invalid_material, 0, 0.f);
+	graph->add_connection(n_invalid_material, 0, n_invalid_out_material, 0);
+	graph->add_connection(n_invalid_material, 0, n_invalid_out_sdf, 0);
+	result = generator->compile(false);
+	ZN_TEST_ASSERT(!result.success);
+}
+
 
 Ref<VoxelGraphFunction> create_pass_through_function() {
 	Ref<VoxelGraphFunction> func;

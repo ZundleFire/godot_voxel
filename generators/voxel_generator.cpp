@@ -121,9 +121,22 @@ void append_generator_parameter_uniforms(
 	for (unsigned int i = 0; i < shader_data.parameters.size(); ++i) {
 		VoxelGenerator::ShaderParameter &p = shader_data.parameters[i];
 		const unsigned int binding = bindings_start + i;
-		ZN_ASSERT(p.resource->get_type() == ComputeShaderResourceInternal::TYPE_TEXTURE_2D);
-		source_text +=
-				String("layout (set = 0, binding = {0}) uniform sampler2D {1};\n").format(varray(binding, p.name));
+
+		switch (p.resource->get_type()) {
+			case ComputeShaderResourceInternal::TYPE_TEXTURE_2D:
+				source_text += String("layout (set = 0, binding = {0}) uniform sampler2D {1};\n")
+									   .format(varray(binding, p.name));
+				break;
+			case ComputeShaderResourceInternal::TYPE_STORAGE_BUFFER:
+				// Storage buffer — emit a #define so the user's GLSL can declare the buffer
+				// block with the correct binding number (which varies between compile paths).
+				source_text += String("#define {0}_BINDING {1}\n").format(varray(p.name, binding));
+				break;
+			default:
+				ZN_CRASH_MSG("Unhandled shader parameter resource type");
+				break;
+		}
+
 		out_params.params.push_back(ComputeShaderParameter{ binding, p.resource });
 	}
 	source_text += "\n";

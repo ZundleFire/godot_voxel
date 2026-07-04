@@ -19,12 +19,20 @@ public:
 		_main_tasks.push_back(task);
 	}
 
+	inline void push_generation_task(IThreadedTask *task) {
+		_generation_tasks.push_back(task);
+	}
+
 	inline void push_io_task(IThreadedTask *task) {
 		_io_tasks.push_back(task);
 	}
 
 	inline unsigned int get_main_count() const {
 		return _main_tasks.size();
+	}
+
+	inline unsigned int get_generation_count() const {
+		return _generation_tasks.size();
 	}
 
 	inline unsigned int get_io_count() const {
@@ -39,10 +47,11 @@ private:
 	BufferedTaskScheduler();
 
 	bool has_tasks() const {
-		return _main_tasks.size() > 0 || _io_tasks.size() > 0;
+		return _main_tasks.size() > 0 || _generation_tasks.size() > 0 || _io_tasks.size() > 0;
 	}
 
 	StdVector<IThreadedTask *> _main_tasks;
+	StdVector<IThreadedTask *> _generation_tasks;
 	StdVector<IThreadedTask *> _io_tasks;
 	Thread::ID _thread_id;
 };

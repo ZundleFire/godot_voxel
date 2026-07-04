@@ -9,6 +9,7 @@
 #include "mixel4.h"
 #include "voxel_format.h"
 #include "voxel_memory_pool.h"
+#include <algorithm>
 #include <cstring>
 
 namespace zylann::voxel {
@@ -390,23 +391,20 @@ void VoxelBuffer::fill(uint64_t defval, unsigned int channel_index) {
 			memset(channel.data, defval, channel.size_in_bytes);
 			break;
 
-		case DEPTH_16_BIT:
-			for (size_t i = 0; i < volume; ++i) {
-				reinterpret_cast<uint16_t *>(channel.data)[i] = defval;
-			}
-			break;
+		case DEPTH_16_BIT: {
+			uint16_t *p = reinterpret_cast<uint16_t *>(channel.data);
+			std::fill(p, p + volume, static_cast<uint16_t>(defval));
+		} break;
 
-		case DEPTH_32_BIT:
-			for (size_t i = 0; i < volume; ++i) {
-				reinterpret_cast<uint32_t *>(channel.data)[i] = defval;
-			}
-			break;
+		case DEPTH_32_BIT: {
+			uint32_t *p = reinterpret_cast<uint32_t *>(channel.data);
+			std::fill(p, p + volume, static_cast<uint32_t>(defval));
+		} break;
 
-		case DEPTH_64_BIT:
-			for (size_t i = 0; i < volume; ++i) {
-				reinterpret_cast<uint64_t *>(channel.data)[i] = defval;
-			}
-			break;
+		case DEPTH_64_BIT: {
+			uint64_t *p = reinterpret_cast<uint64_t *>(channel.data);
+			std::fill(p, p + volume, defval);
+		} break;
 
 		default:
 			CRASH_NOW();
@@ -454,23 +452,20 @@ void VoxelBuffer::fill_area(uint64_t defval, Vector3i min, Vector3i max, unsigne
 					memset(&channel.data[dst_ri], defval, area_size.y * sizeof(uint8_t));
 					break;
 
-				case DEPTH_16_BIT:
-					for (int i = 0; i < area_size.y; ++i) {
-						((uint16_t *)channel.data)[dst_ri + i] = defval;
-					}
-					break;
+				case DEPTH_16_BIT: {
+					uint16_t *row = &((uint16_t *)channel.data)[dst_ri];
+					std::fill(row, row + area_size.y, static_cast<uint16_t>(defval));
+				} break;
 
-				case DEPTH_32_BIT:
-					for (int i = 0; i < area_size.y; ++i) {
-						((uint32_t *)channel.data)[dst_ri + i] = defval;
-					}
-					break;
+				case DEPTH_32_BIT: {
+					uint32_t *row = &((uint32_t *)channel.data)[dst_ri];
+					std::fill(row, row + area_size.y, static_cast<uint32_t>(defval));
+				} break;
 
-				case DEPTH_64_BIT:
-					for (int i = 0; i < area_size.y; ++i) {
-						((uint64_t *)channel.data)[dst_ri + i] = defval;
-					}
-					break;
+				case DEPTH_64_BIT: {
+					uint64_t *row = &((uint64_t *)channel.data)[dst_ri];
+					std::fill(row, row + area_size.y, defval);
+				} break;
 
 				default:
 					CRASH_NOW();
@@ -647,7 +642,46 @@ void VoxelBuffer::copy_channel_from(
 	Channel &channel = _channels[channel_index];
 	const Channel &other_channel = other._channels[channel_index];
 
-	ZN_ASSERT_RETURN(other_channel.depth == channel.depth);
+	if (other_channel.depth != channel.depth) {
+		// Depths differ: do a per-voxel copy with value conversion.
+		// This handles the case where stored blocks have a different channel depth than the current format
+		// (e.g. INDICES stored as DEPTH_16_BIT but the current VoxelFormat uses DEPTH_8_BIT).
+		// Values are truncated/extended as raw integers; this is safe for integer channels like INDICES
+		// where the generator only writes small values that fit in the narrower type.
+		Vector3i clamped_src_min = src_min;
+		Vector3i clamped_src_max = src_max;
+		Vector3i clamped_dst_min = dst_min;
+		clip_copy_region(clamped_src_min, clamped_src_max, other._size, clamped_dst_min, _size);
+		const Vector3i area_size = clamped_src_max - clamped_src_min;
+		if (area_size.x <= 0 || area_size.y <= 0 || area_size.z <= 0) {
+			return;
+		}
+		if (other_channel.compression == COMPRESSION_UNIFORM) {
+			// Source is uniform (same value everywhere). Convert defval to dst depth and fill the area.
+			// Treat as raw integer truncation/extension.
+			const uint64_t converted_defval = other_channel.defval & ((uint64_t(1) << get_depth_bit_count(channel.depth)) - 1);
+			if (converted_defval != channel.defval) {
+				fill_area(converted_defval, clamped_dst_min, clamped_dst_min + area_size, channel_index);
+			}
+			// If converted defval matches dst defval, nothing to do
+		} else {
+			// Source has per-voxel data: copy with per-voxel conversion
+			if (channel.compression == COMPRESSION_UNIFORM) {
+				ZN_ASSERT_RETURN(create_channel(channel_index, channel.defval));
+			}
+			for (int z = 0; z < area_size.z; ++z) {
+				for (int x = 0; x < area_size.x; ++x) {
+					for (int y = 0; y < area_size.y; ++y) {
+						const Vector3i src_pos = clamped_src_min + Vector3i(x, y, z);
+						const Vector3i dst_pos = clamped_dst_min + Vector3i(x, y, z);
+						const uint64_t value = other.get_voxel(src_pos.x, src_pos.y, src_pos.z, channel_index);
+						set_voxel(value, dst_pos.x, dst_pos.y, dst_pos.z, channel_index);
+					}
+				}
+			}
+		}
+		return;
+	}
 
 	if (channel.compression == COMPRESSION_UNIFORM && other_channel.compression == COMPRESSION_UNIFORM &&
 		channel.defval == other_channel.defval) {

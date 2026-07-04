@@ -8,10 +8,12 @@
 #include "nodes/inputs.h"
 #include "nodes/math_funcs.h"
 #include "nodes/math_ops.h"
+#include "nodes/materials.h"
 #include "nodes/math_vectors.h"
 #include "nodes/misc.h"
 #include "nodes/noise.h"
 #include "nodes/outputs.h"
+#include "nodes/planet.h"
 #include "nodes/sdf.h"
 
 namespace zylann::voxel::pg {
@@ -58,6 +60,10 @@ const char *get_category_name(Category category) {
 			return "Relay";
 		case CATEGORY_CONSTANT:
 			return "Constant";
+		case CATEGORY_MASKS:
+			return "Masks";
+		case CATEGORY_MATERIAL:
+			return "Material";
 		default:
 			CRASH_NOW_MSG("Unhandled category");
 	}
@@ -78,9 +84,11 @@ NodeTypeDB::NodeTypeDB() {
 	register_output_nodes(types);
 	register_math_func_nodes(types);
 	register_math_ops_nodes(types);
+	register_material_nodes(types);
 	register_math_vector_nodes(types);
 	register_misc_nodes(types);
 	register_noise_nodes(types);
+	register_planet_nodes(types);
 	register_sdf_nodes(types);
 
 	CRASH_COND(_expression_functions.size() > 0);

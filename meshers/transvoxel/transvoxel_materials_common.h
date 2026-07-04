@@ -6,7 +6,12 @@
 namespace zylann::voxel::transvoxel::materials {
 
 inline uint32_t pack_bytes(const FixedArray<uint8_t, 4> &a) {
-	return (a[0] | (a[1] << 8) | (a[2] << 16) | (a[3] << 24));
+        // Little-endian: a[0] in the least-significant byte.
+        // Matches decode4u8 in all voxel shaders: uvec4(i&0xff, i>>8&0xff, i>>16&0xff, i>>24&0xff)
+        return (static_cast<uint32_t>(a[0]) |
+                        (static_cast<uint32_t>(a[1]) << 8) |
+                        (static_cast<uint32_t>(a[2]) << 16) |
+                        (static_cast<uint32_t>(a[3]) << 24));
 }
 
 inline void add_4i8_4w8_texture_data(

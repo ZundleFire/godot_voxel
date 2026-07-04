@@ -1,53 +1,14 @@
 #include "../node_type_db.h"
+#include "../voxel_graph_math_ops_simd.h"
 #include "../voxel_graph_runtime.h"
 #include "util.h"
 
 namespace zylann::voxel::pg {
 
-// Special case for division because we want to avoid NaNs caused by zeros
+// Special case for division because we want to avoid NaNs caused by zeros.
+// The actual implementation is now shared with the ISPC-backed buffer path.
 void do_division(Runtime::ProcessBufferContext &ctx) {
-	const Runtime::Buffer &a = ctx.get_input(0);
-	const Runtime::Buffer &b = ctx.get_input(1);
-	Runtime::Buffer &out = ctx.get_output(0);
-	const uint32_t buffer_size = out.size;
-
-	if (a.is_constant || b.is_constant) {
-		if (!b.is_constant) {
-			const float c = a.constant_value;
-			const float *v = b.data;
-			for (uint32_t i = 0; i < buffer_size; ++i) {
-				out.data[i] = v[i] == 0.f ? 0.f : c / v[i];
-			}
-
-		} else if (!a.is_constant) {
-			if (b.constant_value == 0.f) {
-				for (uint32_t i = 0; i < buffer_size; ++i) {
-					out.data[i] = 0.f;
-				}
-			} else {
-				const float c = 1.f / b.constant_value;
-				const float *v = a.data;
-				for (uint32_t i = 0; i < buffer_size; ++i) {
-					out.data[i] = v[i] * c;
-				}
-			}
-		} else {
-			// Normally this case should have been optimized out at compile-time
-			const float v = b.constant_value == 0.f ? 0.f : a.constant_value / b.constant_value;
-			for (uint32_t i = 0; i < buffer_size; ++i) {
-				out.data[i] = v;
-			}
-		}
-
-	} else {
-		for (uint32_t i = 0; i < buffer_size; ++i) {
-			if (b.data[i] == 0.f) {
-				out.data[i] = 0.f;
-			} else {
-				out.data[i] = a.data[i] / b.data[i];
-			}
-		}
-	}
+	process_divide_buffer(ctx);
 }
 
 void register_math_ops_nodes(Span<NodeType> types) {
@@ -61,9 +22,7 @@ void register_math_ops_nodes(Span<NodeType> types) {
 		t.inputs.push_back(NodeType::Port("b", 0.f, VoxelGraphFunction::AUTO_CONNECT_NONE, false));
 		t.outputs.push_back(NodeType::Port("out"));
 		t.compile_func = nullptr;
-		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
-			do_binop(ctx, [](float a, float b) { return a + b; });
-		};
+		t.process_buffer_func = process_add_buffer;
 		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
 			const Interval a = ctx.get_input(0);
 			const Interval b = ctx.get_input(1);
@@ -80,9 +39,7 @@ void register_math_ops_nodes(Span<NodeType> types) {
 		t.inputs.push_back(NodeType::Port("a", 0.f, VoxelGraphFunction::AUTO_CONNECT_NONE, false));
 		t.inputs.push_back(NodeType::Port("b", 0.f, VoxelGraphFunction::AUTO_CONNECT_NONE, false));
 		t.outputs.push_back(NodeType::Port("out"));
-		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
-			do_binop(ctx, [](float a, float b) { return a - b; });
-		};
+		t.process_buffer_func = process_subtract_buffer;
 		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
 			const Interval a = ctx.get_input(0);
 			const Interval b = ctx.get_input(1);
@@ -99,9 +56,7 @@ void register_math_ops_nodes(Span<NodeType> types) {
 		t.inputs.push_back(NodeType::Port("a", 0.f, VoxelGraphFunction::AUTO_CONNECT_NONE, false));
 		t.inputs.push_back(NodeType::Port("b", 0.f, VoxelGraphFunction::AUTO_CONNECT_NONE, false));
 		t.outputs.push_back(NodeType::Port("out"));
-		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
-			do_binop(ctx, [](float a, float b) { return a * b; });
-		};
+		t.process_buffer_func = process_multiply_buffer;
 		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
 			const Interval a = ctx.get_input(0);
 			const Interval b = ctx.get_input(1);

@@ -100,7 +100,7 @@ void LoadBlockDataTask::run(zylann::ThreadedTaskContext &ctx) {
 
 				IThreadedTask *task = generator->create_block_task(params);
 
-				VoxelEngine::get_singleton().push_async_task(task);
+				VoxelEngine::get_singleton().push_generation_task(task);
 				_requested_generator_task = true;
 
 			} else {

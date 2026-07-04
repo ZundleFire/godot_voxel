@@ -48,6 +48,9 @@
 #include "util/noise/fast_noise_lite/fast_noise_lite.h"
 #include "util/noise/fast_noise_lite/fast_noise_lite_gradient.h"
 #include "util/noise/spot_noise_gd.h"
+#include "util/noise/voxel_advanced_noise.h"
+#include "util/noise/voxel_noise_batch.h"
+#include "util/noise/voxel_procedural_noise.h"
 #include "util/string/format.h"
 #include "util/tasks/async_dependency_tracker.h"
 #include "util/tasks/godot/threaded_task_gd.h"
@@ -327,6 +330,10 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 #ifdef VOXEL_ENABLE_FAST_NOISE_2
 		ClassDB::register_class<FastNoise2>();
 #endif
+
+		ClassDB::register_class<zylann::VoxelAdvancedNoise>();
+		ClassDB::register_class<zylann::VoxelProceduralNoise>();
+		ClassDB::register_class<zylann::VoxelNoiseBatch>();
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		ClassDB::register_class<VoxelMesherTransvoxel>();

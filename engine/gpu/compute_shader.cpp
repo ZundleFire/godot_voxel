@@ -3,6 +3,7 @@
 #include "../../util/godot/classes/rendering_server.h"
 #include "../../util/godot/core/array.h" // for `varray` in GDExtension builds
 #include "../../util/godot/core/print_string.h"
+#include "../../util/io/log.h"
 #include "../../util/profiling.h"
 #include "../../util/string/format.h"
 #include "../voxel_engine.h"
@@ -113,12 +114,22 @@ std::shared_ptr<ComputeShader> ComputeShaderFactory::create_from_glsl(String sou
 	std::shared_ptr<ComputeShader> shader = make_shared_instance<ComputeShader>();
 	VoxelEngine::get_singleton().push_gpu_task_f([shader, source_text, name](GPUTaskContext &ctx) {
 		shader->_internal.load_from_glsl(ctx.rendering_device, source_text, name);
+		const bool ok = shader->_internal.is_valid();
+		shader->_compilation_succeeded.store(ok, std::memory_order_release);
+		shader->_compilation_complete.store(true, std::memory_order_release);
+		if (!ok) {
+			ZN_PRINT_ERROR(format("Compute shader '{}' failed to compile. GPU generation will fall back to CPU.", name));
+		}
 	});
 	return shader;
 }
 
 std::shared_ptr<ComputeShader> ComputeShaderFactory::create_invalid() {
-	return make_shared_instance<ComputeShader>();
+	auto shader = make_shared_instance<ComputeShader>();
+	// Mark as complete but failed — so callers don't wait forever.
+	shader->_compilation_succeeded.store(false, std::memory_order_release);
+	shader->_compilation_complete.store(true, std::memory_order_release);
+	return shader;
 }
 
 RID ComputeShader::get_rid() const {

@@ -103,7 +103,7 @@ void request_block_generate(
 
 	IThreadedTask *task = stream_dependency->generator->create_block_task(params);
 
-	task_scheduler.push_main_task(task);
+	task_scheduler.push_generation_task(task);
 }
 
 // Used only when streaming block by block

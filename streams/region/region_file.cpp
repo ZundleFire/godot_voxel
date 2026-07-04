@@ -242,6 +242,13 @@ Error RegionFile::open(const String &fpath, bool create_if_not_found) {
 
 	_file_access = f;
 
+	// Attempt to open a read-only memory mapping for faster load_block() reads.
+	// If this fails (e.g. file was just created), we fall back to FileAccess reads.
+	{
+		const CharString fpath_utf8 = fpath.utf8();
+		_use_mmap = _mmap.open(fpath_utf8.get_data());
+	}
+
 	// Precalculate location of sectors and which block they contain.
 	// This will be useful to know when sectors get moved on insertion and removal
 
@@ -299,6 +306,10 @@ Error RegionFile::close() {
 		}
 		_file_access.unref();
 	}
+	if (_use_mmap) {
+		_mmap.close();
+		_use_mmap = false;
+	}
 	_sectors.clear();
 	return err;
 }
@@ -343,7 +354,6 @@ bool RegionFile::is_valid_block_position(const Vector3 position) const {
 
 Error RegionFile::load_block(const Vector3i position, VoxelBuffer &out_block) {
 	ERR_FAIL_COND_V(_file_access.is_null(), ERR_FILE_CANT_READ);
-	FileAccess &f = **_file_access;
 
 	ERR_FAIL_COND_V(!is_valid_block_position(position), ERR_INVALID_PARAMETER);
 	const unsigned int lut_index = get_block_index_in_header(position);
@@ -363,16 +373,42 @@ Error RegionFile::load_block(const Vector3i position, VoxelBuffer &out_block) {
 	const unsigned int sector_index = block_info.get_sector_index();
 	const unsigned int block_begin = _blocks_begin_offset + sector_index * _header.format.sector_size;
 
-	f.seek(block_begin);
+	if (_use_mmap) {
+		// Memory-mapped fast path: read size prefix and block data directly from the mapping.
+		// The first 4 bytes at block_begin are a little-endian uint32 storing the compressed data size.
+		const uint8_t *size_ptr = _mmap.get_data(block_begin, sizeof(uint32_t));
+		ERR_FAIL_NULL_V_MSG(size_ptr, ERR_FILE_CORRUPT, "mmap: block size prefix out of range");
 
-	unsigned int block_data_size = f.get_32();
-	CRASH_COND(f.eof_reached());
+		const uint32_t block_data_size =
+				static_cast<uint32_t>(size_ptr[0]) |
+				(static_cast<uint32_t>(size_ptr[1]) << 8) |
+				(static_cast<uint32_t>(size_ptr[2]) << 16) |
+				(static_cast<uint32_t>(size_ptr[3]) << 24);
 
-	ERR_FAIL_COND_V_MSG(
-			!BlockSerializer::decompress_and_deserialize(f, block_data_size, out_block),
-			ERR_PARSE_ERROR,
-			String("Failed to read block {0}").format(varray(position))
-	);
+		const uint8_t *block_data_ptr = _mmap.get_data(block_begin + sizeof(uint32_t), block_data_size);
+		ERR_FAIL_NULL_V_MSG(block_data_ptr, ERR_FILE_CORRUPT, "mmap: block data out of range");
+
+		ERR_FAIL_COND_V_MSG(
+				!BlockSerializer::decompress_and_deserialize(
+						Span<const uint8_t>(block_data_ptr, block_data_size), out_block),
+				ERR_PARSE_ERROR,
+				String("Failed to read block {0} (mmap)").format(varray(position))
+		);
+
+	} else {
+		// Traditional FileAccess path
+		FileAccess &f = **_file_access;
+		f.seek(block_begin);
+
+		unsigned int block_data_size = f.get_32();
+		CRASH_COND(f.eof_reached());
+
+		ERR_FAIL_COND_V_MSG(
+				!BlockSerializer::decompress_and_deserialize(f, block_data_size, out_block),
+				ERR_PARSE_ERROR,
+				String("Failed to read block {0}").format(varray(position))
+		);
+	}
 
 	return OK;
 }
@@ -493,6 +529,14 @@ Error RegionFile::save_block(
 		}
 
 		block_info.set_sector_count(new_sector_count);
+	}
+
+	// The file may have grown or shifted — refresh the memory mapping so future loads see new data.
+	if (_use_mmap) {
+		// Ensure all writes are flushed to disk before remapping.
+		_file_access->flush();
+		const CharString fpath_utf8 = _file_path.utf8();
+		_use_mmap = _mmap.remap(fpath_utf8.get_data());
 	}
 
 	return OK;

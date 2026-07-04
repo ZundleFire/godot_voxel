@@ -19,7 +19,7 @@ namespace zylann::voxel {
 class VoxelStreamSQLite : public VoxelStream {
 	GDCLASS(VoxelStreamSQLite, VoxelStream)
 public:
-	static const unsigned int CACHE_SIZE = 64;
+	static const unsigned int DEFAULT_CACHE_SIZE = 64;
 
 	VoxelStreamSQLite();
 	~VoxelStreamSQLite();
@@ -48,6 +48,11 @@ public:
 	}
 	void load_all_blocks(FullLoadingResult &result) override;
 
+	void load_blocks_bulk(const BulkLoadParams &params, FullLoadingResult &result) override;
+	bool supports_bulk_load() const override {
+		return true;
+	}
+
 	int get_used_channels_mask() const override;
 
 	void flush() override;
@@ -56,6 +61,9 @@ public:
 	// Might improve query performance if saved data is very sparse (like when only edited blocks are saved).
 	void set_key_cache_enabled(bool enable);
 	bool is_key_cache_enabled() const;
+
+	void set_cache_size(unsigned int size);
+	unsigned int get_cache_size() const;
 
 	Box3i get_supported_block_range() const override;
 	int get_lod_count() const override;
@@ -131,6 +139,7 @@ private:
 	// This is because save queries are more expensive.
 	// It also speeds up queries of blocks that were recently saved.
 	VoxelStreamCache _cache;
+	unsigned int _cache_size = DEFAULT_CACHE_SIZE;
 	// The current way we stream data is by querying every block location near each player, to know if there is data.
 	// Therefore testing if a block is present is the beginning of the most frequently executed code path.
 	// In configurations where only edited blocks get saved, very few blocks even get stored in the database,

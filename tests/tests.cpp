@@ -85,6 +85,8 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_voxel_graph_generator_texturing);
 	VOXEL_TEST(test_voxel_graph_equivalence_merging);
 	VOXEL_TEST(test_voxel_graph_generate_block_with_input_sdf);
+	VOXEL_TEST(test_voxel_graph_planet_nodes);
+	VOXEL_TEST(test_voxel_graph_material_nodes);
 	VOXEL_TEST(test_voxel_graph_functions_pass_through);
 	VOXEL_TEST(test_voxel_graph_functions_nested_pass_through);
 	VOXEL_TEST(test_voxel_graph_functions_autoconnect);

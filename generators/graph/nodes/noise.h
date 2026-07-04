@@ -3,6 +3,7 @@
 #include "../../../util/noise/fast_noise_lite/fast_noise_lite_range.h"
 #include "../../../util/noise/gd_noise_range.h"
 #include "../../../util/noise/spot_noise.h"
+#include "../../../util/noise/voxel_procedural_noise.h"
 #include "../../../util/profiling.h"
 #include "../node_type_db.h"
 
@@ -951,6 +952,104 @@ void register_noise_nodes(Span<NodeType> types) {
 		// TODO Support shader code for the Spots3D node
 		// t.shader_gen_func = [](ShaderGenContext &ctx) {
 		// };
+	}
+	{
+		struct Params {
+			const VoxelProceduralNoise *noise;
+		};
+
+		NodeType &t = types[VoxelGraphFunction::NODE_PROCEDURAL_NOISE_2D];
+		t.name = "ProceduralNoise2D";
+		t.category = CATEGORY_GENERATE;
+		t.inputs.push_back(NodeType::Port("x", 0.f, VoxelGraphFunction::AUTO_CONNECT_X));
+		t.inputs.push_back(NodeType::Port("y", 0.f, VoxelGraphFunction::AUTO_CONNECT_Z));
+		t.outputs.push_back(NodeType::Port("out"));
+		t.params.push_back(
+				NodeType::Param(
+						"noise",
+						VoxelProceduralNoise::get_class_static(),
+						&create_resource_to_variant<VoxelProceduralNoise>
+				)
+		);
+
+		t.compile_func = [](CompileContext &ctx) {
+			Ref<VoxelProceduralNoise> noise = ctx.get_param(0);
+			if (noise.is_null()) {
+				ctx.make_error(
+						String(ZN_TTR("{0} instance is null"))
+								.format(varray(VoxelProceduralNoise::get_class_static()))
+				);
+				return;
+			}
+			Params p;
+			p.noise = *noise;
+			ctx.set_params(p);
+		};
+
+		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
+			ZN_PROFILE_SCOPE_NAMED("NODE_PROCEDURAL_NOISE_2D");
+			const Runtime::Buffer &x = ctx.get_input(0);
+			const Runtime::Buffer &y = ctx.get_input(1);
+			Runtime::Buffer &out = ctx.get_output(0);
+			const Params p = ctx.get_params<Params>();
+			p.noise->get_noise_2d_series(x.data, y.data, out.data, out.size);
+		};
+
+		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
+			const Params p = ctx.get_params<Params>();
+			// Shouldn't be null, it is checked when the graph is compiled
+			ctx.set_output(0, p.noise->get_estimated_output_range());
+		};
+	}
+	{
+		struct Params {
+			const VoxelProceduralNoise *noise;
+		};
+
+		NodeType &t = types[VoxelGraphFunction::NODE_PROCEDURAL_NOISE_3D];
+		t.name = "ProceduralNoise3D";
+		t.category = CATEGORY_GENERATE;
+		t.inputs.push_back(NodeType::Port("x", 0.f, VoxelGraphFunction::AUTO_CONNECT_X));
+		t.inputs.push_back(NodeType::Port("y", 0.f, VoxelGraphFunction::AUTO_CONNECT_Y));
+		t.inputs.push_back(NodeType::Port("z", 0.f, VoxelGraphFunction::AUTO_CONNECT_Z));
+		t.outputs.push_back(NodeType::Port("out"));
+		t.params.push_back(
+				NodeType::Param(
+						"noise",
+						VoxelProceduralNoise::get_class_static(),
+						&create_resource_to_variant<VoxelProceduralNoise>
+				)
+		);
+
+		t.compile_func = [](CompileContext &ctx) {
+			Ref<VoxelProceduralNoise> noise = ctx.get_param(0);
+			if (noise.is_null()) {
+				ctx.make_error(
+						String(ZN_TTR("{0} instance is null"))
+								.format(varray(VoxelProceduralNoise::get_class_static()))
+				);
+				return;
+			}
+			Params p;
+			p.noise = *noise;
+			ctx.set_params(p);
+		};
+
+		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
+			ZN_PROFILE_SCOPE_NAMED("NODE_PROCEDURAL_NOISE_3D");
+			const Runtime::Buffer &x = ctx.get_input(0);
+			const Runtime::Buffer &y = ctx.get_input(1);
+			const Runtime::Buffer &z = ctx.get_input(2);
+			Runtime::Buffer &out = ctx.get_output(0);
+			const Params p = ctx.get_params<Params>();
+			p.noise->get_noise_3d_series(x.data, y.data, z.data, out.data, out.size);
+		};
+
+		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
+			const Params p = ctx.get_params<Params>();
+			// Shouldn't be null, it is checked when the graph is compiled
+			ctx.set_output(0, p.noise->get_estimated_output_range());
+		};
 	}
 }
 

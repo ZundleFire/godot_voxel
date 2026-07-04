@@ -3,6 +3,10 @@
 #include "../util/godot/core/string.h"
 #include "../util/string/format.h"
 
+#ifdef VOXEL_ENABLE_INSTANCER
+#include "instance_data.h"
+#endif
+
 #ifdef ZN_GODOT
 #include "../util/godot/core/class_db.h"
 #endif
@@ -57,6 +61,23 @@ void VoxelStream::save_instance_blocks(Span<InstancesQueryData> p_blocks) {
 
 void VoxelStream::load_all_blocks(FullLoadingResult &result) {
 	ZN_PRINT_ERROR(format("{} does not support `load_all_blocks`", get_class()));
+}
+
+void VoxelStream::load_blocks_bulk(const BulkLoadParams &params, FullLoadingResult &result) {
+	// Default: fall back to load_all_blocks and filter by LOD range + region
+	if (supports_loading_all_blocks()) {
+		FullLoadingResult all_result;
+		load_all_blocks(all_result);
+		for (auto &block : all_result.blocks) {
+			if (block.lod >= params.min_lod && block.lod <= params.max_lod) {
+				if (params.region.contains(block.position)) {
+					result.blocks.push_back(std::move(block));
+				}
+			}
+		}
+	} else {
+		ZN_PRINT_ERROR(format("{} does not support `load_blocks_bulk`", get_class()));
+	}
 }
 
 int VoxelStream::get_used_channels_mask() const {

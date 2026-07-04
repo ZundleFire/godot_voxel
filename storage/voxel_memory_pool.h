@@ -20,6 +20,10 @@ namespace zylann::voxel {
 // The majority of VoxelBuffers use powers of two so most of the time
 // we won't waste memory. Sometimes non-power-of-two buffers are created,
 // but they are often temporary and less numerous.
+//
+// Thread-local caches reduce mutex contention: each thread keeps a small
+// free-list per size bucket. Alloc/recycle hit the shared pool only when
+// the local cache is empty/full.
 class VoxelMemoryPool {
 private:
 #ifdef DEBUG_ENABLED
@@ -54,6 +58,22 @@ private:
 #endif
 	};
 
+	// Thread-local cache per size-bucket to reduce contention on the shared pool.
+	static constexpr unsigned int TLS_CACHE_CAPACITY = 8; // Max blocks kept per bucket per thread
+	static constexpr unsigned int TLS_REFILL_COUNT = 4;   // How many to grab from shared pool at once
+
+	struct TLSPoolBucket {
+		uint8_t *blocks[TLS_CACHE_CAPACITY];
+		unsigned int count = 0;
+	};
+
+	struct TLSCache {
+		// Same number of buckets as the shared pool
+		TLSPoolBucket buckets[21];
+	};
+
+	static TLSCache &get_tls_cache();
+
 public:
 	static void create_singleton();
 	static void destroy_singleton();
@@ -66,6 +86,10 @@ public:
 	void recycle(uint8_t *block, size_t size);
 
 	void clear_unused_blocks();
+
+	// Flush all thread-local caches back to the shared pool.
+	// Call before destroying the pool or when memory pressure is high.
+	void flush_tls_caches();
 
 	void debug_print();
 	unsigned int debug_get_used_blocks() const;

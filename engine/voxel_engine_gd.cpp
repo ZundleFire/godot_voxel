@@ -138,6 +138,9 @@ Dictionary to_dict(const zylann::voxel::VoxelEngine::Stats::ThreadPoolStats &sta
 Dictionary to_dict(const zylann::voxel::VoxelEngine::Stats &stats) {
 	Dictionary pools;
 	pools["general"] = to_dict(stats.general);
+	if (stats.has_separate_generation_pool) {
+		pools["generation"] = to_dict(stats.generation_pool);
+	}
 
 	Dictionary tasks;
 	tasks["streaming"] = stats.streaming_tasks;
@@ -186,6 +189,30 @@ void VoxelEngine::set_thread_count(int count) {
 	ERR_FAIL_COND_MSG(count < 1 || count > MAX_THREADS,
 			vformat("Thread count must be a number from 1 to %d", MAX_THREADS));
 	zylann::voxel::VoxelEngine::get_singleton().set_thread_count(static_cast<uint32_t>(count));
+}
+
+int VoxelEngine::get_hardware_thread_count() const {
+	return static_cast<int>(zylann::Thread::get_hardware_concurrency());
+}
+
+int VoxelEngine::get_generation_thread_count() const {
+	return zylann::voxel::VoxelEngine::get_singleton().get_generation_thread_count();
+}
+
+void VoxelEngine::set_generation_thread_count(int count) {
+	constexpr int MAX_THREADS = static_cast<int>(ThreadedTaskRunner::MAX_THREADS);
+	ERR_FAIL_COND_MSG(count < 0 || count > MAX_THREADS,
+			vformat("Generation thread count must be 0 (disabled) or 1 to %d", MAX_THREADS));
+	zylann::voxel::VoxelEngine::get_singleton().set_generation_thread_count(static_cast<uint32_t>(count));
+}
+
+int VoxelEngine::get_main_thread_time_budget_usec() const {
+	return zylann::voxel::VoxelEngine::get_singleton().get_main_thread_time_budget_usec();
+}
+
+void VoxelEngine::set_main_thread_time_budget_usec(int usec) {
+	ERR_FAIL_COND_MSG(usec < 0, "Time budget must be >= 0");
+	zylann::voxel::VoxelEngine::get_singleton().set_main_thread_time_budget_usec(static_cast<unsigned int>(usec));
 }
 
 void VoxelEngine::schedule_task(Ref<ZN_ThreadedTask> task) {
@@ -248,6 +275,14 @@ void VoxelEngine::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_stats"), &VoxelEngine::get_stats);
 	ClassDB::bind_method(D_METHOD("get_thread_count"), &VoxelEngine::get_thread_count);
 	ClassDB::bind_method(D_METHOD("set_thread_count", "count"), &VoxelEngine::set_thread_count);
+	ClassDB::bind_method(D_METHOD("get_hardware_thread_count"), &VoxelEngine::get_hardware_thread_count);
+	ClassDB::bind_method(D_METHOD("get_generation_thread_count"), &VoxelEngine::get_generation_thread_count);
+	ClassDB::bind_method(D_METHOD("set_generation_thread_count", "count"), &VoxelEngine::set_generation_thread_count);
+
+	ClassDB::bind_method(
+			D_METHOD("get_main_thread_time_budget_usec"), &VoxelEngine::get_main_thread_time_budget_usec);
+	ClassDB::bind_method(
+			D_METHOD("set_main_thread_time_budget_usec", "usec"), &VoxelEngine::set_main_thread_time_budget_usec);
 
 	ClassDB::bind_method(
 			D_METHOD("get_threaded_graphics_resource_building_enabled"),

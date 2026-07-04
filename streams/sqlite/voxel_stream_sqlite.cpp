@@ -229,7 +229,7 @@ void VoxelStreamSQLite::save_voxel_blocks(Span<VoxelStream::VoxelQueryData> p_bl
 	}
 
 	// TODO We should consider using a serialized cache, and measure the threshold in bytes
-	if (_cache.get_indicative_block_count() >= CACHE_SIZE) {
+	if (_cache.get_indicative_block_count() >= _cache_size) {
 		flush_cache();
 	}
 }
@@ -349,7 +349,7 @@ void VoxelStreamSQLite::save_instance_blocks(Span<VoxelStream::InstancesQueryDat
 	}
 
 	// TODO Optimization: we should consider using a serialized cache, and measure the threshold in bytes
-	if (_cache.get_indicative_block_count() >= CACHE_SIZE) {
+	if (_cache.get_indicative_block_count() >= _cache_size) {
 		flush_cache();
 	}
 }
@@ -431,6 +431,24 @@ void VoxelStreamSQLite::load_all_blocks(FullLoadingResult &result) {
 	Context ctx_outer{ result };
 	const bool request_result = con->load_all_blocks(&ctx_outer, L::process_block_func);
 	ERR_FAIL_COND(request_result == false);
+}
+
+void VoxelStreamSQLite::load_blocks_bulk(const BulkLoadParams &params, FullLoadingResult &result) {
+	ZN_PROFILE_SCOPE();
+
+	// Optimized path: load all then filter by LOD range and region.
+	// A more optimized implementation could push the filter into the SQL query,
+	// but that would require new Connection methods. For now, post-filtering is sufficient.
+	FullLoadingResult all_result;
+	load_all_blocks(all_result);
+
+	for (auto &block : all_result.blocks) {
+		if (block.lod >= params.min_lod && block.lod <= params.max_lod) {
+			if (params.region.size == Vector3i() || params.region.contains(block.position)) {
+				result.blocks.push_back(std::move(block));
+			}
+		}
+	}
 }
 
 int VoxelStreamSQLite::get_used_channels_mask() const {
@@ -585,6 +603,14 @@ bool VoxelStreamSQLite::is_key_cache_enabled() const {
 	return _block_keys_cache_enabled;
 }
 
+void VoxelStreamSQLite::set_cache_size(unsigned int size) {
+	_cache_size = size < 1 ? 1 : size;
+}
+
+unsigned int VoxelStreamSQLite::get_cache_size() const {
+	return _cache_size;
+}
+
 Box3i VoxelStreamSQLite::get_supported_block_range() const {
 	// const Connection *con = get_connection();
 	// const CoordinateFormat format = con != nullptr ? con->get_meta().coordinate_format :
@@ -675,6 +701,9 @@ void VoxelStreamSQLite::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_key_cache_enabled", "enabled"), &VoxelStreamSQLite::set_key_cache_enabled);
 	ClassDB::bind_method(D_METHOD("is_key_cache_enabled"), &VoxelStreamSQLite::is_key_cache_enabled);
 
+	ClassDB::bind_method(D_METHOD("set_cache_size", "size"), &VoxelStreamSQLite::set_cache_size);
+	ClassDB::bind_method(D_METHOD("get_cache_size"), &VoxelStreamSQLite::get_cache_size);
+
 	ClassDB::bind_method(
 			D_METHOD("set_preferred_coordinate_format", "format"), &VoxelStreamSQLite::set_preferred_coordinate_format
 	);
@@ -701,6 +730,12 @@ void VoxelStreamSQLite::_bind_methods() {
 			),
 			"set_preferred_coordinate_format",
 			"get_preferred_coordinate_format"
+	);
+
+	ADD_PROPERTY(
+			PropertyInfo(Variant::INT, "cache_size", PROPERTY_HINT_RANGE, "1,4096,1"),
+			"set_cache_size",
+			"get_cache_size"
 	);
 }
 

@@ -321,6 +321,15 @@ public:
 
 	bool has_blocks_with_voxels_in_area_broad_mip_test(Box3i box_in_voxels) const;
 
+	// Attempts to build a lower-LOD block by downsampling 8 child blocks from the LOD below.
+	// Returns true if all 8 child blocks were found and the output buffer was filled.
+	// This can be used to avoid re-invoking the generator when transitioning LODs.
+	bool try_downsample_block(
+			Vector3i block_pos,
+			unsigned int target_lod,
+			std::shared_ptr<VoxelBuffer> &out_buffer
+	) const;
+
 	// Access voxels of a specific block.
 	// WARNING: you must hold the spatial lock before calling this, and until you're done working on such blocks.
 	// Can return null.

@@ -206,6 +206,8 @@ protected:
 
 private:
 	void process();
+	void _on_generator_changed();
+	void refresh_material_from_graph_generator();
 	void process_viewers();
 	void process_viewer_data_box_change(
 			const ViewerID viewer_id,

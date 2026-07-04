@@ -116,8 +116,7 @@ void ThreadedTaskRunner::enqueue(IThreadedTask *task, bool serial) {
 		debug_add_owned_task(task);
 #endif
 	}
-	// TODO Do I need to post a certain amount of times?
-	// I feel like this causes the semaphore to be passed too many times when tasks become empty
+	// Wake one thread – one post is sufficient for one task.
 	_tasks_semaphore.post();
 }
 
@@ -144,9 +143,10 @@ void ThreadedTaskRunner::enqueue(Span<IThreadedTask *> new_tasks, bool serial) {
 		}
 		_debug_received_tasks += new_tasks.size();
 	}
-	// TODO Do I need to post a certain amount of times?
-	// Should it be the number of threads instead of number of tasks?
-	for (size_t i = 0; i < new_tasks.size(); ++i) {
+	// Wake at most `thread_count` threads – there's no benefit in signalling more threads than
+	// we have, and the woken threads will each grab tasks from the queue.
+	const size_t wake_count = (new_tasks.size() < _thread_count) ? new_tasks.size() : _thread_count;
+	for (size_t i = 0; i < wake_count; ++i) {
 		_tasks_semaphore.post();
 	}
 }

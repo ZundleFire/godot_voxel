@@ -114,6 +114,19 @@ public:
 
 	virtual void load_all_blocks(FullLoadingResult &result);
 
+	// Bulk load with LOD range filtering.
+	// Allows loading coarse LOD data first (for distant terrain), then filling in LOD0 on demand.
+	struct BulkLoadParams {
+		Box3i region;           // In block coordinates
+		uint8_t min_lod = 0;
+		uint8_t max_lod = 0;   // Inclusive
+	};
+
+	virtual void load_blocks_bulk(const BulkLoadParams &params, FullLoadingResult &result);
+	virtual bool supports_bulk_load() const {
+		return false;
+	}
+
 	// Tells which channels can be found in this stream.
 	// The simplest implementation is to return them all.
 	// One reason to specify which channels are available is to help the editor detect configuration issues,

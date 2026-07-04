@@ -21,10 +21,14 @@ void BufferedTaskScheduler::flush() {
 	if (_main_tasks.size() > 0) {
 		VoxelEngine::get_singleton().push_async_tasks(to_span(_main_tasks));
 	}
+	if (_generation_tasks.size() > 0) {
+		VoxelEngine::get_singleton().push_generation_tasks(to_span(_generation_tasks));
+	}
 	if (_io_tasks.size() > 0) {
 		VoxelEngine::get_singleton().push_async_io_tasks(to_span(_io_tasks));
 	}
 	_main_tasks.clear();
+	_generation_tasks.clear();
 	_io_tasks.clear();
 }
 

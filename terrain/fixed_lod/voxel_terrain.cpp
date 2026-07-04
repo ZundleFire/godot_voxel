@@ -6,6 +6,7 @@
 #include "../../engine/voxel_engine.h"
 #include "../../engine/voxel_engine_updater.h"
 #include "../../generators/generate_block_task.h"
+#include "../../generators/graph/voxel_generator_graph.h"
 #include "../../meshers/blocky/voxel_mesher_blocky.h"
 #include "../../meshers/mesh_block_task.h"
 #include "../../storage/voxel_buffer_gd.h"
@@ -173,13 +174,24 @@ void VoxelTerrain::set_generator(Ref<VoxelGenerator> p_generator) {
 	}
 
 	Ref<VoxelGenerator> prev_generator = get_generator();
+	const Callable generator_changed_callable = callable_mp(this, &VoxelTerrain::_on_generator_changed);
 	if (prev_generator.is_valid()) {
 		prev_generator->clear_cache();
+		if (prev_generator->is_connected(VoxelStringNames::get_singleton().changed, generator_changed_callable)) {
+			prev_generator->disconnect(VoxelStringNames::get_singleton().changed, generator_changed_callable);
+		}
 		// TODO if we were to share this generator on multiple terrains, cache should not be entirely cleared. Instead,
 		// we should just remove the area from all paired viewers.
 	}
 
 	_data->set_generator(p_generator);
+
+	if (p_generator.is_valid() &&
+			!p_generator->is_connected(VoxelStringNames::get_singleton().changed, generator_changed_callable)) {
+		p_generator->connect(VoxelStringNames::get_singleton().changed, generator_changed_callable);
+	}
+
+	refresh_material_from_graph_generator();
 
 	MeshingDependency::reset(_meshing_dependency, _mesher, p_generator);
 	StreamingDependency::reset(_streaming_dependency, get_stream(), p_generator);
@@ -203,6 +215,32 @@ void VoxelTerrain::set_generator(Ref<VoxelGenerator> p_generator) {
 
 Ref<VoxelGenerator> VoxelTerrain::get_generator() const {
 	return _data->get_generator();
+}
+
+void VoxelTerrain::refresh_material_from_graph_generator() {
+	Ref<VoxelGeneratorGraph> graph_generator = get_generator();
+	if (graph_generator.is_null()) {
+		return;
+	}
+
+	Ref<Material> final_material = graph_generator->get_final_material();
+	if (!graph_generator->is_good() || final_material.is_null()) {
+		const pg::CompilationResult result = graph_generator->compile(Engine::get_singleton()->is_editor_hint());
+		if (!result.success) {
+			ZN_PRINT_WARNING(
+					format("VoxelTerrain keeping previous material because graph compilation failed: {}", result.message));
+			return;
+		}
+		final_material = graph_generator->get_final_material();
+	}
+
+	if (final_material.is_valid()) {
+		set_material_override(final_material);
+	}
+}
+
+void VoxelTerrain::_on_generator_changed() {
+	refresh_material_from_graph_generator();
 }
 
 // void VoxelTerrain::_set_block_size_po2(int p_block_size_po2) {
@@ -926,8 +964,22 @@ void VoxelTerrain::_notification(int p_what) {
 				set_mesher(mesher);
 			}
 #endif
+			refresh_material_from_graph_generator();
 #endif
 			break;
+#ifdef TOOLS_ENABLED
+		case NOTIFICATION_EDITOR_PRE_SAVE: {
+			Ref<VoxelGeneratorGraph> graph_generator = get_generator();
+			if (Engine::get_singleton()->is_editor_hint() && graph_generator.is_valid()) {
+				set_material_override(Ref<Material>());
+			}
+		} break;
+		case NOTIFICATION_EDITOR_POST_SAVE:
+			if (Engine::get_singleton()->is_editor_hint()) {
+				refresh_material_from_graph_generator();
+			}
+			break;
+#endif
 
 		case NOTIFICATION_PROCESS:
 			// Can't do that in enter tree because Godot is "still setting up children".
@@ -1079,7 +1131,7 @@ void request_block_load(
 
 		IThreadedTask *task = stream_dependency->generator->create_block_task(params);
 
-		scheduler.push_main_task(task);
+		scheduler.push_generation_task(task);
 	}
 }
 

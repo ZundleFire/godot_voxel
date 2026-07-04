@@ -59,7 +59,7 @@ VoxelEngine::VoxelEngine(Config config) {
 
 	_general_thread_pool.set_name("Voxel general");
 	_general_thread_pool.set_thread_count(thread_count);
-	_general_thread_pool.set_priority_update_period(200);
+	_general_thread_pool.set_priority_update_period(64);
 
 	// Init world
 	_world.shared_priority_dependency = make_shared_instance<PriorityDependency::ViewersData>();
@@ -80,6 +80,11 @@ VoxelEngine::~VoxelEngine() {
 	// but doing it anyways for correctness, it's how it should have been...
 	// See https://github.com/Zylann/godot_voxel/issues/189
 	wait_and_clear_all_tasks(true);
+
+	if (_use_separate_generation_pool) {
+		_generation_thread_pool.set_thread_count(0);
+		_use_separate_generation_pool = false;
+	}
 
 #ifdef VOXEL_ENABLE_GPU
 	_gpu_task_runner.stop();
@@ -143,6 +148,20 @@ void VoxelEngine::wait_and_clear_all_tasks(bool warn) {
 		}
 		ZN_DELETE(task);
 	});
+
+	if (_use_separate_generation_pool) {
+		_generation_thread_pool.wait_for_all_tasks();
+
+		_generation_thread_pool.dequeue_completed_tasks([warn](zylann::IThreadedTask *task) {
+			if (warn) {
+				ZN_PRINT_WARNING(
+						"Generation tasks remain on module cleanup, "
+						"this could become a problem if they reference scripts"
+				);
+			}
+			ZN_DELETE(task);
+		});
+	}
 }
 
 VolumeID VoxelEngine::add_volume(VolumeCallbacks callbacks) {
@@ -303,6 +322,9 @@ void VoxelEngine::process() {
 	ZN_PROFILE_PLOT("TimeSpread tasks", int64_t(_time_spread_task_runner.get_pending_count()));
 	ZN_PROFILE_PLOT("Progressive tasks", int64_t(_progressive_task_runner.get_pending_count()));
 	ZN_PROFILE_PLOT("Threaded tasks", int64_t(_general_thread_pool.get_debug_remaining_tasks()));
+	if (_use_separate_generation_pool) {
+		ZN_PROFILE_PLOT("Generation tasks (pool)", int64_t(_generation_thread_pool.get_debug_remaining_tasks()));
+	}
 	ZN_PROFILE_PLOT("Objects", int64_t(ObjectDB::get_object_count()));
 	ZN_PROFILE_PLOT(
 			"ZN Std Allocator",
@@ -314,6 +336,14 @@ void VoxelEngine::process() {
 		task->apply_result();
 		ZN_DELETE(task);
 	});
+
+	// Receive generation results from separate pool if enabled
+	if (_use_separate_generation_pool) {
+		_generation_thread_pool.dequeue_completed_tasks([](zylann::IThreadedTask *task) {
+			task->apply_result();
+			ZN_DELETE(task);
+		});
+	}
 
 	// Run this after dequeueing threaded tasks, because they can add some to this runner,
 	// which could in turn complete right away (we avoid 1-frame delays this way).
@@ -397,6 +427,12 @@ VoxelEngine::Stats::ThreadPoolStats debug_get_pool_stats(const zylann::ThreadedT
 VoxelEngine::Stats VoxelEngine::get_stats() const {
 	Stats s;
 	s.general = debug_get_pool_stats(_general_thread_pool);
+	if (_use_separate_generation_pool) {
+		s.generation_pool = debug_get_pool_stats(_generation_thread_pool);
+		s.has_separate_generation_pool = true;
+	} else {
+		s.has_separate_generation_pool = false;
+	}
 	s.generation_tasks = _debug_generate_block_task_count;
 	s.meshing_tasks = MeshBlockTask::debug_get_running_count();
 	s.streaming_tasks = LoadBlockDataTask::debug_get_running_count() + SaveBlockDataTask::debug_get_running_count();
@@ -413,6 +449,57 @@ int VoxelEngine::get_thread_count() const {
 
 void VoxelEngine::set_thread_count(uint32_t count) {
 	_general_thread_pool.set_thread_count(count);
+}
+
+void VoxelEngine::set_generation_thread_count(uint32_t count) {
+	if (count == 0) {
+		// Disable separate generation pool — tasks will go through general pool
+		if (_use_separate_generation_pool) {
+			_generation_thread_pool.wait_for_all_tasks();
+			_generation_thread_pool.dequeue_completed_tasks([](zylann::IThreadedTask *task) {
+				task->apply_result();
+				ZN_DELETE(task);
+			});
+			_generation_thread_pool.set_thread_count(0);
+			_use_separate_generation_pool = false;
+			ZN_PRINT_VERBOSE("Voxel: separate generation pool disabled");
+		}
+		return;
+	}
+	if (!_use_separate_generation_pool) {
+		_generation_thread_pool.set_name("Voxel generation");
+		_generation_thread_pool.set_priority_update_period(64);
+	}
+	_generation_thread_pool.set_thread_count(count);
+	_use_separate_generation_pool = true;
+	ZN_PRINT_VERBOSE(format("Voxel: generation pool thread count set to {}", count));
+}
+
+int VoxelEngine::get_generation_thread_count() const {
+	if (!_use_separate_generation_pool) {
+		return 0;
+	}
+	return _generation_thread_pool.get_thread_count();
+}
+
+bool VoxelEngine::has_separate_generation_pool() const {
+	return _use_separate_generation_pool;
+}
+
+void VoxelEngine::push_generation_task(IThreadedTask *task) {
+	if (_use_separate_generation_pool) {
+		_generation_thread_pool.enqueue(task, false);
+	} else {
+		_general_thread_pool.enqueue(task, false);
+	}
+}
+
+void VoxelEngine::push_generation_tasks(Span<IThreadedTask *> tasks) {
+	if (_use_separate_generation_pool) {
+		_generation_thread_pool.enqueue(tasks, false);
+	} else {
+		_general_thread_pool.enqueue(tasks, false);
+	}
 }
 
 } // namespace zylann::voxel

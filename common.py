@@ -14,6 +14,7 @@ def register_scons_options(env, is_extension):
     env_vars.Add(BoolVariable("voxel_sqlite", "Build with SQLite save stream support", True))
     env_vars.Add(BoolVariable("voxel_instancer", "Build with VoxelInstancer support", True))
     env_vars.Add(BoolVariable("voxel_gpu", "Build with GPU compute support", True))
+    env_vars.Add(BoolVariable("voxel_ispc", "Build with ISPC SIMD noise acceleration (x86-only, requires ispc compiler)", False))
     env_vars.Add(BoolVariable("voxel_basic_generators", "Build with basic/example generators", True))
     env_vars.Add(BoolVariable("voxel_mesh_sdf", "Build with mesh voxelization support", True))
     env_vars.Add(BoolVariable("voxel_vox", "Build with support for loading .vox files", True))
@@ -106,6 +107,9 @@ def get_sources(env, is_editor_build):
         "util/noise/fast_noise_lite/*.cpp",
         "util/noise/gd_noise_range.cpp",
         "util/noise/spot_noise_gd.cpp",
+        "util/noise/voxel_advanced_noise.cpp",
+        "util/noise/voxel_noise_batch.cpp",
+        "util/noise/voxel_procedural_noise.cpp",
         "util/string/*.cpp",
         "util/thread/thread.cpp",
         "util/thread/spatial_lock_2d.cpp",

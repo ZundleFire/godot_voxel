@@ -48,6 +48,7 @@ private:
 #ifdef VOXEL_ENABLE_GPU
 	void run_gpu_task(zylann::ThreadedTaskContext &ctx);
 	void run_gpu_conversion();
+	void run_gpu_material_pass();
 #endif
 	void run_cpu_generation();
 	void run_stream_saving_and_finish();

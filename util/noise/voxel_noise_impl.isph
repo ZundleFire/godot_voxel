@@ -1,0 +1,814 @@
+// Voxel ISPC noise functions — complete implementation.
+// Based on FastNoise2 algorithms and adapted from UE5 VoxelPlugin's VoxelNoiseNodesImpl.isph.
+// Self-contained — includes our own minimal header instead of UE5's VoxelMinimal.isph.
+//
+// Noise types:
+//   - Perlin 2D/3D (quintic interpolation, SIMD gradient lookup)
+//   - Simplex 2D/3D (branchless mask approach)
+//   - Cellular 2D/3D (basic + TrueDistance with neighbor info)
+//   - Value 2D/3D (hermite interpolation)
+//   - Domain Warp 2D/3D (hash-based gradient warp)
+//
+// Original noise algorithms: Copyright (c) 2020 Jordan Peck (MIT License)
+// ISPC adaptation: Copyright (c) 2024 GodotEden contributors
+
+#pragma once
+
+#include "voxel_ispc_minimal.isph"
+
+// ============================================================================
+// Quintic interpolation
+// ============================================================================
+
+inline float InterpQuintic(const float Value) {
+    return Value * Value * Value * (Value * (Value * 6.0f - 15.0f) + 10.0f);
+}
+inline float2 InterpQuintic(const float2 Value) {
+    return MakeFloat2(InterpQuintic(Value.x), InterpQuintic(Value.y));
+}
+inline float3 InterpQuintic(const float3 Value) {
+    return MakeFloat3(InterpQuintic(Value.x), InterpQuintic(Value.y), InterpQuintic(Value.z));
+}
+
+// ============================================================================
+// Noise primes and constants
+// ============================================================================
+
+#define NoisePrimes_X ((uniform int32)501125321)
+#define NoisePrimes_Y ((uniform int32)1136930381)
+#define NoisePrimes_Z ((uniform int32)1720413743)
+#define NoisePrimes_W ((uniform int32)1066037191)
+
+#define NoisePrimes_int2 MakeInt2(NoisePrimes_X, NoisePrimes_Y)
+#define NoisePrimes_int3 MakeInt3(NoisePrimes_X, NoisePrimes_Y, NoisePrimes_Z)
+
+// Simplex noise skew factors
+#define Sqrt2 1.4142135623730950488f
+#define Sqrt3 1.7320508075688772935f
+#define F2 (0.5f * (Sqrt3 - 1.0f))
+#define G2 ((3.0f - Sqrt3) / 6.0f)
+#define F3 (1.0f / 3.0f)
+#define G3 (1.0f / 2.0f)
+
+// ============================================================================
+// Gradient dot products — SIMD-optimized 2D, bit-trick 3D
+// ============================================================================
+
+inline float GetGradientDot2D(const int32 Hash, const float X, const float Y) {
+    // 8 gradient directions for 2D Perlin noise
+    // Uses SIMD shuffle for TARGET_WIDTH 4 and 8 — avoids array lookup divergence
+    const int32 Index = Hash & 7;
+
+#if TARGET_WIDTH == 8
+    // All 8 gradients fit in a single register per component
+    const varying float A = MakeRegister(1.0f + Sqrt2, -1.0f - Sqrt2, 1.0f + Sqrt2, -1.0f - Sqrt2, 1.0f, -1.0f, 1.0f, -1.0f);
+    const varying float B = MakeRegister(1.0f, 1.0f, -1.0f, -1.0f, 1.0f + Sqrt2, 1.0f + Sqrt2, -1.0f - Sqrt2, -1.0f - Sqrt2);
+
+    const float GradientX = shuffle(A, Index);
+    const float GradientY = shuffle(B, Index);
+
+    return GradientX * X + GradientY * Y;
+#elif TARGET_WIDTH == 4
+    // Split into two 4-wide registers, select via Index < 4
+    const varying float A0 = MakeRegister(1.0f + Sqrt2, -1.0f - Sqrt2, 1.0f + Sqrt2, -1.0f - Sqrt2);
+    const varying float A1 = MakeRegister(1.0f, -1.0f, 1.0f, -1.0f);
+
+    const varying float B0 = MakeRegister(1.0f, 1.0f, -1.0f, -1.0f);
+    const varying float B1 = MakeRegister(1.0f + Sqrt2, 1.0f + Sqrt2, -1.0f - Sqrt2, -1.0f - Sqrt2);
+
+    const float GradientX = Index < 4 ? shuffle(A0, Index) : shuffle(A1, Index - 4);
+    const float GradientY = Index < 4 ? shuffle(B0, Index) : shuffle(B1, Index - 4);
+
+    return GradientX * X + GradientY * Y;
+#else
+    // Fallback: array-based lookup for unknown TARGET_WIDTH
+    const float GradientXArr[8] = {
+        1.0f + Sqrt2, -1.0f - Sqrt2, 1.0f + Sqrt2, -1.0f - Sqrt2,
+        1.0f, -1.0f, 1.0f, -1.0f
+    };
+    const float GradientYArr[8] = {
+        1.0f, 1.0f, -1.0f, -1.0f,
+        1.0f + Sqrt2, 1.0f + Sqrt2, -1.0f - Sqrt2, -1.0f - Sqrt2
+    };
+    return GradientXArr[Index] * X + GradientYArr[Index] * Y;
+#endif
+}
+
+inline float GetGradientDot3D(const int32 Hash, const float X, const float Y, const float Z) {
+    const int32 HashAnd13 = Hash & 13;
+
+    // If h < 8 then x, else y
+    const float U = HashAnd13 < 8 ? X : Y;
+    // If h < 2 then y else if h is 12 or 14 then x else z
+    const float V = HashAnd13 < 2 ? Y : (HashAnd13 == 12 ? X : Z);
+
+    // Sign bits via bit manipulation — branchless
+    const float H1 = floatbits(Hash << 31);
+    const float H2 = floatbits((Hash & 2) << 30);
+
+    return floatbits(intbits(U) ^ intbits(H1)) + floatbits(intbits(V) ^ intbits(H2));
+}
+
+// ============================================================================
+// Hash functions
+// ============================================================================
+
+inline int32 HashPrimes2(const int32 Seed, const int32 A, const int32 B) {
+    int32 Hash = Seed;
+    Hash ^= (A ^ B);
+    Hash *= 0x27d4eb2d;
+    return (Hash >> 15) ^ Hash;
+}
+inline int32 HashPrimes3(const int32 Seed, const int32 A, const int32 B, const int32 C) {
+    int32 Hash = Seed;
+    Hash ^= (A ^ B ^ C);
+    Hash *= 0x27d4eb2d;
+    return (Hash >> 15) ^ Hash;
+}
+
+inline int32 HashPrimesHB2(const int32 Seed, const int32 A, const int32 B) {
+    int32 Hash = Seed;
+    Hash ^= (A ^ B);
+    Hash *= 0x27d4eb2d;
+    return Hash;
+}
+inline int32 HashPrimesHB3(const int32 Seed, const int32 A, const int32 B, const int32 C) {
+    int32 Hash = Seed;
+    Hash ^= (A ^ B ^ C);
+    Hash *= 0x27d4eb2d;
+    return Hash;
+}
+
+inline float GetValueCoord2(const int32 Seed, const int32 A, const int32 B) {
+    int32 Hash = Seed;
+    Hash ^= (A ^ B);
+    Hash *= Hash * 0x27d4eb2d;
+    return ((float)Hash) * (1.0f / (float)MAX_int32);
+}
+inline float GetValueCoord3(const int32 Seed, const int32 A, const int32 B, const int32 C) {
+    int32 Hash = Seed;
+    Hash ^= (A ^ B ^ C);
+    Hash *= Hash * 0x27d4eb2d;
+    return ((float)Hash) * (1.0f / (float)MAX_int32);
+}
+
+// ============================================================================
+// Perlin noise
+// ============================================================================
+
+inline float GetPerlin2D(const int32 Seed, float2 Position) {
+    Position.x += 0.04902460144f;
+    Position.y += 0.02112610644f;
+
+    const float2 Floor = floor(Position);
+    const int2 PositionA = MakeInt2(Floor) * NoisePrimes_int2;
+    const int2 PositionB = PositionA + NoisePrimes_int2;
+
+    const float2 AlphaA = Position - Floor;
+    const float2 AlphaB = AlphaA - 1.0f;
+    const float2 QuinticAlpha = InterpQuintic(AlphaA);
+
+    return 0.579106986522674560546875f *
+        BilinearInterpolation(
+            GetGradientDot2D(HashPrimes2(Seed, PositionA.x, PositionA.y), AlphaA.x, AlphaA.y),
+            GetGradientDot2D(HashPrimes2(Seed, PositionB.x, PositionA.y), AlphaB.x, AlphaA.y),
+            GetGradientDot2D(HashPrimes2(Seed, PositionA.x, PositionB.y), AlphaA.x, AlphaB.y),
+            GetGradientDot2D(HashPrimes2(Seed, PositionB.x, PositionB.y), AlphaB.x, AlphaB.y),
+            QuinticAlpha.x,
+            QuinticAlpha.y);
+}
+
+inline float GetPerlin3D(const int32 Seed, float3 Position) {
+    Position.x += 0.04902460144f;
+    Position.y += 0.02112610644f;
+    Position.z += 0.06403176963f;
+
+    const float3 Floor = floor(Position);
+    const int3 PositionA = MakeInt3(Floor) * NoisePrimes_int3;
+    const int3 PositionB = PositionA + NoisePrimes_int3;
+
+    const float3 AlphaA = Position - Floor;
+    const float3 AlphaB = AlphaA - 1.0f;
+    const float3 QuinticAlpha = InterpQuintic(AlphaA);
+
+    return 0.964921414852142333984375f *
+        TrilinearInterpolation(
+            GetGradientDot3D(HashPrimes3(Seed, PositionA.x, PositionA.y, PositionA.z), AlphaA.x, AlphaA.y, AlphaA.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionB.x, PositionA.y, PositionA.z), AlphaB.x, AlphaA.y, AlphaA.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionA.x, PositionB.y, PositionA.z), AlphaA.x, AlphaB.y, AlphaA.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionB.x, PositionB.y, PositionA.z), AlphaB.x, AlphaB.y, AlphaA.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionA.x, PositionA.y, PositionB.z), AlphaA.x, AlphaA.y, AlphaB.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionB.x, PositionA.y, PositionB.z), AlphaB.x, AlphaA.y, AlphaB.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionA.x, PositionB.y, PositionB.z), AlphaA.x, AlphaB.y, AlphaB.z),
+            GetGradientDot3D(HashPrimes3(Seed, PositionB.x, PositionB.y, PositionB.z), AlphaB.x, AlphaB.y, AlphaB.z),
+            QuinticAlpha.x,
+            QuinticAlpha.y,
+            QuinticAlpha.z);
+}
+
+// ============================================================================
+// Simplex noise — branchless mask approach (adapted from VoxelPlugin 2.0)
+// ============================================================================
+
+inline float GetSimplex2D(const int32 Seed, float2 Position) {
+    const float Offset = F2 * (Position.x + Position.y);
+    const float2 Floor = floor(Position + Offset);
+
+    const int2 HashedPosition = MakeInt2(Floor) * NoisePrimes_int2;
+
+    const float G = G2 * (Floor.x + Floor.y);
+
+    const float2 PositionA = Position - (Floor - G);
+
+    // Branchless simplex triangle selection using select()
+    const bool Mask = PositionA.x > PositionA.y;
+    const float2 PositionB = MakeFloat2(
+        select(Mask, PositionA.x - 1.0f, PositionA.x) + G2,
+        select(Mask, PositionA.y, PositionA.y - 1.0f) + G2);
+
+    const float2 PositionC = PositionA + (G2 * 2.0f - 1.0f);
+
+    float AlphaA = 0.5f - (PositionA.y * PositionA.y) - (PositionA.x * PositionA.x);
+    float AlphaB = 0.5f - (PositionB.y * PositionB.y) - (PositionB.x * PositionB.x);
+    float AlphaC = 0.5f - (PositionC.y * PositionC.y) - (PositionC.x * PositionC.x);
+
+    AlphaA = max(AlphaA, 0.0f);
+    AlphaB = max(AlphaB, 0.0f);
+    AlphaC = max(AlphaC, 0.0f);
+
+    AlphaA = AlphaA * AlphaA * AlphaA;
+    AlphaB = AlphaB * AlphaB * AlphaB;
+    AlphaC = AlphaC * AlphaC * AlphaC;
+
+    const float NoiseA = GetGradientDot2D(
+        HashPrimes2(Seed, HashedPosition.x, HashedPosition.y),
+        PositionA.x, PositionA.y);
+    const float NoiseB = GetGradientDot2D(
+        HashPrimes2(Seed,
+            select(Mask, HashedPosition.x + NoisePrimes_X, HashedPosition.x),
+            select(Mask, HashedPosition.y, HashedPosition.y + NoisePrimes_Y)),
+        PositionB.x, PositionB.y);
+    const float NoiseC = GetGradientDot2D(
+        HashPrimes2(Seed,
+            HashedPosition.x + NoisePrimes_X,
+            HashedPosition.y + NoisePrimes_Y),
+        PositionC.x, PositionC.y);
+
+    // Divide by 3 to get -1 to 1 range
+    return 38.283687591552734375f * (NoiseA * AlphaA + NoiseB * AlphaB + NoiseC * AlphaC) / 3.0f;
+}
+
+inline float GetSimplex3D(const int32 Seed, float3 Position) {
+    const float S = F3 * (Position.x + Position.y + Position.z);
+    Position = Position + S;
+
+    const float3 Floor = floor(Position);
+    const float3 Offset = Position - Floor;
+
+    const int3 HashedPosition = MakeInt3(Floor) * NoisePrimes_int3;
+
+    // Branchless simplex tetrahedron selection using boolean masks
+    const bool MaskXY = Offset.x >= Offset.y;
+    const bool MaskYZ = Offset.y >= Offset.z;
+    const bool MaskXZ = Offset.x >= Offset.z;
+
+    const bool MaskA = MaskXY & MaskXZ;
+    const bool MaskB = MaskYZ & (!MaskXY);
+    const bool MaskC = (!MaskXZ) & (!MaskYZ);
+
+    const bool MaskD = MaskXY | MaskXZ;
+    const bool MaskE = (!MaskXY) | MaskYZ;
+    const bool MaskF = MaskXZ & MaskYZ;
+
+    const float G = G3 * (Offset.x + Offset.y + Offset.z);
+
+    const float3 PositionA = Offset - G;
+    const float3 PositionB = MakeFloat3(
+        select(MaskA, PositionA.x - 1.0f, PositionA.x) + G3,
+        select(MaskB, PositionA.y - 1.0f, PositionA.y) + G3,
+        select(MaskC, PositionA.z - 1.0f, PositionA.z) + G3);
+    const float3 PositionC = MakeFloat3(
+        select(MaskD, PositionA.x - 1.0f, PositionA.x) + G3 * 2.0f,
+        select(MaskE, PositionA.y - 1.0f, PositionA.y) + G3 * 2.0f,
+        select(MaskF, PositionA.z, PositionA.z - 1.0f) + G3 * 2.0f);
+    const float3 PositionD = PositionA + (G3 * 3.0f - 1.0f);
+
+    float AlphaA = ((0.5f - PositionA.z * PositionA.z) - PositionA.y * PositionA.y) - PositionA.x * PositionA.x;
+    float AlphaB = ((0.5f - PositionB.z * PositionB.z) - PositionB.y * PositionB.y) - PositionB.x * PositionB.x;
+    float AlphaC = ((0.5f - PositionC.z * PositionC.z) - PositionC.y * PositionC.y) - PositionC.x * PositionC.x;
+    float AlphaD = ((0.5f - PositionD.z * PositionD.z) - PositionD.y * PositionD.y) - PositionD.x * PositionD.x;
+
+    AlphaA = max(AlphaA, 0.0f);
+    AlphaB = max(AlphaB, 0.0f);
+    AlphaC = max(AlphaC, 0.0f);
+    AlphaD = max(AlphaD, 0.0f);
+
+    AlphaA = AlphaA * AlphaA * AlphaA;
+    AlphaB = AlphaB * AlphaB * AlphaB;
+    AlphaC = AlphaC * AlphaC * AlphaC;
+    AlphaD = AlphaD * AlphaD * AlphaD;
+
+    const float NoiseA = GetGradientDot3D(
+        HashPrimes3(Seed, HashedPosition.x, HashedPosition.y, HashedPosition.z),
+        PositionA.x, PositionA.y, PositionA.z);
+    const float NoiseB = GetGradientDot3D(
+        HashPrimes3(Seed,
+            select(MaskA, HashedPosition.x + NoisePrimes_X, HashedPosition.x),
+            select(MaskB, HashedPosition.y + NoisePrimes_Y, HashedPosition.y),
+            select(MaskC, HashedPosition.z + NoisePrimes_Z, HashedPosition.z)),
+        PositionB.x, PositionB.y, PositionB.z);
+    const float NoiseC = GetGradientDot3D(
+        HashPrimes3(Seed,
+            select(MaskD, HashedPosition.x + NoisePrimes_X, HashedPosition.x),
+            select(MaskE, HashedPosition.y + NoisePrimes_Y, HashedPosition.y),
+            select(MaskF, HashedPosition.z, HashedPosition.z + NoisePrimes_Z)),
+        PositionC.x, PositionC.y, PositionC.z);
+    const float NoiseD = GetGradientDot3D(
+        HashPrimes3(Seed,
+            HashedPosition.x + NoisePrimes_X,
+            HashedPosition.y + NoisePrimes_Y,
+            HashedPosition.z + NoisePrimes_Z),
+        PositionD.x, PositionD.y, PositionD.z);
+
+    // Divide by 3 to get -1 to 1 range
+    return 32.69428253173828125f * (NoiseA * AlphaA + NoiseB * AlphaB + NoiseC * AlphaC + NoiseD * AlphaD) / 3.0f;
+}
+
+// ============================================================================
+// Cellular noise — basic (nearest cell distance)
+// ============================================================================
+
+inline float2 GetCellularDirection2D(const int32 Seed, const int2 HashPosition, const int32 IndexX, const int32 IndexY) {
+    const int32 Hash = HashPrimesHB2(
+        Seed,
+        HashPosition.x + IndexX * NoisePrimes_X,
+        HashPosition.y + IndexY * NoisePrimes_Y);
+
+    return normalize(MakeFloat2(
+        ((Hash >> 0) & MAX_uint16) - MAX_uint16 / 2.0f,
+        ((Hash >> 16) & MAX_uint16) - MAX_uint16 / 2.0f
+    ));
+}
+
+inline float3 GetCellularDirection3D(const int32 Seed, const int3 HashPosition, const int32 IndexX, const int32 IndexY, const int32 IndexZ) {
+    const int32 Hash = HashPrimesHB3(
+        Seed,
+        HashPosition.x + IndexX * NoisePrimes_X,
+        HashPosition.y + IndexY * NoisePrimes_Y,
+        HashPosition.z + IndexZ * NoisePrimes_Z);
+
+    const int32 TenBits = (1 << 10) - 1;
+    return normalize(MakeFloat3(
+        ((Hash >> 0) & TenBits) - TenBits / 2.0f,
+        ((Hash >> 10) & TenBits) - TenBits / 2.0f,
+        ((Hash >> 20) & TenBits) - TenBits / 2.0f
+    ));
+}
+
+inline float GetCellularNoise2D(const int32 Seed, const float2 Position, const float Jitter) {
+    const float ScaledJitter = Jitter / 4.0f;
+    float Distance = 0.0f;
+
+    const float2 Floor = floor(Position);
+    const float2 LocalPosition = Position - Floor;
+    const int2 HashPosition = MakeInt2(Floor) * NoisePrimes_int2;
+
+    for (uniform int32 IndexX = -1; IndexX < 2; IndexX++) {
+        for (uniform int32 IndexY = -1; IndexY < 2; IndexY++) {
+            const float2 Direction = GetCellularDirection2D(Seed, HashPosition, IndexX, IndexY);
+            const float2 Center = MakeFloat2(IndexX, IndexY) + ScaledJitter * Direction;
+            const float NewDistance = DistanceSquared(Center, LocalPosition);
+
+            if (IndexX == -1 && IndexY == -1) {
+                Distance = NewDistance;
+            } else {
+                Distance = min(Distance, NewDistance);
+            }
+        }
+    }
+
+    return sqrt(Distance);
+}
+
+inline float GetCellularNoise3D(const int32 Seed, const float3 Position, const float Jitter) {
+    const float ScaledJitter = Jitter / 4.0f;
+    float Distance = 0.0f;
+
+    const float3 Floor = floor(Position);
+    const float3 LocalPosition = Position - Floor;
+    const int3 HashPosition = MakeInt3(Floor) * NoisePrimes_int3;
+
+    for (uniform int32 IndexX = -1; IndexX < 2; IndexX++) {
+        for (uniform int32 IndexY = -1; IndexY < 2; IndexY++) {
+            for (uniform int32 IndexZ = -1; IndexZ < 2; IndexZ++) {
+                const float3 Direction = GetCellularDirection3D(Seed, HashPosition, IndexX, IndexY, IndexZ);
+                const float3 Center = MakeFloat3(IndexX, IndexY, IndexZ) + ScaledJitter * Direction;
+                const float NewDistance = DistanceSquared(Center, LocalPosition);
+
+                if (IndexX == -1 && IndexY == -1 && IndexZ == -1) {
+                    Distance = NewDistance;
+                } else {
+                    Distance = min(Distance, NewDistance);
+                }
+            }
+        }
+    }
+
+    return sqrt(Distance);
+}
+
+// ============================================================================
+// True Distance Cellular noise — returns edge distance + cell/neighbor info
+// Adapted from VoxelPlugin 2.0's GetTrueDistanceCellularNoise
+// ============================================================================
+
+inline float GetTrueDistanceCellularNoise2D(
+    const int32 Seed,
+    const float2 Position,
+    const float Jitter,
+    varying float2* CellPosition,
+    varying float2* OutFirstNeighborPosition,
+    varying float2* OutSecondNeighborPosition,
+    varying float &OutSecondNeighborDistance,
+    varying float2* OutThirdNeighborPosition,
+    varying float &OutThirdNeighborDistance)
+{
+    const float ScaledJitter = Jitter / 4.0f;
+
+    float DistanceToCenter = 0.0f;
+    float2 MinCenter;
+    int2 MinIndices;
+
+    const float2 Floor = floor(Position);
+    const float2 LocalPosition = Position - Floor;
+    const int2 HashPosition = MakeInt2(Floor) * NoisePrimes_int2;
+
+    // Pass 1: Find the nearest cell center
+    for (uniform int32 IndexX = -1; IndexX <= 2; IndexX++) {
+        for (uniform int32 IndexY = -1; IndexY <= 2; IndexY++) {
+            const float2 Direction = GetCellularDirection2D(Seed, HashPosition, IndexX, IndexY);
+            const float2 Center = MakeFloat2(IndexX, IndexY) + ScaledJitter * Direction;
+            const float NewDistance = DistanceSquared(Center, LocalPosition);
+
+            if ((IndexX == -1 && IndexY == -1) || NewDistance < DistanceToCenter) {
+                DistanceToCenter = NewDistance;
+                MinCenter = Center;
+                MinIndices = MakeInt2(IndexX, IndexY);
+            }
+        }
+    }
+
+    *CellPosition = MakeFloat2(MinIndices.x + (int)Floor.x, MinIndices.y + (int)Floor.y)
+        + ScaledJitter * GetCellularDirection2D(Seed, HashPosition, MinIndices.x, MinIndices.y);
+
+    // Pass 2: Find the 3 nearest edge distances (Voronoi edges)
+    float DistanceToEdge = 1e9f;
+    float DistanceToSecondEdge = 1e9f;
+    float DistanceToThirdEdge = 1e9f;
+
+    int2 Neighbor1;
+    float2 Direction1;
+    int2 Neighbor2;
+    float2 Direction2;
+    int2 Neighbor3;
+    float2 Direction3;
+
+    for (uniform int32 IndexX = -1; IndexX <= 2; IndexX++) {
+        for (uniform int32 IndexY = -1; IndexY <= 2; IndexY++) {
+            if (MinIndices.x == IndexX && MinIndices.y == IndexY) {
+                continue;
+            }
+
+            const float2 Direction = GetCellularDirection2D(Seed, HashPosition, IndexX, IndexY);
+            const float2 Center = MakeFloat2(IndexX, IndexY) + ScaledJitter * Direction;
+
+            // Distance to the edge between our cell and this neighbor
+            const float NewDistance = dot(
+                (MinCenter + Center) * 0.5f - LocalPosition,
+                normalize(Center - MinCenter));
+
+            if (NewDistance < DistanceToEdge) {
+                DistanceToThirdEdge = DistanceToSecondEdge;
+                Direction3 = Direction2;
+                Neighbor3 = Neighbor2;
+
+                DistanceToSecondEdge = DistanceToEdge;
+                Direction2 = Direction1;
+                Neighbor2 = Neighbor1;
+
+                DistanceToEdge = NewDistance;
+                Direction1 = Direction;
+                Neighbor1 = MakeInt2(IndexX, IndexY);
+            } else if (NewDistance < DistanceToSecondEdge) {
+                DistanceToThirdEdge = DistanceToSecondEdge;
+                Direction3 = Direction2;
+                Neighbor3 = Neighbor2;
+
+                DistanceToSecondEdge = NewDistance;
+                Direction2 = Direction;
+                Neighbor2 = MakeInt2(IndexX, IndexY);
+            } else if (NewDistance < DistanceToThirdEdge) {
+                DistanceToThirdEdge = NewDistance;
+                Direction3 = Direction;
+                Neighbor3 = MakeInt2(IndexX, IndexY);
+            }
+        }
+    }
+
+    *OutFirstNeighborPosition = MakeFloat2(Neighbor1.x + (int)Floor.x, Neighbor1.y + (int)Floor.y) + ScaledJitter * Direction1;
+    *OutSecondNeighborPosition = MakeFloat2(Neighbor2.x + (int)Floor.x, Neighbor2.y + (int)Floor.y) + ScaledJitter * Direction2;
+    OutSecondNeighborDistance = DistanceToSecondEdge;
+    *OutThirdNeighborPosition = MakeFloat2(Neighbor3.x + (int)Floor.x, Neighbor3.y + (int)Floor.y) + ScaledJitter * Direction3;
+    OutThirdNeighborDistance = DistanceToThirdEdge;
+
+    return DistanceToEdge;
+}
+
+inline float GetTrueDistanceCellularNoise3D(
+    const int32 Seed,
+    const float3 Position,
+    const float Jitter,
+    varying float3* CellPosition,
+    varying float3* OutFirstNeighborPosition,
+    varying float3* OutSecondNeighborPosition,
+    varying float &OutSecondNeighborDistance,
+    varying float3* OutThirdNeighborPosition,
+    varying float &OutThirdNeighborDistance)
+{
+    const float ScaledJitter = Jitter / 4.0f;
+
+    float DistanceToCenter = 0.0f;
+    float3 MinCenter;
+    int3 MinIndices;
+
+    const float3 Floor = floor(Position);
+    const float3 LocalPosition = Position - Floor;
+    const int3 HashPosition = MakeInt3(Floor) * NoisePrimes_int3;
+
+    // Pass 1: Find the nearest cell center
+    for (uniform int32 IndexX = -1; IndexX <= 2; IndexX++) {
+        for (uniform int32 IndexY = -1; IndexY <= 2; IndexY++) {
+            for (uniform int32 IndexZ = -1; IndexZ <= 2; IndexZ++) {
+                const float3 Direction = GetCellularDirection3D(Seed, HashPosition, IndexX, IndexY, IndexZ);
+                const float3 Center = MakeFloat3(IndexX, IndexY, IndexZ) + ScaledJitter * Direction;
+                const float NewDistance = DistanceSquared(Center, LocalPosition);
+
+                if ((IndexX == -1 && IndexY == -1 && IndexZ == -1) || NewDistance < DistanceToCenter) {
+                    DistanceToCenter = NewDistance;
+                    MinCenter = Center;
+                    MinIndices = MakeInt3(IndexX, IndexY, IndexZ);
+                }
+            }
+        }
+    }
+
+    *CellPosition = MakeFloat3(
+        MinIndices.x + (int)Floor.x, MinIndices.y + (int)Floor.y, MinIndices.z + (int)Floor.z)
+        + ScaledJitter * GetCellularDirection3D(Seed, HashPosition, MinIndices.x, MinIndices.y, MinIndices.z);
+
+    // Pass 2: Find the 3 nearest edge distances
+    float DistanceToEdge = 1e9f;
+    float DistanceToSecondEdge = 1e9f;
+    float DistanceToThirdEdge = 1e9f;
+
+    int3 Neighbor1;
+    float3 Direction1;
+    int3 Neighbor2;
+    float3 Direction2;
+    int3 Neighbor3;
+    float3 Direction3;
+
+    for (uniform int32 IndexX = -1; IndexX <= 2; IndexX++) {
+        for (uniform int32 IndexY = -1; IndexY <= 2; IndexY++) {
+            for (uniform int32 IndexZ = -1; IndexZ <= 2; IndexZ++) {
+                if (MinIndices.x == IndexX &&
+                    MinIndices.y == IndexY &&
+                    MinIndices.z == IndexZ) {
+                    continue;
+                }
+
+                const float3 Direction = GetCellularDirection3D(Seed, HashPosition, IndexX, IndexY, IndexZ);
+                const float3 Center = MakeFloat3(IndexX, IndexY, IndexZ) + ScaledJitter * Direction;
+
+                const float NewDistance = dot(
+                    (MinCenter + Center) * 0.5f - LocalPosition,
+                    normalize(Center - MinCenter));
+
+                if (NewDistance < DistanceToEdge) {
+                    DistanceToThirdEdge = DistanceToSecondEdge;
+                    Direction3 = Direction2;
+                    Neighbor3 = Neighbor2;
+
+                    DistanceToSecondEdge = DistanceToEdge;
+                    Direction2 = Direction1;
+                    Neighbor2 = Neighbor1;
+
+                    DistanceToEdge = NewDistance;
+                    Direction1 = Direction;
+                    Neighbor1 = MakeInt3(IndexX, IndexY, IndexZ);
+                } else if (NewDistance < DistanceToSecondEdge) {
+                    DistanceToThirdEdge = DistanceToSecondEdge;
+                    Direction3 = Direction2;
+                    Neighbor3 = Neighbor2;
+
+                    DistanceToSecondEdge = NewDistance;
+                    Direction2 = Direction;
+                    Neighbor2 = MakeInt3(IndexX, IndexY, IndexZ);
+                } else if (NewDistance < DistanceToThirdEdge) {
+                    DistanceToThirdEdge = NewDistance;
+                    Direction3 = Direction;
+                    Neighbor3 = MakeInt3(IndexX, IndexY, IndexZ);
+                }
+            }
+        }
+    }
+
+    *OutFirstNeighborPosition = MakeFloat3(Neighbor1.x + (int)Floor.x, Neighbor1.y + (int)Floor.y, Neighbor1.z + (int)Floor.z) + ScaledJitter * Direction1;
+    *OutSecondNeighborPosition = MakeFloat3(Neighbor2.x + (int)Floor.x, Neighbor2.y + (int)Floor.y, Neighbor2.z + (int)Floor.z) + ScaledJitter * Direction2;
+    OutSecondNeighborDistance = DistanceToSecondEdge;
+    *OutThirdNeighborPosition = MakeFloat3(Neighbor3.x + (int)Floor.x, Neighbor3.y + (int)Floor.y, Neighbor3.z + (int)Floor.z) + ScaledJitter * Direction3;
+    OutThirdNeighborDistance = DistanceToThirdEdge;
+
+    return DistanceToEdge;
+}
+
+// ============================================================================
+// Value noise — uses InterpHermite (matching VoxelPlugin 2.0)
+// ============================================================================
+
+inline float GetValue2D(const int32 Seed, float2 Position) {
+    Position.x += 0.04902460144f;
+    Position.y += 0.02112610644f;
+
+    const float2 Floor = floor(Position);
+    const int2 PositionA = MakeInt2(Floor) * NoisePrimes_int2;
+    const int2 PositionB = PositionA + NoisePrimes_int2;
+
+    const float2 HermiteAlpha = InterpHermite(Position - Floor);
+
+    return BilinearInterpolation(
+        GetValueCoord2(Seed, PositionA.x, PositionA.y),
+        GetValueCoord2(Seed, PositionB.x, PositionA.y),
+        GetValueCoord2(Seed, PositionA.x, PositionB.y),
+        GetValueCoord2(Seed, PositionB.x, PositionB.y),
+        HermiteAlpha.x,
+        HermiteAlpha.y);
+}
+
+inline float GetValue3D(const int32 Seed, float3 Position) {
+    Position.x += 0.04902460144f;
+    Position.y += 0.02112610644f;
+    Position.z += 0.06403176963f;
+
+    const float3 Floor = floor(Position);
+    const int3 PositionA = MakeInt3(Floor) * NoisePrimes_int3;
+    const int3 PositionB = PositionA + NoisePrimes_int3;
+
+    const float3 HermiteAlpha = InterpHermite(Position - Floor);
+
+    return TrilinearInterpolation(
+        GetValueCoord3(Seed, PositionA.x, PositionA.y, PositionA.z),
+        GetValueCoord3(Seed, PositionB.x, PositionA.y, PositionA.z),
+        GetValueCoord3(Seed, PositionA.x, PositionB.y, PositionA.z),
+        GetValueCoord3(Seed, PositionB.x, PositionB.y, PositionA.z),
+        GetValueCoord3(Seed, PositionA.x, PositionA.y, PositionB.z),
+        GetValueCoord3(Seed, PositionB.x, PositionA.y, PositionB.z),
+        GetValueCoord3(Seed, PositionA.x, PositionB.y, PositionB.z),
+        GetValueCoord3(Seed, PositionB.x, PositionB.y, PositionB.z),
+        HermiteAlpha.x,
+        HermiteAlpha.y,
+        HermiteAlpha.z);
+}
+
+// ============================================================================
+// Domain Warp 2D — hash-based gradient warp with Hermite interpolation
+// Adapted from VoxelPlugin 2.0's DomainWarp2D/3D
+// ============================================================================
+
+inline float DomainWarp2D(const int32 Seed, const float Amplitude, float2 Position, varying float2* OutPosition) {
+    Position.x += 0.04902460144f;
+    Position.y += 0.02112610644f;
+
+    const float2 Floor = floor(Position);
+
+    const int2 PositionA = MakeInt2(Floor) * NoisePrimes_int2;
+    const int2 PositionB = PositionA + NoisePrimes_int2;
+
+    const int32 Hash00 = HashPrimesHB2(Seed, PositionA.x, PositionA.y);
+    const float2 Alpha00 = MakeFloat2(Hash00 & 0xffff, (Hash00 >> 16) & 0xffff);
+
+    const int32 Hash10 = HashPrimesHB2(Seed, PositionB.x, PositionA.y);
+    const float2 Alpha10 = MakeFloat2(Hash10 & 0xffff, (Hash10 >> 16) & 0xffff);
+
+    const int32 Hash01 = HashPrimesHB2(Seed, PositionA.x, PositionB.y);
+    const float2 Alpha01 = MakeFloat2(Hash01 & 0xffff, (Hash01 >> 16) & 0xffff);
+
+    const int32 Hash11 = HashPrimesHB2(Seed, PositionB.x, PositionB.y);
+    const float2 Alpha11 = MakeFloat2(Hash11 & 0xffff, (Hash11 >> 16) & 0xffff);
+
+    const float Normalize = 1.0f / (0xffff / 2.0f);
+    const float2 HermiteAlpha = InterpHermite(Position - Floor);
+
+    const float2 Warp = (MakeFloat2(
+        BilinearInterpolation(
+            Alpha00.x, Alpha10.x, Alpha01.x, Alpha11.x,
+            HermiteAlpha.x, HermiteAlpha.y),
+        BilinearInterpolation(
+            Alpha00.y, Alpha10.y, Alpha01.y, Alpha11.y,
+            HermiteAlpha.x, HermiteAlpha.y)) - (0xffff / 2.0f)) * Normalize;
+
+    *OutPosition = Warp * Amplitude + *OutPosition;
+
+    float SquaredWarpLength = dot(Warp, Warp);
+    return SquaredWarpLength * InvSqrt(SquaredWarpLength);
+}
+
+// ============================================================================
+// Domain Warp 3D — hash-based gradient warp with Hermite interpolation
+// ============================================================================
+
+inline float DomainWarp3D(const int32 Seed, const float Amplitude, float3 Position, varying float3* OutPosition) {
+    Position.x += 0.04902460144f;
+    Position.y += 0.02112610644f;
+    Position.z += 0.06403176963f;
+
+    const float3 Floor = floor(Position);
+
+    const int3 Position0 = MakeInt3(Floor) * NoisePrimes_int3;
+    const int3 Position1 = Position0 + NoisePrimes_int3;
+
+    // Compute hash-based gradient vectors at all 8 corners
+#define GRADIENT_COORD_3D(IX, IY, IZ) \
+    const int32 Hash##IX##IY##IZ = HashPrimesHB3(Seed, Position##IX.x, Position##IY.y, Position##IZ.z); \
+    const float3 Alpha##IX##IY##IZ = MakeFloat3( \
+        Hash##IX##IY##IZ & 0x3ff, \
+        (Hash##IX##IY##IZ >> 10) & 0x3ff, \
+        (Hash##IX##IY##IZ >> 20) & 0x3ff);
+
+    GRADIENT_COORD_3D(0, 0, 0);
+    GRADIENT_COORD_3D(1, 0, 0);
+    GRADIENT_COORD_3D(0, 1, 0);
+    GRADIENT_COORD_3D(1, 1, 0);
+    GRADIENT_COORD_3D(0, 0, 1);
+    GRADIENT_COORD_3D(1, 0, 1);
+    GRADIENT_COORD_3D(0, 1, 1);
+    GRADIENT_COORD_3D(1, 1, 1);
+
+#undef GRADIENT_COORD_3D
+
+    const float3 HermiteAlpha = InterpHermite(Position - Floor);
+
+    // Bilinear interpolation of gradient vectors on each Z slice
+    const float3 WarpA = MakeFloat3(
+        BilinearInterpolation(
+            Alpha000.x, Alpha100.x, Alpha010.x, Alpha110.x,
+            HermiteAlpha.x, HermiteAlpha.y),
+        BilinearInterpolation(
+            Alpha000.y, Alpha100.y, Alpha010.y, Alpha110.y,
+            HermiteAlpha.x, HermiteAlpha.y),
+        BilinearInterpolation(
+            Alpha000.z, Alpha100.z, Alpha010.z, Alpha110.z,
+            HermiteAlpha.x, HermiteAlpha.y));
+
+    const float3 WarpB = MakeFloat3(
+        BilinearInterpolation(
+            Alpha001.x, Alpha101.x, Alpha011.x, Alpha111.x,
+            HermiteAlpha.x, HermiteAlpha.y),
+        BilinearInterpolation(
+            Alpha001.y, Alpha101.y, Alpha011.y, Alpha111.y,
+            HermiteAlpha.x, HermiteAlpha.y),
+        BilinearInterpolation(
+            Alpha001.z, Alpha101.z, Alpha011.z, Alpha111.z,
+            HermiteAlpha.x, HermiteAlpha.y));
+
+    const float Normalize = 1.0f / (0x3ff / 2.0f);
+
+    // Lerp between Z slices and normalize
+    const float3 Warp = (lerp(WarpA, WarpB, HermiteAlpha.z) - (0x3ff / 2.0f)) * Normalize;
+
+    *OutPosition = Warp * Amplitude + *OutPosition;
+
+    float SquaredWarpLength = dot(Warp, Warp);
+    return SquaredWarpLength * InvSqrt(SquaredWarpLength);
+}
+
+// ============================================================================
+// Simplified TrueDistance Cellular — returns just edge distance (no neighbor info)
+// Useful for simple "Voronoi edge distance" effect without needing all the neighbor data.
+// ============================================================================
+
+inline float GetTrueDistanceCellular2D(const int32 Seed, const float2 Position, const float Jitter) {
+    float2 CellPos;
+    float2 Neighbor1, Neighbor2, Neighbor3;
+    float Dist2, Dist3;
+    return GetTrueDistanceCellularNoise2D(Seed, Position, Jitter,
+        &CellPos, &Neighbor1, &Neighbor2, Dist2, &Neighbor3, Dist3);
+}
+
+inline float GetTrueDistanceCellular3D(const int32 Seed, const float3 Position, const float Jitter) {
+    float3 CellPos;
+    float3 Neighbor1, Neighbor2, Neighbor3;
+    float Dist2, Dist3;
+    return GetTrueDistanceCellularNoise3D(Seed, Position, Jitter,
+        &CellPos, &Neighbor1, &Neighbor2, Dist2, &Neighbor3, Dist3);
+}

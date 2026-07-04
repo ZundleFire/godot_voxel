@@ -263,6 +263,8 @@ public:
 		};
 
 		ThreadPoolStats general;
+		ThreadPoolStats generation_pool;
+		bool has_separate_generation_pool;
 		int generation_tasks;
 		int streaming_tasks;
 		int meshing_tasks;
@@ -276,6 +278,16 @@ public:
 
 	int get_thread_count() const;
 	void set_thread_count(uint32_t count);
+
+	// Separate generation pool support.
+	// When enabled, GenerateBlockTask runs on a dedicated pool, freeing the general pool for meshing/other tasks.
+	void set_generation_thread_count(uint32_t count);
+	int get_generation_thread_count() const;
+	bool has_separate_generation_pool() const;
+
+	// Thread-safe. Routes to generation pool if enabled, otherwise to general pool.
+	void push_generation_task(IThreadedTask *task);
+	void push_generation_tasks(Span<IThreadedTask *> tasks);
 
 #ifdef VOXEL_ENABLE_GPU
 	bool has_rendering_device() const {
@@ -343,6 +355,10 @@ private:
 	World _world;
 
 	ThreadedTaskRunner _general_thread_pool;
+	// Optional separate pool for generation tasks (GenerateBlockTask).
+	// When thread count > 0, generation tasks are routed here instead of _general_thread_pool.
+	ThreadedTaskRunner _generation_thread_pool;
+	bool _use_separate_generation_pool = false;
 	// For tasks that can only run on the main thread and be spread out over frames
 	TimeSpreadTaskRunner _time_spread_task_runner;
 	unsigned int _main_thread_time_budget_usec = DEFAULT_MAIN_THREAD_BUDGET_USEC;

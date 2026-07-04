@@ -474,14 +474,20 @@ void GenerateBlockGPUTask::collect(GPUTaskContext &ctx) {
 		storage_buffer_pool.recycle(bd.params_sb);
 	}
 
-	zylann::godot::free_rendering_device_rid(rd, _generator_pipeline_rid);
+	if (_generator_pipeline_rid.is_valid()) {
+		zylann::godot::free_rendering_device_rid(rd, _generator_pipeline_rid);
+	}
 
 	for (const RID &rid : _modifier_pipelines) {
-		zylann::godot::free_rendering_device_rid(rd, rid);
+		if (rid.is_valid()) {
+			zylann::godot::free_rendering_device_rid(rd, rid);
+		}
 	}
 
 	for (const RID &rid : _uniform_sets_to_free) {
-		zylann::godot::free_rendering_device_rid(rd, rid);
+		if (rid.is_valid()) {
+			zylann::godot::free_rendering_device_rid(rd, rid);
+		}
 	}
 
 	// We leave conversion to the CPU task, because we have only one thread for GPU work and it only exists for waiting

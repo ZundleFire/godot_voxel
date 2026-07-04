@@ -19,6 +19,7 @@
 #include <memory>
 
 ZN_GODOT_FORWARD_DECLARE(class Image)
+ZN_GODOT_FORWARD_DECLARE(class Material)
 
 namespace zylann::voxel {
 
@@ -127,6 +128,7 @@ public:
 	int get_sdf_output_port_address() const;
 
 	bool has_texture_output() const;
+	Ref<Material> get_final_material() const;
 
 #ifdef VOXEL_ENABLE_GPU
 	// GPU support
@@ -193,6 +195,7 @@ private:
 	static void _bind_methods();
 
 	Ref<pg::VoxelGraphFunction> _main_function;
+	Ref<Material> _final_material;
 
 	// This generator performs range analysis using nodes of the graph. Terrain surface can only appear when SDF
 	// crosses zero within a block. For each generated block, an estimated range of the output is calculated.

@@ -114,10 +114,17 @@ Vector3i get_relative_lod_distance_in_chunks(
 		int lod0_distance_in_chunks,
 		int lodn_distance_in_chunks,
 		int lod_chunk_size,
-		Vector3i max_view_distance_voxels
+		Vector3i max_view_distance_voxels,
+		const PackedFloat64Array *custom_dists = nullptr
 ) {
 	int ld;
-	if (lod_index == 0) {
+	if (custom_dists != nullptr && lod_index < custom_dists->size()) {
+		// Custom per-LOD distance in voxels — convert to chunk count at this LOD level
+		ld = math::max(
+				static_cast<int>(Math::ceil((*custom_dists)[lod_index])) / lod_chunk_size,
+				1
+		);
+	} else if (lod_index == 0) {
 		// First LOD uses dedicated distance
 		ld = lod0_distance_in_chunks;
 	} else {
@@ -266,6 +273,9 @@ void process_viewers(
 				const int lod_mesh_block_size_po2 = volume_settings.mesh_block_size_po2 + lod_index;
 				const int lod_mesh_block_size = 1 << lod_mesh_block_size_po2;
 
+				const PackedFloat64Array *custom_dists =
+						volume_settings.use_custom_lod_distances ? &volume_settings.custom_lod_distances : nullptr;
+
 				const Vector3i ld = get_relative_lod_distance_in_chunks(
 						lod_index,
 						lod_count,
@@ -276,7 +286,8 @@ void process_viewers(
 								paired_viewer.state.view_distance_voxels.horizontal,
 								paired_viewer.state.view_distance_voxels.vertical,
 								paired_viewer.state.view_distance_voxels.horizontal
-						)
+						),
+						custom_dists
 				);
 
 				// Box3i new_mesh_box = get_lod_box_in_chunks(
@@ -365,6 +376,9 @@ void process_viewers(
 						Box3i(volume_bounds_in_voxels.position >> lod_data_block_size_po2,
 							  volume_bounds_in_voxels.size >> lod_data_block_size_po2);
 
+				const PackedFloat64Array *custom_dists =
+						volume_settings.use_custom_lod_distances ? &volume_settings.custom_lod_distances : nullptr;
+
 				const Vector3i ld = get_relative_lod_distance_in_chunks(
 						lod_index,
 						lod_count,
@@ -375,7 +389,8 @@ void process_viewers(
 								paired_viewer.state.view_distance_voxels.horizontal,
 								paired_viewer.state.view_distance_voxels.vertical,
 								paired_viewer.state.view_distance_voxels.horizontal
-						)
+						),
+						custom_dists
 				);
 
 				const Box3i new_data_box =
@@ -1641,6 +1656,43 @@ void process_clipbox_streaming(
 		process_data_blocks_sliding_box(
 				state, data, data_blocks_to_save, data_blocks_to_load, settings, lod_count, can_load
 		);
+
+		// Re-request data blocks that were dropped by the task system (e.g. marked "too far" or cancelled).
+		// Without this, dropped blocks remain as permanent holes — the clipbox diff won't re-request them
+		// because the viewer box hasn't changed, causing LOD subdivision to stall indefinitely.
+		if (can_load) {
+			static thread_local StdVector<VoxelLodTerrainUpdateData::BlockLocation> tls_dropped_blocks;
+			tls_dropped_blocks.clear();
+			{
+				MutexLock mlock(state.clipbox_streaming.dropped_data_blocks_mutex);
+				append_array(tls_dropped_blocks, state.clipbox_streaming.dropped_data_blocks);
+				state.clipbox_streaming.dropped_data_blocks.clear();
+			}
+
+			for (const VoxelLodTerrainUpdateData::BlockLocation &bloc : tls_dropped_blocks) {
+				if (bloc.lod >= lod_count) {
+					continue;
+				}
+				VoxelLodTerrainUpdateData::Lod &lod = state.lods[bloc.lod];
+
+				// Check if the block is still within the current data box for any viewer
+				bool still_needed = false;
+				for (const VoxelLodTerrainUpdateData::PairedViewer &pv : state.clipbox_streaming.paired_viewers) {
+					if (pv.state.data_box_per_lod[bloc.lod].contains(bloc.position)) {
+						still_needed = true;
+						break;
+					}
+				}
+
+				if (still_needed) {
+					// Re-add to loading_blocks and data_blocks_to_load.
+					// The block was already removed from loading_blocks by the main thread on drop.
+					MutexLock mlock(lod.loading_blocks_mutex);
+					add_loading_block(lod, bloc.position, bloc.lod, data_blocks_to_load);
+				}
+			}
+		}
+
 	} else {
 		if (full_load_completed == false) {
 			// Don't do anything until things are loaded, because we'll trigger meshing directly when mesh blocks get

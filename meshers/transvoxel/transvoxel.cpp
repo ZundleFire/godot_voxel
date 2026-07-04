@@ -9,6 +9,10 @@
 #include "transvoxel_materials_null.h"
 #include "transvoxel_materials_single_s4.h"
 #include "transvoxel_tables.cpp"
+#include <algorithm> // std::fill
+#ifdef TOOLS_ENABLED
+#include "../../util/string/format.h"
+#endif
 
 // Quality isn't great so not available for now.
 #ifdef VOXEL_ENABLE_TRANSVOXEL_MATERIAL_SINGLE_S2
@@ -223,14 +227,16 @@ void build_regular_mesh(
 	const TSdf isolevel = get_isolevel<TSdf>();
 
 	// Iterate all cells with padding (expected to be neighbors)
+	// Data is laid out in ZXY order (Y is the deepest/contiguous coordinate).
+	// We iterate Z -> X -> Y so the inner loop advances by stride 1 in memory,
+	// maximizing cache-line utilization and prefetcher effectiveness.
 	Vector3i pos;
 	for (pos.z = min_pos.z; pos.z < max_pos.z; ++pos.z) {
-		for (pos.y = min_pos.y; pos.y < max_pos.y; ++pos.y) {
-			// TODO Optimization: change iteration to be ZXY? (Data is laid out with Y as deepest coordinate)
+		for (pos.x = min_pos.x; pos.x < max_pos.x; ++pos.x) {
 			unsigned int data_index =
-					Vector3iUtil::get_zxy_index(Vector3i(min_pos.x, pos.y, pos.z), block_size_with_padding);
+					Vector3iUtil::get_zxy_index(Vector3i(pos.x, min_pos.y, pos.z), block_size_with_padding);
 
-			for (pos.x = min_pos.x; pos.x < max_pos.x; ++pos.x, data_index += block_size_with_padding.y) {
+			for (pos.y = min_pos.y; pos.y < max_pos.y; ++pos.y, data_index += 1) {
 				{
 					// The chosen comparison here is very important. This relates to case selections where 4 samples
 					// are equal to the isolevel and 4 others are above or below:
@@ -1099,10 +1105,7 @@ Span<const T> get_or_decompress_channel(const VoxelBuffer &voxels, StdVector<T> 
 	if (voxels.get_channel_compression(channel) == VoxelBuffer::COMPRESSION_UNIFORM) {
 		backing_buffer.resize(Vector3iUtil::get_volume_u64(voxels.get_size()));
 		const T v = voxels.get_voxel(Vector3i(), channel);
-		// TODO Could use a fast fill using 8-byte blocks or intrinsics?
-		for (unsigned int i = 0; i < backing_buffer.size(); ++i) {
-			backing_buffer[i] = v;
-		}
+		std::fill(backing_buffer.begin(), backing_buffer.end(), v);
 		return to_span_const(backing_buffer);
 
 	} else {
@@ -1258,6 +1261,19 @@ DefaultTextureIndicesData build_regular_mesh(
 	const unsigned int voxels_count = Vector3iUtil::get_volume_u64(voxels.get_size());
 
 	output.clear();
+
+	// Pre-reserve output vectors to reduce reallocations during meshing.
+	// Empirical estimates: ~5% of cells produce geometry with ~2 tris each.
+	// For a 16^3 block that's ~200 vertices and ~600 indices.
+	// Over-estimating is fine since vectors won't shrink until clear().
+	{
+		const unsigned int estimated_verts = voxels_count / 16;
+		const unsigned int estimated_indices = estimated_verts * 3;
+		output.vertices.reserve(estimated_verts);
+		output.normals.reserve(estimated_verts);
+		output.lod_data.reserve(estimated_verts);
+		output.indices.reserve(estimated_indices);
+	}
 
 	DefaultTextureIndicesData default_texture_indices;
 	default_texture_indices.use = false;

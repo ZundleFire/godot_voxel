@@ -4,6 +4,7 @@
 #include "../../engine/buffered_task_scheduler.h"
 #include "../../engine/voxel_engine_gd.h"
 #include "../../engine/voxel_engine_updater.h"
+#include "../../generators/graph/voxel_generator_graph.h"
 #include "../../meshers/blocky/voxel_mesher_blocky.h"
 #include "../../meshers/transvoxel/voxel_mesher_transvoxel.h"
 #include "../../storage/voxel_buffer_gd.h"
@@ -328,7 +329,21 @@ void VoxelLodTerrain::set_generator(Ref<VoxelGenerator> p_generator) {
 		return;
 	}
 
+	Ref<VoxelGenerator> previous_generator = get_generator();
+	const Callable generator_changed_callable = callable_mp(this, &VoxelLodTerrain::_on_generator_changed);
+	if (previous_generator.is_valid() &&
+			previous_generator->is_connected(VoxelStringNames::get_singleton().changed, generator_changed_callable)) {
+		previous_generator->disconnect(VoxelStringNames::get_singleton().changed, generator_changed_callable);
+	}
+
 	_data->set_generator(p_generator);
+
+	if (p_generator.is_valid() &&
+			!p_generator->is_connected(VoxelStringNames::get_singleton().changed, generator_changed_callable)) {
+		p_generator->connect(VoxelStringNames::get_singleton().changed, generator_changed_callable);
+	}
+
+	refresh_material_from_graph_generator();
 
 	MeshingDependency::reset(_meshing_dependency, _mesher, p_generator);
 	StreamingDependency::reset(_streaming_dependency, get_stream(), p_generator);
@@ -352,6 +367,32 @@ void VoxelLodTerrain::set_generator(Ref<VoxelGenerator> p_generator) {
 
 Ref<VoxelGenerator> VoxelLodTerrain::get_generator() const {
 	return _data->get_generator();
+}
+
+void VoxelLodTerrain::refresh_material_from_graph_generator() {
+	Ref<VoxelGeneratorGraph> graph_generator = get_generator();
+	if (graph_generator.is_null()) {
+		return;
+	}
+
+	Ref<Material> final_material = graph_generator->get_final_material();
+	if (!graph_generator->is_good() || final_material.is_null()) {
+		const pg::CompilationResult result = graph_generator->compile(Engine::get_singleton()->is_editor_hint());
+		if (!result.success) {
+			ZN_PRINT_WARNING(
+					format("VoxelLodTerrain keeping previous material because graph compilation failed: {}", result.message));
+			return;
+		}
+		final_material = graph_generator->get_final_material();
+	}
+
+	if (final_material.is_valid()) {
+		set_material(final_material);
+	}
+}
+
+void VoxelLodTerrain::_on_generator_changed() {
+	refresh_material_from_graph_generator();
 }
 
 void VoxelLodTerrain::_on_gi_mode_changed() {
@@ -507,6 +548,19 @@ void VoxelLodTerrain::set_mesh_block_size(unsigned int mesh_block_size) {
 
 	// Update voxel bounds because block size change can affect octree size
 	set_voxel_bounds(_data->get_bounds());
+}
+
+void VoxelLodTerrain::set_voxel_size(float p_size) {
+	ERR_FAIL_COND(p_size <= 0.0f);
+	_voxel_size = p_size;
+	// voxel_size is used at mesh application time to scale mesh vertices.
+	// A rebuild is needed if the size changes while terrain exists.
+	// For now this is a configuration-time property;
+	// changing it at runtime requires remeshing (same as changing block size).
+}
+
+float VoxelLodTerrain::get_voxel_size() const {
+	return _voxel_size;
 }
 
 void VoxelLodTerrain::set_full_load_mode_enabled(bool enabled) {
@@ -822,6 +876,40 @@ float VoxelLodTerrain::get_secondary_lod_distance() const {
 	return _update_data->settings.secondary_lod_distance;
 }
 
+void VoxelLodTerrain::set_lod_distances(const PackedFloat64Array &distances) {
+	_update_data->wait_for_end_of_task();
+
+	if (distances.size() == 0) {
+		// Clear custom distances, revert to formula-based
+		_update_data->settings.use_custom_lod_distances = false;
+		_update_data->settings.custom_lod_distances = PackedFloat64Array();
+	} else {
+		// Validate: distances must be positive and increasing
+		double prev = 0.0;
+		PackedFloat64Array validated;
+		validated.resize(distances.size());
+		for (int i = 0; i < distances.size(); ++i) {
+			double d = MAX(distances[i], prev + 1.0);
+			validated.set(i, d);
+			prev = d;
+		}
+		_update_data->settings.custom_lod_distances = validated;
+		_update_data->settings.use_custom_lod_distances = true;
+	}
+
+	_update_data->state.octree_streaming.force_update_octrees_next_update = true;
+
+#ifdef VOXEL_ENABLE_INSTANCER
+	if (_instancer != nullptr) {
+		_instancer->update_mesh_lod_distances_from_parent();
+	}
+#endif
+}
+
+PackedFloat64Array VoxelLodTerrain::get_lod_distances() const {
+	return _update_data->settings.custom_lod_distances;
+}
+
 void VoxelLodTerrain::get_lod_distances(Span<float> distances) {
 	// Get the distances in local coordinates where each LOD ends (not accounting for max view distance extension).
 	// Note that due to chunking adjustments, this may not be fully accurate. Actual chunks can appear further away.
@@ -831,6 +919,21 @@ void VoxelLodTerrain::get_lod_distances(Span<float> distances) {
 
 	const VoxelLodTerrainUpdateData::Settings &settings = _update_data->settings;
 	const int lod_count = math::min(get_lod_count(), static_cast<int>(distances.size()));
+
+	// If custom per-LOD distances are set, use them
+	if (settings.use_custom_lod_distances && settings.custom_lod_distances.size() > 0) {
+		for (int lod_index = 0; lod_index < lod_count; ++lod_index) {
+			if (lod_index < settings.custom_lod_distances.size()) {
+				distances[lod_index] = static_cast<float>(settings.custom_lod_distances[lod_index]);
+			} else {
+				// Extrapolate for LODs beyond the custom table
+				distances[lod_index] =
+						static_cast<float>(settings.custom_lod_distances[settings.custom_lod_distances.size() - 1]) *
+						(1 << (lod_index - settings.custom_lod_distances.size() + 1));
+			}
+		}
+		return;
+	}
 
 	distances[0] = settings.lod_distance;
 
@@ -1097,8 +1200,22 @@ void VoxelLodTerrain::_notification(int p_what) {
 				mesher.instantiate();
 				set_mesher(mesher);
 			}
+			refresh_material_from_graph_generator();
 			break;
 #endif
+		case NOTIFICATION_EDITOR_PRE_SAVE:
+			if (Engine::get_singleton()->is_editor_hint()) {
+				Ref<VoxelGeneratorGraph> graph_generator = get_generator();
+				if (graph_generator.is_valid()) {
+					_material.unref();
+				}
+			}
+			break;
+		case NOTIFICATION_EDITOR_POST_SAVE:
+			if (Engine::get_singleton()->is_editor_hint()) {
+				refresh_material_from_graph_generator();
+			}
+			break;
 #endif
 
 		case NOTIFICATION_EXIT_TREE:
@@ -1750,11 +1867,21 @@ void VoxelLodTerrain::apply_data_block_response(VoxelEngine::BlockDataOutput &ob
 	if (ob.dropped) {
 		// That block was dropped by the data loader thread, but we were still expecting it...
 		// This is most likely caused by the loader not keeping up with the speed at which the player is moving.
-		// We should recover with the removal from `loading_blocks` so it will be re-queried again later...
+		// Remove from loading_blocks so the clipbox streaming system can re-request it.
 
-		//				print_line(String("Received a block loading drop while we were still expecting it: lod{0} ({1},
-		//{2}, {3})") 								   .format(varray(ob.lod, ob.position.x, ob.position.y,
-		// ob.position.z)));
+		{
+			MutexLock lock(lod.loading_blocks_mutex);
+			lod.loading_blocks.erase(ob.position);
+		}
+
+		// Notify the update thread so it can re-request if the block is still needed
+		if (_data->is_streaming_enabled() &&
+			_update_data->settings.streaming_system == VoxelLodTerrainUpdateData::STREAMING_SYSTEM_CLIPBOX) {
+			VoxelLodTerrainUpdateData::ClipboxStreamingState &cs = _update_data->state.clipbox_streaming;
+			MutexLock mlock(cs.dropped_data_blocks_mutex);
+			cs.dropped_data_blocks.push_back(
+					VoxelLodTerrainUpdateData::BlockLocation{ ob.position, ob.lod_index });
+		}
 
 		++_stats.dropped_block_loads;
 		return;
@@ -1869,8 +1996,12 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		}
 		if (ob.type == VoxelEngine::BlockMeshOutput::TYPE_DROPPED) {
 			// That block is loaded, but its meshing request was dropped.
-			// TODO Not sure what to do in this case, the code sending update queries has to be tweaked
-			ZN_PRINT_VERBOSE("Received a block mesh drop while we were still expecting it");
+			// Reset state so the streaming system (octree or clipbox) can re-request meshing.
+			// Without this, the block stays in MESH_UPDATE_SENT forever, blocking the LOD cascade.
+			VoxelLodTerrainUpdateData::MeshBlockState &dropped_mesh = mesh_block_state_it->second;
+			dropped_mesh.state = VoxelLodTerrainUpdateData::MESH_NEED_UPDATE;
+			dropped_mesh.update_list_index = -1;
+			ZN_PRINT_VERBOSE("Mesh block dropped, reset to MESH_NEED_UPDATE for re-request");
 			++_stats.dropped_block_meshs;
 			return;
 		}
@@ -3882,6 +4013,12 @@ void VoxelLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_secondary_lod_distance", "lod_distance"), &Self::set_secondary_lod_distance);
 	ClassDB::bind_method(D_METHOD("get_secondary_lod_distance"), &Self::get_secondary_lod_distance);
 
+	ClassDB::bind_method(D_METHOD("set_lod_distances", "distances"), &Self::set_lod_distances);
+	ClassDB::bind_method(
+			D_METHOD("get_lod_distances"),
+			static_cast<PackedFloat64Array (Self::*)() const>(&Self::get_lod_distances)
+	);
+
 	// Misc
 
 	ClassDB::bind_method(
@@ -3950,6 +4087,9 @@ void VoxelLodTerrain::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_mesh_block_size"), &Self::get_mesh_block_size);
 	ClassDB::bind_method(D_METHOD("set_mesh_block_size"), &Self::set_mesh_block_size);
+
+	ClassDB::bind_method(D_METHOD("set_voxel_size", "size"), &Self::set_voxel_size);
+	ClassDB::bind_method(D_METHOD("get_voxel_size"), &Self::get_voxel_size);
 
 	ClassDB::bind_method(D_METHOD("get_data_block_size"), &Self::get_data_block_size);
 	ClassDB::bind_method(D_METHOD("get_data_block_region_extent"), &Self::get_data_block_region_extent);
@@ -4031,6 +4171,11 @@ void VoxelLodTerrain::_bind_methods() {
 			PropertyInfo(Variant::FLOAT, "secondary_lod_distance"),
 			"set_secondary_lod_distance",
 			"get_secondary_lod_distance"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::PACKED_FLOAT64_ARRAY, "lod_distances"),
+			"set_lod_distances",
+			"get_lod_distances"
 	);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lod_fade_duration"), "set_lod_fade_duration", "get_lod_fade_duration");
 
@@ -4114,6 +4259,11 @@ void VoxelLodTerrain::_bind_methods() {
 			"is_stream_running_in_editor"
 	);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "mesh_block_size"), "set_mesh_block_size", "get_mesh_block_size");
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "voxel_size", PROPERTY_HINT_RANGE, "0.01,100.0,0.01,or_greater"),
+			"set_voxel_size",
+			"get_voxel_size"
+	);
 	ADD_PROPERTY(
 			PropertyInfo(Variant::BOOL, "full_load_mode_enabled"),
 			"set_full_load_mode_enabled",

@@ -9,6 +9,7 @@
 #include "../util/profiling.h"
 #include "../util/string/format.h"
 #include "../util/tasks/async_dependency_tracker.h"
+#include "voxel_generator_script.h"
 
 namespace zylann::voxel {
 
@@ -64,6 +65,9 @@ void GenerateBlockTask::run(zylann::ThreadedTaskContext &ctx) {
 			run_gpu_conversion();
 		}
 		if (_stage == 2) {
+			// After GPU has filled the SDF channel, check if the generator is a VoxelGeneratorScript
+			// that supports the hybrid GPU SDF + CPU materials pipeline.
+			run_gpu_material_pass();
 			run_stream_saving_and_finish();
 		}
 	} else
@@ -84,7 +88,22 @@ void GenerateBlockTask::run_gpu_task(zylann::ThreadedTaskContext &ctx) {
 	// Implement and call `VoxelGenerator::generate_broad_block()`
 
 	std::shared_ptr<ComputeShader> generator_shader = generator->get_block_rendering_shader();
-	ERR_FAIL_COND(generator_shader == nullptr);
+	if (generator_shader == nullptr) {
+		// Shader not compiled yet — fall back to CPU
+		ZN_PRINT_VERBOSE("GPU shader not available (nullptr), falling back to CPU generation");
+		_use_gpu = false;
+		run_cpu_generation();
+		run_stream_saving_and_finish();
+		return;
+	}
+	if (generator_shader->is_compilation_complete() && !generator_shader->is_valid()) {
+		// Shader compilation failed — fall back to CPU
+		ZN_PRINT_ERROR_ONCE("GPU shader compilation failed, falling back to CPU generation");
+		_use_gpu = false;
+		run_cpu_generation();
+		run_stream_saving_and_finish();
+		return;
+	}
 
 	const Vector3i origin_in_voxels = (_position << _lod_index) * _block_size;
 
@@ -132,12 +151,74 @@ void GenerateBlockTask::run_gpu_conversion() {
 	_stage = 2;
 }
 
+void GenerateBlockTask::run_gpu_material_pass() {
+	Ref<VoxelGenerator> generator = _stream_dependency->generator;
+	ERR_FAIL_COND(generator.is_null());
+
+	VoxelGeneratorScript *script_gen = Object::cast_to<VoxelGeneratorScript>(*generator);
+	if (script_gen != nullptr && script_gen->has_sdf_compute_shader()) {
+		// Hybrid pipeline: GPU produced SDF, now CPU assigns materials
+		const Vector3i origin_in_voxels = (_position << _lod_index) * _block_size;
+		VoxelGenerator::VoxelQueryData query_data{ *_voxels, origin_in_voxels, _lod_index };
+		script_gen->generate_materials(query_data);
+	}
+
+#ifdef VOXEL_ENABLE_MODIFIERS
+	if (_data != nullptr) {
+		const Vector3i origin_in_voxels = (_position << _lod_index) * _block_size;
+		_data->get_modifiers().apply(
+				*_voxels,
+				AABB(origin_in_voxels, _voxels->get_size() << _lod_index)
+		);
+	}
+#endif
+}
+
 #endif
 
 void GenerateBlockTask::run_cpu_generation() {
 	const Vector3i origin_in_voxels = (_position << _lod_index) * _block_size;
 
 	Ref<VoxelGenerator> generator = _stream_dependency->generator;
+
+	// Optimization: broad-phase early-out — if the generator can determine the block is trivially
+	// uniform (e.g. fully inside solid or fully outside a sphere), skip the expensive full generation.
+	// This avoids calling into GDScript for the vast majority of blocks that are deep underground
+	// or high in the atmosphere.
+	{
+		VoxelGenerator::VoxelQueryData broad_query{ *_voxels, origin_in_voxels, _lod_index };
+		if (generator->generate_broad_block(broad_query)) {
+			_max_lod_hint = true;
+#ifdef VOXEL_ENABLE_MODIFIERS
+			if (_data != nullptr) {
+				_data->get_modifiers().apply(
+						*_voxels,
+						AABB(origin_in_voxels, _voxels->get_size() << _lod_index)
+				);
+			}
+#endif
+			return;
+		}
+	}
+
+	// Optimization: for LOD > 0, try to build the block by downsampling child blocks
+	// from the lower LOD level, avoiding a full generator call.
+	if (_lod_index > 0 && _data != nullptr) {
+		std::shared_ptr<VoxelBuffer> downsampled;
+		if (_data->try_downsample_block(_position, _lod_index, downsampled)) {
+			downsampled->move_to(*_voxels);
+			// Downsampled blocks inherit max_lod_hint from the generator's defaults
+			_max_lod_hint = false;
+
+#ifdef VOXEL_ENABLE_MODIFIERS
+			_data->get_modifiers().apply(
+					*_voxels,
+					AABB(origin_in_voxels, _voxels->get_size() << _lod_index)
+			);
+#endif
+			return;
+		}
+	}
 
 	VoxelGenerator::VoxelQueryData query_data{ *_voxels, origin_in_voxels, _lod_index };
 	const VoxelGenerator::Result result = generator->generate_block(query_data);

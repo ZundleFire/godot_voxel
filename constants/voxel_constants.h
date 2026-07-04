@@ -8,7 +8,21 @@ namespace zylann::voxel::constants {
 
 // These constants are chosen so you don't accidentally blow up resource usage
 static const float MINIMUM_LOD_DISTANCE = 16.f;
-static const float MAXIMUM_LOD_DISTANCE = 128.f;
+// Raised from 128 → 8192 to allow each LOD level to span planetary distances.
+//
+// How LOD reach is computed (clipbox streaming, get_relative_lod_distance_in_chunks):
+//   lod0_chunks  = ceil(lod_distance          / mesh_block_size)        [fine zone around camera]
+//   lodn_chunks  = ceil(secondary_lod_distance / mesh_block_size)        [per-level additive step]
+//   LOD N reach  = lod0_chunks >> N  +  lodn_chunks   (in chunks of size mesh_block_size << N)
+//
+// With mesh_block_size=32, lod_distance=128, secondary_lod_distance=4096:
+//   lod0_chunks = 4,  lodn_chunks = 128
+//   LOD 0 : (4 >> 0) + 128 = 132 chunks × 32 m  =   4 224 m
+//   LOD 1 : (4 >> 1) + 128 = 130 chunks × 64 m  =   8 320 m
+//   LOD 3 : (4 >> 3) + 128 = 128 chunks × 256 m =  32 768 m  (~33 km)
+//   LOD 7 : 0        + 128 = 128 chunks × 4096 m = 524 288 m (~524 km, low orbit)
+//   LOD 10: 0        + 128 = 128 chunks × 32768 m = 4.2 Gm   (capped by view_distance)
+static const float MAXIMUM_LOD_DISTANCE = 8192.f;
 
 static const unsigned int MIN_BLOCK_SIZE = 16;
 static const unsigned int MAX_BLOCK_SIZE = 32;

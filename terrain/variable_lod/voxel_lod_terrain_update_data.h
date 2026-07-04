@@ -68,6 +68,10 @@ struct VoxelLodTerrainUpdateData {
 		float lod_distance = 0.f;
 		// Distance between the end of LOD0 and the end of LOD1, carried over to other LODs
 		float secondary_lod_distance = 0.f;
+		// Optional per-LOD distance overrides (in voxels). When non-empty, overrides the two-parameter formula.
+		// Each entry specifies the camera distance at which LOD level `i` ends and LOD `i+1` begins.
+		PackedFloat64Array custom_lod_distances;
+		bool use_custom_lod_distances = false;
 		unsigned int view_distance_voxels = 512;
 		StreamingSystem streaming_system = STREAMING_SYSTEM_LEGACY_OCTREE;
 		// bool full_load_mode = false;
@@ -305,6 +309,11 @@ struct VoxelLodTerrainUpdateData {
 		// Read by update thread to trigger visibility changes.
 		StdVector<LoadedMeshBlockEvent> loaded_mesh_blocks;
 		BinaryMutex loaded_mesh_blocks_mutex;
+
+		// Written by main thread when data block tasks are dropped (too far / cancelled).
+		// Read by update thread to remove from loading_blocks and re-request.
+		StdVector<BlockLocation> dropped_data_blocks;
+		BinaryMutex dropped_data_blocks_mutex;
 	};
 
 	struct EditNotificationInputs {

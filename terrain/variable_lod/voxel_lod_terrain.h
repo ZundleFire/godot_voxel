@@ -59,6 +59,9 @@ public:
 	void set_secondary_lod_distance(float p_lod_distance);
 	float get_secondary_lod_distance() const;
 
+	void set_lod_distances(const PackedFloat64Array &distances);
+	PackedFloat64Array get_lod_distances() const;
+
 	void set_lod_count(int p_lod_count);
 	int get_lod_count() const;
 
@@ -91,6 +94,9 @@ public:
 	unsigned int get_mesh_block_size_pow2() const;
 	unsigned int get_mesh_block_size() const;
 	void set_mesh_block_size(unsigned int mesh_block_size);
+
+	void set_voxel_size(float p_size);
+	float get_voxel_size() const;
 
 	void set_full_load_mode_enabled(bool enabled);
 	bool is_full_load_mode_enabled() const;
@@ -304,6 +310,8 @@ protected:
 
 private:
 	void process(float delta);
+	void _on_generator_changed();
+	void refresh_material_from_graph_generator();
 	void apply_quick_reloading_blocks();
 	void apply_main_thread_update_tasks();
 
@@ -410,6 +418,8 @@ private:
 	float _collision_margin = constants::DEFAULT_COLLISION_MARGIN;
 	int _collision_update_delay = 0;
 	FixedArray<StdVector<Vector3i>, constants::MAX_LOD> _deferred_collision_updates_per_lod;
+
+	float _voxel_size = 1.0f;
 
 	float _lod_fade_duration = 0.f;
 	// Note, direct pointers to mesh blocks should be safe because these blocks are always destroyed from the same

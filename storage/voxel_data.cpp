@@ -1170,6 +1170,71 @@ SpatialLock3D &VoxelData::get_spatial_lock(unsigned int lod_index) const {
 	return data_lod.spatial_lock;
 }
 
+bool VoxelData::try_downsample_block(
+		Vector3i block_pos,
+		unsigned int target_lod,
+		std::shared_ptr<VoxelBuffer> &out_buffer
+) const {
+	ZN_PROFILE_SCOPE();
+
+	if (target_lod == 0 || target_lod >= _lod_count) {
+		// Can't downsample into LOD 0 (no lower LOD to read from) or beyond max LOD
+		return false;
+	}
+
+	const unsigned int src_lod = target_lod - 1;
+	const Lod &src_data_lod = _lods[src_lod];
+	const int data_block_size = get_block_size();
+	const int half_bs = data_block_size >> 1;
+
+	// The 8 child blocks in the source LOD that map to our target block
+	const Vector3i base_src_pos = block_pos << 1;
+
+	// Lock the source LOD for reading
+	const Box3i src_box(base_src_pos, Vector3i(2, 2, 2));
+	SpatialLock3D::Read srlock(src_data_lod.spatial_lock, src_box);
+	RWLockRead rlock(src_data_lod.map_lock);
+
+	// Check that all 8 child blocks exist and have voxels
+	FixedArray<const VoxelBuffer *, 8> src_buffers;
+	unsigned int child_index = 0;
+	for (int z = 0; z < 2; ++z) {
+		for (int x = 0; x < 2; ++x) {
+			for (int y = 0; y < 2; ++y) {
+				const Vector3i src_pos = base_src_pos + Vector3i(x, y, z);
+				const VoxelDataBlock *block = src_data_lod.map.get_block(src_pos);
+				if (block == nullptr || !block->has_voxels()) {
+					return false;
+				}
+				src_buffers[child_index] = &block->get_voxels_const();
+				++child_index;
+			}
+		}
+	}
+
+	// All 8 children exist. Create output buffer and downsample.
+	out_buffer = make_shared_instance<VoxelBuffer>(VoxelBuffer::ALLOCATOR_POOL);
+	out_buffer->create(Vector3iUtil::create(data_block_size), &_format);
+
+	child_index = 0;
+	for (int z = 0; z < 2; ++z) {
+		for (int x = 0; x < 2; ++x) {
+			for (int y = 0; y < 2; ++y) {
+				const Vector3i rel(x, y, z);
+				src_buffers[child_index]->downscale_to(
+						*out_buffer,
+						Vector3i(),
+						Vector3iUtil::create(data_block_size),
+						rel * half_bs
+				);
+				++child_index;
+			}
+		}
+	}
+
+	return true;
+}
+
 bool VoxelData::has_blocks_with_voxels_in_area_broad_mip_test(Box3i box_in_voxels) const {
 	ZN_PROFILE_SCOPE();
 
