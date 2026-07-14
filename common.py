@@ -110,6 +110,7 @@ def get_sources(env, is_editor_build):
         "util/noise/voxel_advanced_noise.cpp",
         "util/noise/voxel_noise_batch.cpp",
         "util/noise/voxel_procedural_noise.cpp",
+        "util/noise/voxel_terrain_noise.cpp",
         "util/string/*.cpp",
         "util/thread/thread.cpp",
         "util/thread/spatial_lock_2d.cpp",

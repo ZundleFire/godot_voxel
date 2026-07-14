@@ -15,6 +15,7 @@
 #include "nodes/outputs.h"
 #include "nodes/planet.h"
 #include "nodes/sdf.h"
+#include "nodes/terrain_diffusion.h"
 
 namespace zylann::voxel::pg {
 
@@ -90,6 +91,7 @@ NodeTypeDB::NodeTypeDB() {
 	register_noise_nodes(types);
 	register_planet_nodes(types);
 	register_sdf_nodes(types);
+	register_terrain_diffusion_nodes(types);
 
 	CRASH_COND(_expression_functions.size() > 0);
 

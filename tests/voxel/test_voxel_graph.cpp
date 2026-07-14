@@ -1213,8 +1213,8 @@ void test_voxel_graph_material_nodes() {
 	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().g, expected_stack_albedo.g));
 	ZN_TEST_ASSERT(Math::is_equal_approx(final_standard_material->get_albedo().b, expected_stack_albedo.b));
 
-	Ref<VoxelLodTerrain> lod_terrain;
-	lod_terrain.instantiate();
+	// VoxelLodTerrain is a Node, not RefCounted — must be memnew'd, not Ref'd
+	VoxelLodTerrain *lod_terrain = memnew(VoxelLodTerrain);
 	lod_terrain->set_generator(generator);
 	final_standard_material = lod_terrain->get_material();
 	ZN_TEST_ASSERT(final_standard_material.is_valid());
@@ -1251,6 +1251,8 @@ void test_voxel_graph_material_nodes() {
 	graph->add_connection(n_invalid_material, 0, n_invalid_out_sdf, 0);
 	result = generator->compile(false);
 	ZN_TEST_ASSERT(!result.success);
+
+	memdelete(lod_terrain);
 }
 
 

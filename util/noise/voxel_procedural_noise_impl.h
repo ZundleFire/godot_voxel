@@ -1414,6 +1414,741 @@ FORCEINLINE uniform int32 FCNextOctaveSeed(const uniform int32 Seed) {
 	return (Seed * 196314165) + 907633515;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Terrain diffusion — ported from the VCET Unreal plugin's TerrainDiffusion
+// kernels (MIT, same origin as the noise above).
+//
+// Hierarchical terrain heightfield built on the gradient noises above.
+// AestheticBias blends two shaping strategies per octave:
+// - 0 (Realistic): fBm with derivative-based erosion damping — the running
+//   slope of previous octaves suppresses later detail, carving smooth valleys
+//   into steep areas (Inigo Quilez's "fbm with derivatives" erosion trick)
+// - 1 (Fantastical): ridged multifractal — folded noise with amplitude
+//   feedback, producing sharp creases, cliff faces and dramatic peaks
+//
+// Deterministic: per-octave seeds evolve with FCNextOctaveSeed, so identical
+// inputs give identical terrain on every machine. O(1) random access.
+//
+// Godot adaptations vs the UE original:
+// - Y is the polar axis (Godot is Y-up; UE used Z)
+// - Positions/scales are in world units (meters), not cm — pure convention,
+//   the math is scale-free
+///////////////////////////////////////////////////////////////////////////////
+
+#ifndef ISPC
+FORCEINLINE float select(const bool Cond, const float A, const float B) {
+	return Cond ? A : B;
+}
+FORCEINLINE float acos(const float v) {
+	return ::acosf(v);
+}
+#endif
+
+// Per-stage seed derivation, all uniform
+#define FC_TERRAIN_SEED_WARP_X(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x36E1A2C5u))
+#define FC_TERRAIN_SEED_WARP_Y(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x9C2779B9u))
+#define FC_TERRAIN_SEED_WARP_Z(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x5851F42Du))
+#define FC_TERRAIN_SEED_MOUNTAIN(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x7F4A7C15u))
+#define FC_TERRAIN_SEED_CONTINENT(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x2545F491u))
+#define FC_TERRAIN_SEED_CANYON(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x68E31DA4u))
+#define FC_CLIMATE_SEED_TEMPERATURE(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x1B873593u))
+#define FC_CLIMATE_SEED_MOISTURE(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0xCC9E2D51u))
+#define FC_RIVER_SEED_FLOW_X(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0xA3B195A8u))
+#define FC_RIVER_SEED_FLOW_Y(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0xFB9C3D21u))
+#define FC_RIVER_SEED_TRUNK(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0x4C957F3Bu))
+#define FC_RIVER_SEED_TRIB(Seed) ((uniform int32)((uniform uint32)(Seed) ^ 0xD8A12E67u))
+
+// 3-octave Perlin fBm in roughly [-1, 1], used for regional masks and climate
+FORCEINLINE float FCTerrainRegionNoise2D(const uniform int32 InSeed, const float2 Position) {
+	uniform int32 Seed = InSeed;
+	const uniform uint32 SeedA = (uniform uint32)Seed;
+	Seed = FCNextOctaveSeed(Seed);
+	const uniform uint32 SeedB = (uniform uint32)Seed;
+	Seed = FCNextOctaveSeed(Seed);
+	const uniform uint32 SeedC = (uniform uint32)Seed;
+
+	return (FCPerlin2D(SeedA, Position) + FCPerlin2D(SeedB, Position * 2.f) * 0.5f +
+			FCPerlin2D(SeedC, Position * 4.f) * 0.25f) /
+			1.75f;
+}
+
+FORCEINLINE float FCTerrainRegionNoise3D(const uniform int32 InSeed, const float3 Position) {
+	uniform int32 Seed = InSeed;
+	const uniform uint32 SeedA = (uniform uint32)Seed;
+	Seed = FCNextOctaveSeed(Seed);
+	const uniform uint32 SeedB = (uniform uint32)Seed;
+	Seed = FCNextOctaveSeed(Seed);
+	const uniform uint32 SeedC = (uniform uint32)Seed;
+
+	return (FCPerlin3D(SeedA, Position) + FCPerlin3D(SeedB, Position * 2.f) * 0.5f +
+			FCPerlin3D(SeedC, Position * 4.f) * 0.25f) /
+			1.75f;
+}
+
+// Returns a normalized height in roughly [-1, 1]. Position is pre-divided by FeatureScale.
+FORCEINLINE float FCInfiniteTerrain2D(
+		const uniform int32 InSeed,
+		float2 Position,
+		const uniform int32 NumOctaves,
+		const float Lacunarity,
+		const float Gain,
+		const float AestheticBias) {
+	varying float Sum = 0.f;
+	varying float AmplitudeSum = 0.f;
+	varying float Amplitude = 1.f;
+	varying float2 GradientSum = MakeFloat2(0.f, 0.f);
+	varying float RidgeWeight = 1.f;
+	uniform int32 Seed = InSeed;
+
+	for (uniform int32 OctaveIndex = 0; OctaveIndex < NumOctaves; OctaveIndex++) {
+		const uniform uint32 OctaveSeed = (uniform uint32)Seed;
+
+		float2 Gradient;
+		const float Raw = FCPerlinDeriv2D(OctaveSeed, Position, &Gradient) * 1.4f;
+
+		// Erosion-like damping: accumulated slope suppresses later octaves
+		GradientSum = GradientSum + Gradient;
+		const float Erosion = 1.f / (1.f + dot(GradientSum, GradientSum));
+		const float SmoothValue = Raw * Erosion;
+
+		// Ridge filtering with multifractal amplitude feedback
+		float Ridge = 1.f - abs(Raw);
+		Ridge = Ridge * Ridge * RidgeWeight;
+		RidgeWeight = clamp(Ridge * 2.f, 0.f, 1.f);
+		const float RidgeValue = Ridge * 2.f - 1.f;
+
+		const float Value = FCLerp(SmoothValue, RidgeValue, AestheticBias);
+
+		const float NewSum = Sum + Value * Amplitude;
+		Sum = select(FCIsFinite(NewSum), NewSum, Sum);
+
+		AmplitudeSum += Amplitude;
+		Amplitude = Amplitude * Gain;
+		Position = Position * Lacunarity;
+		Seed = FCNextOctaveSeed(Seed);
+	}
+
+	return Sum / (AmplitudeSum == 0.f ? 1.f : AmplitudeSum);
+}
+
+// 3D counterpart, sampled in 3D space so it is seamless on any closed surface.
+FORCEINLINE float FCInfiniteTerrain3D(
+		const uniform int32 InSeed,
+		float3 Position,
+		const uniform int32 NumOctaves,
+		const float Lacunarity,
+		const float Gain,
+		const float AestheticBias) {
+	varying float Sum = 0.f;
+	varying float AmplitudeSum = 0.f;
+	varying float Amplitude = 1.f;
+	varying float3 GradientSum = MakeFloat3(0.f, 0.f, 0.f);
+	varying float RidgeWeight = 1.f;
+	uniform int32 Seed = InSeed;
+
+	for (uniform int32 OctaveIndex = 0; OctaveIndex < NumOctaves; OctaveIndex++) {
+		const uniform uint32 OctaveSeed = (uniform uint32)Seed;
+
+		float3 Gradient;
+		const float Raw = FCPerlinDeriv3D(OctaveSeed, Position, &Gradient) * 1.4f;
+
+		GradientSum = GradientSum + Gradient;
+		const float Erosion = 1.f / (1.f + dot(GradientSum, GradientSum));
+		const float SmoothValue = Raw * Erosion;
+
+		float Ridge = 1.f - abs(Raw);
+		Ridge = Ridge * Ridge * RidgeWeight;
+		RidgeWeight = clamp(Ridge * 2.f, 0.f, 1.f);
+		const float RidgeValue = Ridge * 2.f - 1.f;
+
+		const float Value = FCLerp(SmoothValue, RidgeValue, AestheticBias);
+
+		const float NewSum = Sum + Value * Amplitude;
+		Sum = select(FCIsFinite(NewSum), NewSum, Sum);
+
+		AmplitudeSum += Amplitude;
+		Amplitude = Amplitude * Gain;
+		Position = Position * Lacunarity;
+		Seed = FCNextOctaveSeed(Seed);
+	}
+
+	return Sum / (AmplitudeSum == 0.f ? 1.f : AmplitudeSum);
+}
+
+// Optional post-shaping stages layered on the base terrain, all in normalized
+// height space [-1, 1]. Every stage is an exact no-op when its Blend/Strength
+// is 0, so the base terrain is unchanged unless a control is enabled.
+struct FCTerrainShaping {
+	varying float WarpStrength; // world units of positional warp
+	varying float WarpScale; // feature scale of the warp field
+	varying float MountainBlend; // 0-1
+	varying float MountainScale; // spacing of mountain range bands
+	varying float ContinentBlend; // 0-1
+	varying float ContinentScale; // size of landmasses
+	varying float IslandBias; // -1 (archipelago) .. +1 (mostly land)
+	varying float CanyonBlend; // 0-1
+	varying float CanyonScale; // spacing of canyon networks
+	varying float TerraceStrength; // 0-1
+	varying float TerraceCount; // number of terrace levels
+};
+
+// Soft height quantization into mesas/plateaus, shared by the 2D/3D shaping
+FORCEINLINE float FCApplyTerrainTerraces(float Height, const FCTerrainShaping Shaping) {
+	const float Count = clamp(Shaping.TerraceCount, 1.f, 64.f);
+	const float Level = (Height + 1.f) * 0.5f * Count;
+	const float Cell = floor(Level);
+	const float Alpha = Level - Cell;
+	const float AlphaQuad = Alpha * Alpha * Alpha * Alpha;
+	const float InvAlpha = 1.f - Alpha;
+	const float InvAlphaQuad = InvAlpha * InvAlpha * InvAlpha * InvAlpha;
+	const float SharpAlpha = AlphaQuad / max(AlphaQuad + InvAlphaQuad, 1e-8f);
+	const float Terraced = (Cell + SharpAlpha) / Count * 2.f - 1.f;
+	return FCLerp(Height, Terraced, clamp(Shaping.TerraceStrength, 0.f, 1.f));
+}
+
+// Applies the shaping stages to a normalized height. Position is in world
+// units (pre-FeatureScale), matching the masks' own scales.
+FORCEINLINE float FCApplyTerrainShaping2D(
+		const uniform int32 Seed,
+		const float2 Position,
+		float Height,
+		const FCTerrainShaping Shaping) {
+	// Mountain ranges: concentrate relief into sharpened ridge bands
+	if (Shaping.MountainBlend != 0.f) {
+		float Band = 1.f -
+				abs(FCPerlin2D((uniform uint32)FC_TERRAIN_SEED_MOUNTAIN(Seed),
+						Position / max(Shaping.MountainScale, 1e-3f)));
+		Band = clamp(Band, 0.f, 1.f);
+		Band = Band * Band * Band;
+		Height = Height * FCLerp(1.f, Band, clamp(Shaping.MountainBlend, 0.f, 1.f));
+	}
+
+	// Continents & islands: landmass mask with a detailed ocean floor
+	if (Shaping.ContinentBlend != 0.f) {
+		const float Continentalness = FCTerrainRegionNoise2D(
+				FC_TERRAIN_SEED_CONTINENT(Seed), Position / max(Shaping.ContinentScale, 1e-3f));
+		const float Land = FCSmoothstep(-0.2f, 0.2f, Continentalness + Shaping.IslandBias);
+		const float OceanHeight = -0.55f + Height * 0.15f;
+		const float Shaped = FCLerp(OceanHeight, Height, Land);
+		Height = FCLerp(Height, Shaped, clamp(Shaping.ContinentBlend, 0.f, 1.f));
+	}
+
+	// Canyons: steep-walled channels carved down to a canyon floor
+	if (Shaping.CanyonBlend != 0.f) {
+		const float Channel = 1.f -
+				FCSmoothstep(0.02f, 0.18f,
+						abs(FCPerlin2D((uniform uint32)FC_TERRAIN_SEED_CANYON(Seed),
+								Position / max(Shaping.CanyonScale, 1e-3f))));
+		const float CarveTo = min(Height, -0.45f); // never raises ocean floors
+		Height = FCLerp(Height, CarveTo, Channel * clamp(Shaping.CanyonBlend, 0.f, 1.f));
+	}
+
+	// Terraces: soft height quantization into mesas/plateaus
+	if (Shaping.TerraceStrength != 0.f) {
+		Height = FCApplyTerrainTerraces(Height, Shaping);
+	}
+
+	return clamp(Height, -1.f, 1.f);
+}
+
+FORCEINLINE float FCApplyTerrainShaping3D(
+		const uniform int32 Seed,
+		const float3 Position,
+		float Height,
+		const FCTerrainShaping Shaping) {
+	if (Shaping.MountainBlend != 0.f) {
+		float Band = 1.f -
+				abs(FCPerlin3D((uniform uint32)FC_TERRAIN_SEED_MOUNTAIN(Seed),
+						Position / max(Shaping.MountainScale, 1e-3f)));
+		Band = clamp(Band, 0.f, 1.f);
+		Band = Band * Band * Band;
+		Height = Height * FCLerp(1.f, Band, clamp(Shaping.MountainBlend, 0.f, 1.f));
+	}
+
+	if (Shaping.ContinentBlend != 0.f) {
+		const float Continentalness = FCTerrainRegionNoise3D(
+				FC_TERRAIN_SEED_CONTINENT(Seed), Position / max(Shaping.ContinentScale, 1e-3f));
+		const float Land = FCSmoothstep(-0.2f, 0.2f, Continentalness + Shaping.IslandBias);
+		const float OceanHeight = -0.55f + Height * 0.15f;
+		const float Shaped = FCLerp(OceanHeight, Height, Land);
+		Height = FCLerp(Height, Shaped, clamp(Shaping.ContinentBlend, 0.f, 1.f));
+	}
+
+	if (Shaping.CanyonBlend != 0.f) {
+		const float Channel = 1.f -
+				FCSmoothstep(0.02f, 0.18f,
+						abs(FCPerlin3D((uniform uint32)FC_TERRAIN_SEED_CANYON(Seed),
+								Position / max(Shaping.CanyonScale, 1e-3f))));
+		const float CarveTo = min(Height, -0.45f);
+		Height = FCLerp(Height, CarveTo, Channel * clamp(Shaping.CanyonBlend, 0.f, 1.f));
+	}
+
+	if (Shaping.TerraceStrength != 0.f) {
+		Height = FCApplyTerrainTerraces(Height, Shaping);
+	}
+
+	return clamp(Height, -1.f, 1.f);
+}
+
+// Full per-point 2D terrain height: warp + base fBm + shaping. Returns height
+// in world units ([-Amplitude, Amplitude]).
+FORCEINLINE float FCTerrainHeight2D(
+		const uniform int32 Seed,
+		float2 Position,
+		const float Amplitude,
+		const float FeatureScale,
+		const float Lacunarity,
+		const float Gain,
+		const float AestheticBias,
+		const uniform int32 NumOctaves,
+		const FCTerrainShaping Shaping) {
+	// Domain warp in world space, ahead of both the base terrain and the masks
+	if (Shaping.WarpStrength != 0.f) {
+		const float2 WarpPosition = Position / max(Shaping.WarpScale, 1e-3f);
+		Position = Position +
+				MakeFloat2(FCPerlin2D((uniform uint32)FC_TERRAIN_SEED_WARP_X(Seed), WarpPosition),
+						FCPerlin2D((uniform uint32)FC_TERRAIN_SEED_WARP_Y(Seed), WarpPosition)) *
+						Shaping.WarpStrength;
+	}
+
+	varying float Height = FCInfiniteTerrain2D(
+			Seed, Position / max(FeatureScale, 1e-6f), NumOctaves, Lacunarity, Gain,
+			clamp(AestheticBias, 0.f, 1.f));
+
+	Height = FCApplyTerrainShaping2D(Seed, Position, Height, Shaping);
+
+	return Height * Amplitude;
+}
+
+// Full per-point 3D planetary terrain. Samples along the unit direction of
+// Position scaled to the planet surface, so the terrain is seamless on the
+// whole sphere with no pole singularities or longitude seams. Returns the
+// radial surface distance from the planet center: PlanetRadius + height.
+FORCEINLINE float FCTerrainHeight3D(
+		const uniform int32 Seed,
+		const float3 InPosition,
+		const float Amplitude,
+		const float FeatureScale,
+		const float Lacunarity,
+		const float Gain,
+		const float AestheticBias,
+		const uniform int32 NumOctaves,
+		const uniform float PlanetRadius,
+		const FCTerrainShaping Shaping) {
+	const float3 Direction = InPosition / max(length(InPosition), 1e-6f);
+
+	// Surface-space position: the unit direction scaled to the planet
+	// surface, so all scales stay surface arc lengths in world units
+	float3 SurfacePosition = Direction * PlanetRadius;
+
+	// Domain warp in surface space, ahead of both terrain and masks
+	if (Shaping.WarpStrength != 0.f) {
+		const float3 WarpPosition = SurfacePosition / max(Shaping.WarpScale, 1e-3f);
+		SurfacePosition = SurfacePosition +
+				MakeFloat3(FCPerlin3D((uniform uint32)FC_TERRAIN_SEED_WARP_X(Seed), WarpPosition),
+						FCPerlin3D((uniform uint32)FC_TERRAIN_SEED_WARP_Y(Seed), WarpPosition),
+						FCPerlin3D((uniform uint32)FC_TERRAIN_SEED_WARP_Z(Seed), WarpPosition)) *
+						Shaping.WarpStrength;
+	}
+
+	varying float Height = FCInfiniteTerrain3D(
+			Seed, SurfacePosition / max(FeatureScale, 1e-6f), NumOctaves, Lacunarity, Gain,
+			clamp(AestheticBias, 0.f, 1.f));
+
+	Height = FCApplyTerrainShaping3D(Seed, SurfacePosition, Height, Shaping);
+
+	return PlanetRadius + Height * Amplitude;
+}
+
+// Multi-output results are returned by value (structs of varying members).
+// Pointer out-params through a uniform pointer trigger ISPC's "all program
+// instances writing to the same location" undefined behavior.
+struct FCClimateResult {
+	varying float Temperature;
+	varying float Moisture;
+	varying float NormalizedHeight;
+};
+
+// Climate fields from a terrain height + position, for material blending
+// (biome masks, snow lines, vegetation density). All outputs normalized [0,1].
+// Flat worlds have no latitude; regional noise provides climate zones.
+FORCEINLINE FCClimateResult FCTerrainClimate2D(
+		const uniform int32 Seed,
+		const float2 Position,
+		const float Height,
+		const float Amplitude,
+		const float InSeaLevel,
+		const float ClimateScale,
+		const float ElevationCooling,
+		const float TemperatureVariation) {
+	const float2 ClimatePosition = Position / max(ClimateScale, 1e-3f);
+	const float NormalizedHeight = clamp(Height / max(Amplitude, 1e-3f), -1.f, 1.f);
+	const float SeaLevel = clamp(InSeaLevel, -1.f, 1.f);
+	const float AboveSea = max(NormalizedHeight - SeaLevel, 0.f) / max(1.f - SeaLevel, 1e-3f);
+
+	const float TemperatureRegion =
+			0.5f + 0.5f * FCTerrainRegionNoise2D(FC_CLIMATE_SEED_TEMPERATURE(Seed), ClimatePosition);
+	const float BaseTemperature =
+			FCLerp(0.6f, TemperatureRegion, clamp(TemperatureVariation, 0.f, 1.f));
+
+	const float MoistureRegion = 0.5f +
+			0.5f * FCTerrainRegionNoise2D(FC_CLIMATE_SEED_MOISTURE(Seed), ClimatePosition * 1.7f);
+
+	FCClimateResult Result;
+	Result.Temperature =
+			clamp(BaseTemperature - AboveSea * clamp(ElevationCooling, 0.f, 1.f), 0.f, 1.f);
+	Result.Moisture = clamp(MoistureRegion * (1.f - 0.35f * AboveSea), 0.f, 1.f);
+	Result.NormalizedHeight = NormalizedHeight * 0.5f + 0.5f;
+	return Result;
+}
+
+// Planetary climate: latitude gradient (Y is the polar axis in Godot) plus
+// regional noise, cooled with elevation above sea level.
+FORCEINLINE FCClimateResult FCTerrainClimate3D(
+		const uniform int32 Seed,
+		const float3 Position,
+		const float RadialDistance,
+		const float Amplitude,
+		const float InSeaLevel,
+		const float ClimateScale,
+		const float ElevationCooling,
+		const float TemperatureVariation,
+		const uniform float PlanetRadius) {
+	const float3 Direction = Position / max(length(Position), 1e-6f);
+	const float3 ClimatePosition = Direction * (PlanetRadius / max(ClimateScale, 1e-3f));
+
+	const float TerrainHeight = RadialDistance - PlanetRadius;
+	const float NormalizedHeight = clamp(TerrainHeight / max(Amplitude, 1e-3f), -1.f, 1.f);
+	const float SeaLevel = clamp(InSeaLevel, -1.f, 1.f);
+	const float AboveSea = max(NormalizedHeight - SeaLevel, 0.f) / max(1.f - SeaLevel, 1e-3f);
+
+	// Latitude gradient: cos^2(latitude) — 1 at the equator, 0 at the poles
+	const float LatitudeTemperature = 1.f - Direction.y * Direction.y;
+	const float TemperatureNoise =
+			FCTerrainRegionNoise3D(FC_CLIMATE_SEED_TEMPERATURE(Seed), ClimatePosition);
+	const float BaseTemperature =
+			LatitudeTemperature + TemperatureNoise * 0.25f * clamp(TemperatureVariation, 0.f, 1.f);
+
+	const float MoistureRegion = 0.5f +
+			0.5f * FCTerrainRegionNoise3D(FC_CLIMATE_SEED_MOISTURE(Seed), ClimatePosition * 1.7f);
+
+	FCClimateResult Result;
+	Result.Temperature =
+			clamp(BaseTemperature - AboveSea * clamp(ElevationCooling, 0.f, 1.f), 0.f, 1.f);
+	Result.Moisture = clamp(MoistureRegion * (1.f - 0.35f * AboveSea), 0.f, 1.f);
+	Result.NormalizedHeight = NormalizedHeight * 0.5f + 0.5f;
+	return Result;
+}
+
+// Projects positions on/around a spherical planet into a 2D tangent frame
+// centered on a stamp direction, using an azimuthal equidistant projection:
+// radial surface distances from the stamp center are exact arc lengths, so a
+// stamp keeps its intended size anywhere on the planet (poles included).
+// Outputs: Local = tangent-plane coords ((0,0) at center), UV = Local remapped
+// to [0,1] across StampSize, Strength = radial falloff (1 center, 0 edge).
+struct FCSphereStampResult {
+	varying float LocalX;
+	varying float LocalY;
+	varying float UVX;
+	varying float UVY;
+	varying float Strength;
+};
+
+FORCEINLINE FCSphereStampResult FCSphereStamp(
+		const float3 Position,
+		const float3 StampCenter,
+		const float InStampSize,
+		const float Falloff,
+		const float RotationDegrees,
+		const uniform float PlanetRadius) {
+	const float3 Direction = Position / max(length(Position), 1e-6f);
+
+	const float CenterLength = length(StampCenter);
+	float3 Center = MakeFloat3(0.f, 1.f, 0.f);
+	if (CenterLength > 1e-6f) {
+		Center = StampCenter / CenterLength;
+	}
+
+	// Tangent basis aligned to the local surface up (= Center direction),
+	// with a reference-axis fallback when the stamp sits at a pole (Y-up)
+	float3 Reference = MakeFloat3(0.f, 1.f, 0.f);
+	if (abs(Center.y) > 0.99f) {
+		Reference = MakeFloat3(1.f, 0.f, 0.f);
+	}
+	float3 East = cross(Reference, Center);
+	East = East / max(length(East), 1e-6f);
+	const float3 North = cross(Center, East);
+
+	// In-plane rotation of the stamp around its center
+	const float RotationRad = RotationDegrees * (3.14159265f / 180.f);
+	const float CosRotation = cos(RotationRad);
+	const float SinRotation = sin(RotationRad);
+	const float3 RotatedEast = East * CosRotation + North * SinRotation;
+	const float3 RotatedNorth = North * CosRotation - East * SinRotation;
+
+	// Azimuthal equidistant projection
+	const float CosTheta = clamp(dot(Direction, Center), -1.f, 1.f);
+	const float ArcDistance = acos(CosTheta) * PlanetRadius;
+
+	const float3 Tangential = Direction - Center * CosTheta;
+	const float TangentialLength = length(Tangential);
+	float2 PlaneDirection = MakeFloat2(0.f, 0.f);
+	if (TangentialLength > 1e-8f) {
+		PlaneDirection = MakeFloat2(dot(Tangential, RotatedEast), dot(Tangential, RotatedNorth)) /
+				TangentialLength;
+	}
+
+	const float2 Local = PlaneDirection * ArcDistance;
+	const float StampSize = max(InStampSize, 1e-3f);
+
+	// Radial falloff: full strength inside, smooth fade over the outer
+	// Falloff fraction of the stamp radius
+	const float NormalizedRadius = ArcDistance / (StampSize * 0.5f);
+	const float FalloffFraction = clamp(Falloff, 1e-4f, 1.f);
+
+	FCSphereStampResult Result;
+	Result.LocalX = Local.x;
+	Result.LocalY = Local.y;
+	Result.UVX = Local.x / StampSize + 0.5f;
+	Result.UVY = Local.y / StampSize + 0.5f;
+	Result.Strength = 1.f - FCSmoothstep(1.f - FalloffFraction, 1.f, NormalizedRadius);
+	return Result;
+}
+
+// Returns the distance to the nearest Worley cell edge in [0, ~0.7].
+// Cells are jittered by FlowWarp to make channels follow terrain contours.
+FORCEINLINE float FCRiverEdgeDist2D(const uint32 Seed, const float2 Position, const float2 FlowWarp) {
+	const float2 WarpedPos = Position + FlowWarp;
+	const float2 Cell = floor(WarpedPos);
+	const float2 Local = WarpedPos - Cell;
+
+	// Find the two nearest feature points (F1 and F2) — their midpoint is the edge
+	float F1 = 1e6f;
+	float F2 = 1e6f;
+	for (uniform int32 Ix = -2; Ix <= 2; Ix++) {
+		for (uniform int32 Iy = -2; Iy <= 2; Iy++) {
+			const float2 Offset = MakeFloat2(Ix, Iy);
+			const float2 Feature = Offset + FCHash22(Seed, Cell + Offset);
+			const float Dist = length(Local - Feature);
+			if (Dist < F1) {
+				F2 = F1;
+				F1 = Dist;
+			} else if (Dist < F2) {
+				F2 = Dist;
+			}
+		}
+	}
+	// Edge distance: midpoint between F1 and F2 minus F1 == (F2-F1)*0.5
+	return (F2 - F1) * 0.5f;
+}
+
+// River channel mask and depth from TerrainClimate outputs using
+// gradient-directed Worley networks. O(1) per point:
+// 1. Sample the terrain gradient via derivative Perlin for a flow direction.
+// 2. Warp the sample position along that flow direction (FlowStrength).
+// 3. Two Worley passes (trunk + tributary scale), threshold the edge distance.
+// 4. Widen channels toward sea level (coastal deltas).
+// 5. Zero the mask below sea level (rivers end at the ocean).
+// Outputs: RiverMask [0,1] (1 inside channel), RiverDepth [0,1] (1 at center).
+struct FCRiversResult {
+	varying float Mask;
+	varying float Depth;
+};
+
+FORCEINLINE FCRiversResult FCTerrainRivers2D(
+		const uniform int32 Seed,
+		const float2 Position,
+		const float NormalizedHeight,
+		const float InSeaLevel,
+		const float RiverScale,
+		const float RiverWidth,
+		const float FlowStrength) {
+	const float H = clamp(NormalizedHeight, 0.f, 1.f);
+	const float Sea = clamp(InSeaLevel, 0.01f, 0.99f);
+	const float RivS = max(RiverScale, 1.f);
+	const float Width = clamp(RiverWidth, 0.01f, 1.f);
+	const float Flow = clamp(FlowStrength, 0.f, 1.f);
+
+	// Gradient warp: sample a 2-octave Perlin derivative field
+	const float2 GradPos = Position / (RivS * 2.f);
+	float2 Grad0;
+	float2 Grad1;
+	FCPerlinDeriv2D((uniform uint32)FC_RIVER_SEED_FLOW_X(Seed), GradPos, &Grad0);
+	FCPerlinDeriv2D((uniform uint32)FC_RIVER_SEED_FLOW_Y(Seed), GradPos * 1.7f, &Grad1);
+	const float2 FlowWarp = (Grad0 + Grad1 * 0.5f) * Flow;
+
+	// Worley edge distances at trunk and tributary scales
+	const float2 TrunkPos = Position / (RivS * 2.5f);
+	const float2 TribPos = Position / RivS;
+
+	const float TrunkEdge =
+			FCRiverEdgeDist2D((uniform uint32)FC_RIVER_SEED_TRUNK(Seed), TrunkPos, FlowWarp * 0.4f);
+	const float TribEdge =
+			FCRiverEdgeDist2D((uniform uint32)FC_RIVER_SEED_TRIB(Seed), TribPos, FlowWarp);
+
+	// Adaptive width: rivers widen near sea level (coastal delta)
+	const float LandT = clamp((H - Sea) / (1.f - Sea), 0.f, 1.f);
+	const float CoastBoost = FCSmoothstep(0.25f, 0.f, LandT);
+	const float EffWidth = clamp(Width + CoastBoost * Width * 0.6f, 0.01f, 0.99f);
+
+	// Threshold: edge dist < half-width → inside channel
+	// Trunk channels are wider, tributaries narrower
+	const float TrunkHalf = EffWidth * 0.30f;
+	const float TribHalf = EffWidth * 0.18f;
+
+	const float TrunkMask = FCSmoothstep(TrunkHalf, TrunkHalf * 0.4f, TrunkEdge);
+	const float TribMask = FCSmoothstep(TribHalf, TribHalf * 0.4f, TribEdge);
+
+	// Depth: 1 at channel centre, 0 at bank
+	const float TrunkDepth = clamp(1.f - TrunkEdge / max(TrunkHalf, 1e-4f), 0.f, 1.f);
+	const float TribDepth = clamp(1.f - TribEdge / max(TribHalf, 1e-4f), 0.f, 1.f);
+
+	// Merge: trunk takes priority; tributaries don't override trunk channels
+	const float RiverMask = max(TrunkMask, TribMask);
+	const float RiverDepth = max(TrunkDepth * TrunkMask, TribDepth * TribMask);
+
+	// Zero below sea level — rivers end at the ocean
+	const float LandMask = H >= Sea ? 1.f : 0.f;
+
+	FCRiversResult Result;
+	Result.Mask = RiverMask * LandMask;
+	Result.Depth = RiverDepth * LandMask;
+	return Result;
+}
+
+// Biome ids produced by FCTerrainMaterialBlend, encoded as floats:
+// 0 DeepOcean, 1 ShallowOcean, 2 Coast, 3 River, 4 Tropical, 5 Forest,
+// 6 Plains, 7 Desert, 8 Tundra, 9 Mountain, 10 Snow.
+//
+// Converts TerrainClimate outputs into a dominant biome id plus soft feature
+// masks for material selection. The UE original also emitted a blended RGBA
+// color; that is intentionally dropped here — terrain color is a flat solid
+// per material type in this engine, mapped from the biome id downstream.
+struct FCMaterialBlendResult {
+	varying float BiomeId;
+	varying float OceanMask;
+	varying float CoastMask;
+	varying float RiverFeatureMask;
+	varying float VegetationMask;
+	varying float DesertMask;
+	varying float TundraMask;
+	varying float MountainMask;
+	varying float SnowMask;
+};
+
+FORCEINLINE FCMaterialBlendResult FCTerrainMaterialBlend(
+		const float InNormalizedHeight,
+		const float InTemperature,
+		const float InMoisture,
+		const float InSeaLevel,
+		const float InRiverMask,
+		const float InBiomeContrast) {
+	const float H = clamp(InNormalizedHeight, 0.f, 1.f);
+	const float Tmp = clamp(InTemperature, 0.f, 1.f);
+	const float Mst = clamp(InMoisture, 0.f, 1.f);
+	const float Sea = clamp(InSeaLevel, 0.01f, 0.99f);
+	const float RivM = clamp(InRiverMask, 0.f, 1.f);
+	const float Contrast = clamp(InBiomeContrast, 0.f, 1.f);
+
+	const float Sharpness = FCLerp(0.25f, 1.f, Contrast);
+	const float LandMask = H >= Sea ? 1.f : 0.f;
+	const float OceanMask = 1.f - LandMask;
+	const float LandT = clamp((H - Sea) / max(1.f - Sea, 1e-3f), 0.f, 1.f);
+	const float Warmth = Tmp;
+	const float Dryness = 1.f - Mst;
+
+	// Feature masks (all [0,1])
+	const float CoastMask =
+			LandMask * (1.f - FCSmoothstep(0.03f, FCLerp(0.16f, 0.08f, Contrast), LandT));
+	const float MountainMask = LandMask *
+			FCSmoothstep(FCLerp(0.68f, 0.60f, Contrast), FCLerp(0.84f, 0.74f, Contrast), LandT);
+	const float SnowStart = FCLerp(0.60f, 0.90f, Warmth);
+	const float SnowMask =
+			LandMask * FCSmoothstep(SnowStart - 0.08f * Sharpness, SnowStart + 0.08f, LandT);
+	const float DesertMask = LandMask * FCSmoothstep(0.58f, 0.42f, Warmth) *
+			FCSmoothstep(0.48f, 0.70f, Dryness) * (1.f - SnowMask);
+	const float TundraMask = LandMask * FCSmoothstep(0.58f, 0.74f, 1.f - Warmth) *
+			(1.f - SnowMask) * (1.f - DesertMask);
+	const float VegetationMask =
+			LandMask * FCSmoothstep(0.34f, 0.62f, Mst) * (1.f - DesertMask) * (1.f - SnowMask);
+	const float RiverFeatureMask = LandMask * RivM;
+
+	// Ocean depth split for shallow/deep classes
+	const float OceanDepth = OceanMask * clamp((Sea - H) / max(Sea, 1e-3f), 0.f, 1.f);
+	const float ShallowOceanMask = OceanMask * (1.f - FCSmoothstep(0.25f, 0.55f, OceanDepth));
+	const float DeepOceanMask = OceanMask * (1.f - ShallowOceanMask);
+
+	// Land subclasses used for id switching
+	const float TropicalMask = LandMask * FCSmoothstep(0.65f, 0.45f, Warmth) *
+			FCSmoothstep(0.55f, 0.70f, Mst) * (1.f - MountainMask) * (1.f - SnowMask);
+	const float ForestMask = VegetationMask * (1.f - TropicalMask) * (1.f - TundraMask) * (1.f - MountainMask);
+	const float PlainsMask = LandMask *
+			(1.f -
+					max(CoastMask,
+							max(DesertMask,
+									max(TundraMask,
+											max(MountainMask,
+													max(SnowMask,
+															max(RiverFeatureMask,
+																	max(TropicalMask, ForestMask))))))));
+
+	// Dominant biome id
+	varying float BiomeId = 6.f;
+	varying float Best = PlainsMask;
+
+	if (DeepOceanMask > Best) {
+		Best = DeepOceanMask;
+		BiomeId = 0.f;
+	}
+	if (ShallowOceanMask > Best) {
+		Best = ShallowOceanMask;
+		BiomeId = 1.f;
+	}
+	if (CoastMask > Best) {
+		Best = CoastMask;
+		BiomeId = 2.f;
+	}
+	if (RiverFeatureMask > Best) {
+		Best = RiverFeatureMask;
+		BiomeId = 3.f;
+	}
+	if (TropicalMask > Best) {
+		Best = TropicalMask;
+		BiomeId = 4.f;
+	}
+	if (ForestMask > Best) {
+		Best = ForestMask;
+		BiomeId = 5.f;
+	}
+	if (DesertMask > Best) {
+		Best = DesertMask;
+		BiomeId = 7.f;
+	}
+	if (TundraMask > Best) {
+		Best = TundraMask;
+		BiomeId = 8.f;
+	}
+	if (MountainMask > Best) {
+		Best = MountainMask;
+		BiomeId = 9.f;
+	}
+	if (SnowMask > Best) {
+		BiomeId = 10.f;
+	}
+
+	FCMaterialBlendResult Result;
+	Result.BiomeId = BiomeId;
+	Result.OceanMask = OceanMask;
+	Result.CoastMask = CoastMask;
+	Result.RiverFeatureMask = RiverFeatureMask;
+	Result.VegetationMask = VegetationMask;
+	Result.DesertMask = DesertMask;
+	Result.TundraMask = TundraMask;
+	Result.MountainMask = MountainMask;
+	Result.SnowMask = SnowMask;
+	return Result;
+}
+
 #ifndef ISPC
 #undef uniform
 #undef varying

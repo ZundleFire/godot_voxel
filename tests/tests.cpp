@@ -9,6 +9,7 @@
 #include "util/test_island_finder.h"
 #include "util/test_math_funcs.h"
 #include "util/test_noise.h"
+#include "util/test_terrain_noise.h"
 #include "util/test_slot_map.h"
 #include "util/test_spatial_lock.h"
 #include "util/test_string_funcs.h"
@@ -176,6 +177,8 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_instance_generator_material_filter_issue774);
 #endif
 	VOXEL_TEST(test_spot_noise);
+	VOXEL_TEST(test_terrain_noise_determinism);
+	VOXEL_TEST(test_terrain_noise_ranges);
 	VOXEL_TEST(test_voxel_graph_multiple_function_instances);
 	VOXEL_TEST(test_voxel_graph_issue783);
 	VOXEL_TEST(test_voxel_graph_broad_block);

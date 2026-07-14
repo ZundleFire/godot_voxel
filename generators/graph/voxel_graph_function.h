@@ -117,6 +117,13 @@ public:
 		NODE_PLANET_TECTONICS,
 		NODE_PROCEDURAL_NOISE_2D,
 		NODE_PROCEDURAL_NOISE_3D,
+		NODE_INFINITE_TERRAIN_2D,
+		NODE_INFINITE_TERRAIN_3D,
+		NODE_TERRAIN_CLIMATE_2D,
+		NODE_TERRAIN_CLIMATE_3D,
+		NODE_SPHERE_STAMP,
+		NODE_TERRAIN_RIVERS_2D,
+		NODE_TERRAIN_MATERIAL_BLEND,
 
 	// Optional features down (to avoid diffs in docs when building both versions)
 	// Keep in mind this enum's values should not be used in persistent context (saves)
