@@ -375,20 +375,35 @@ void VoxelLodTerrain::refresh_material_from_graph_generator() {
 		return;
 	}
 
+	// Reentrancy guard. `compile()` below emits the generator's `changed` signal on success, which
+	// is connected to `_on_generator_changed()` -> this function. For a graph with no material
+	// output node, `get_final_material()` permanently returns null, so without this guard we would
+	// unconditionally recompile again here on every re-entry, recursing until the call stack
+	// overflows. See the comment on `_refreshing_material_from_graph_generator` in the header.
+	if (_refreshing_material_from_graph_generator) {
+		return;
+	}
+	_refreshing_material_from_graph_generator = true;
+
 	Ref<Material> final_material = graph_generator->get_final_material();
 	if (!graph_generator->is_good() || final_material.is_null()) {
 		const pg::CompilationResult result = graph_generator->compile(Engine::get_singleton()->is_editor_hint());
 		if (!result.success) {
 			ZN_PRINT_WARNING(
 					format("VoxelLodTerrain keeping previous material because graph compilation failed: {}", result.message));
+			_refreshing_material_from_graph_generator = false;
 			return;
 		}
 		final_material = graph_generator->get_final_material();
 	}
 
-	if (final_material.is_valid()) {
-		set_material(final_material);
-	}
+	// Always apply, including when null: a graph that legitimately has no material output (e.g. it
+	// was live-edited from a material graph down to an SDF-only graph) must clear any previously
+	// applied material rather than keep it stale. Only an outright compilation *failure* (handled
+	// above) preserves the previous material.
+	set_material(final_material);
+
+	_refreshing_material_from_graph_generator = false;
 }
 
 void VoxelLodTerrain::_on_generator_changed() {

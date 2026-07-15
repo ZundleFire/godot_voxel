@@ -443,6 +443,16 @@ private:
 
 	// Data stored with a shared pointer so it can be sent to asynchronous tasks
 	bool _threaded_update_enabled = false;
+
+	// Reentrancy guard for `refresh_material_from_graph_generator()`. That function may call
+	// `VoxelGeneratorGraph::compile()`, which emits the generator's `changed` signal on success.
+	// That signal is connected to `_on_generator_changed()`, which calls
+	// `refresh_material_from_graph_generator()` again. For a graph with no material output node,
+	// `get_final_material()` permanently returns null, so without this guard the function would
+	// recompile unconditionally on every re-entry, recursing until the call stack overflows
+	// (this was the root cause of a synchronous segfault when assigning such a generator to
+	// `VoxelLodTerrain.generator`).
+	bool _refreshing_material_from_graph_generator = false;
 	std::shared_ptr<VoxelData> _data;
 	std::shared_ptr<VoxelLodTerrainUpdateData> _update_data;
 	std::shared_ptr<StreamingDependency> _streaming_dependency;
