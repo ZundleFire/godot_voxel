@@ -40,7 +40,9 @@ VoxelSingleValue VoxelGenerator::generate_single(Vector3i pos, unsigned int chan
 	buffer.create(1, 1, 1);
 	VoxelQueryData q{ buffer, pos, 0 };
 	generate_block(q);
-	if (channel == VoxelBuffer::CHANNEL_SDF) {
+	// CHANNEL_DATA5 is used as a float channel by VoxelWaterSimulator (water mass), same as
+	// CHANNEL_SDF -- everything else defaults to raw int semantics.
+	if (channel == VoxelBuffer::CHANNEL_SDF || channel == VoxelBuffer::CHANNEL_DATA5) {
 		v.f = buffer.get_voxel_f(0, 0, 0, channel);
 	} else {
 		v.i = buffer.get_voxel(0, 0, 0, channel);

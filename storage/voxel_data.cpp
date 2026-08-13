@@ -151,7 +151,9 @@ void VoxelData::set_full_load_completed(bool complete) {
 
 inline VoxelSingleValue get_voxel_sv(VoxelBuffer &vb, Vector3i pos, unsigned int channel) {
 	VoxelSingleValue v;
-	if (channel == VoxelBuffer::CHANNEL_SDF) {
+	// CHANNEL_DATA5 is used as a float channel by VoxelWaterSimulator (water mass), same as
+	// CHANNEL_SDF -- everything else defaults to raw int semantics.
+	if (channel == VoxelBuffer::CHANNEL_SDF || channel == VoxelBuffer::CHANNEL_DATA5) {
 		v.f = vb.get_voxel_f(pos.x, pos.y, pos.z, channel);
 	} else {
 		v.i = vb.get_voxel(pos, channel);

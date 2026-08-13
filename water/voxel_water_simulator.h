@@ -117,6 +117,27 @@ public:
 	void set_absorbing_type_ids(PackedInt32Array p_ids);
 	PackedInt32Array get_absorbing_type_ids() const;
 
+	// If true (default), periodically scans every currently resident LOD0 block and activates
+	// any whose water channel is non-uniform (i.e. has an actual wet/dry boundary: a
+	// shoreline, a partially-filled basin, a spring). Uniform blocks -- no water anywhere, or
+	// fully submerged and already at rest -- have provably zero flow work to do and are
+	// skipped (an O(1) check per block, see VoxelBuffer::is_uniform()). This is what makes
+	// generator-baked water (e.g. EdenPlanetGeneratorV1's baked ocean, see its own
+	// generate_block() comment) actually start flowing/rendering with zero scripting: baked
+	// water is deliberately inert until something wakes it, and this is that "something",
+	// running entirely off Inspector properties instead of requiring a scan loop in a script.
+	void set_auto_scan_wet_blocks(bool p_enabled);
+	bool get_auto_scan_wet_blocks() const;
+	// Wall-clock seconds between auto-scans. Independent of update_interval (the tick
+	// dispatch cadence) since scanning and simulating are different costs.
+	void set_auto_scan_interval(float p_seconds);
+	float get_auto_scan_interval() const;
+
+	// Scans every currently resident LOD0 block of the attached terrain and calls
+	// activate_block() on any with a non-uniform water channel. Safe to call manually (e.g.
+	// once from a script after loading a save) even with auto_scan_wet_blocks disabled.
+	void scan_and_activate_wet_blocks();
+
 	// Adds (or removes, with a negative amount) water mass at a global voxel coordinate.
 	// Applied immediately on the main thread (not batched into the async tick) since this is
 	// a rare, caller-driven op, not the per-tick hot path. No-op on a solid voxel or a voxel
@@ -194,8 +215,11 @@ private:
 	float _absorption_rate = 0.0f;
 	float _max_absorption_per_voxel = 1.0f;
 	PackedInt32Array _absorbing_type_ids;
+	bool _auto_scan_wet_blocks = true;
+	float _auto_scan_interval = 2.0f;
 
 	double _time_accumulator = 0.0;
+	double _scan_time_accumulator = 0.0;
 	std::atomic_bool _tick_in_flight = { false };
 	uint32_t _round_robin_cursor = 0;
 

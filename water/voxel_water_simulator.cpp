@@ -3,6 +3,7 @@
 
 #include "../engine/voxel_engine.h"
 #include "../storage/voxel_data.h"
+#include "../storage/voxel_data_block.h"
 #include "../storage/voxel_format_gd.h"
 #include "../terrain/variable_lod/voxel_lod_terrain.h"
 #include "../util/godot/core/class_db.h"
@@ -265,6 +266,48 @@ void VoxelWaterSimulator::deactivate_block(Vector3i p_block_pos) {
 	_settle_counters.erase(p_block_pos);
 }
 
+void VoxelWaterSimulator::set_auto_scan_wet_blocks(bool p_enabled) {
+	_auto_scan_wet_blocks = p_enabled;
+}
+
+bool VoxelWaterSimulator::get_auto_scan_wet_blocks() const {
+	return _auto_scan_wet_blocks;
+}
+
+void VoxelWaterSimulator::set_auto_scan_interval(float p_seconds) {
+	_auto_scan_interval = math::max(p_seconds, 0.1f);
+}
+
+float VoxelWaterSimulator::get_auto_scan_interval() const {
+	return _auto_scan_interval;
+}
+
+void VoxelWaterSimulator::scan_and_activate_wet_blocks() {
+	std::shared_ptr<VoxelData> voxel_data = _get_data();
+	if (voxel_data == nullptr) {
+		return;
+	}
+	// Collect first (activate_block() below takes its own spatial read-lock per block, which
+	// would deadlock against the global read-lock for_each_block_at_lod_r already holds for
+	// the whole scan), then activate outside the scan.
+	StdVector<Vector3i> to_activate;
+	voxel_data->for_each_block_at_lod_r(
+			[&to_activate](Vector3i p_bpos, const VoxelDataBlock &p_block) {
+				if (!p_block.has_voxels()) {
+					return;
+				}
+				std::shared_ptr<VoxelBuffer> buf = p_block.get_voxels_shared();
+				if (buf != nullptr && !buf->is_uniform(WATER_CHANNEL)) {
+					to_activate.push_back(p_bpos);
+				}
+			},
+			0
+	);
+	for (const Vector3i &bpos : to_activate) {
+		activate_block(bpos);
+	}
+}
+
 int VoxelWaterSimulator::get_active_block_count() const {
 	return int(_active_blocks.size());
 }
@@ -288,6 +331,14 @@ bool VoxelWaterSimulator::is_tick_in_flight() const {
 }
 
 void VoxelWaterSimulator::_process_time(double p_delta) {
+	if (_auto_scan_wet_blocks) {
+		_scan_time_accumulator += p_delta;
+		if (_scan_time_accumulator >= double(_auto_scan_interval)) {
+			_scan_time_accumulator = 0.0;
+			scan_and_activate_wet_blocks();
+		}
+	}
+
 	_time_accumulator += p_delta;
 	if (_time_accumulator < double(_update_interval)) {
 		return;
@@ -786,6 +837,30 @@ void VoxelWaterSimulator::_bind_methods() {
 			PropertyInfo(Variant::PACKED_INT32_ARRAY, "absorbing_type_ids"),
 			"set_absorbing_type_ids",
 			"get_absorbing_type_ids"
+	);
+
+	ClassDB::bind_method(
+			D_METHOD("set_auto_scan_wet_blocks", "enabled"), &VoxelWaterSimulator::set_auto_scan_wet_blocks
+	);
+	ClassDB::bind_method(D_METHOD("get_auto_scan_wet_blocks"), &VoxelWaterSimulator::get_auto_scan_wet_blocks);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "auto_scan_wet_blocks"),
+			"set_auto_scan_wet_blocks",
+			"get_auto_scan_wet_blocks"
+	);
+
+	ClassDB::bind_method(
+			D_METHOD("set_auto_scan_interval", "seconds"), &VoxelWaterSimulator::set_auto_scan_interval
+	);
+	ClassDB::bind_method(D_METHOD("get_auto_scan_interval"), &VoxelWaterSimulator::get_auto_scan_interval);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "auto_scan_interval"),
+			"set_auto_scan_interval",
+			"get_auto_scan_interval"
+	);
+
+	ClassDB::bind_method(
+			D_METHOD("scan_and_activate_wet_blocks"), &VoxelWaterSimulator::scan_and_activate_wet_blocks
 	);
 
 	ClassDB::bind_method(D_METHOD("add_water", "global_voxel", "amount"), &VoxelWaterSimulator::add_water);
