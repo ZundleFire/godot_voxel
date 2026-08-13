@@ -50,6 +50,13 @@ Span<const transvoxel::CellInfo> VoxelMesherTransvoxel::get_cell_info_from_curre
 }
 
 void VoxelMesherTransvoxel::load_static_resources() {
+	// Guard against module init running before RenderingServer exists (e.g. the minimal
+	// `--test` doctest harness), where shader_create_from_code() would dereference a null
+	// singleton and crash. In every normal (non-test) run RenderingServer is already available
+	// by the time module init reaches MODULE_INITIALIZATION_LEVEL_SCENE, so this is a no-op there.
+	if (RenderingServer::get_singleton() == nullptr) {
+		return;
+	}
 	Ref<Shader> shader;
 	shader.instantiate();
 	shader->set_code(g_transvoxel_minimal_shader);
