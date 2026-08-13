@@ -27,6 +27,7 @@
 #include "voxel/test_voxel_graph.h"
 #include "voxel/test_voxel_instancer.h"
 #include "voxel/test_voxel_mesher_cubes.h"
+#include "voxel/test_voxel_water.h"
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 #include "voxel/test_transvoxel.h"
@@ -184,6 +185,13 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_voxel_graph_broad_block);
 	VOXEL_TEST(test_voxel_graph_set_default_input_by_name);
 	VOXEL_TEST(test_voxel_graph_get_io_indices);
+
+	VOXEL_TEST(test_voxel_water_mass_conservation);
+	VOXEL_TEST(test_voxel_water_flows_through_cave);
+	VOXEL_TEST(test_voxel_water_gravity_radial);
+	VOXEL_TEST(test_voxel_water_settle_dormancy);
+	VOXEL_TEST(test_voxel_water_mesh_faces_flat_pool);
+	VOXEL_TEST(test_voxel_water_mesh_smooth_faces_flat_pool);
 
 	print_line("------------ Voxel tests end -------------");
 }

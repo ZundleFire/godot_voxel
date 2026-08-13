@@ -72,6 +72,8 @@ def get_sources(env, is_editor_build):
         "storage/*.cpp",
         "storage/metadata/*.cpp",
 
+        "water/*.cpp",
+
         "generators/generate_block_task.cpp",
         "generators/voxel_generator_script.cpp",
         "generators/voxel_generator.cpp",
@@ -203,6 +205,7 @@ def get_sources(env, is_editor_build):
             "tests/voxel/test_voxel_graph.cpp",
             "tests/voxel/test_voxel_instancer.cpp",
             "tests/voxel/test_voxel_mesher_cubes.cpp",
+            "tests/voxel/test_voxel_water.cpp",
         ]
 
     if smoosh_meshing_enabled:

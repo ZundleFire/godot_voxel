@@ -16,6 +16,8 @@
 #include "funcs.h"
 #include "raycast.h"
 
+#include "../water/voxel_water_reclaim.h"
+
 #ifdef VOXEL_ENABLE_MESH_SDF
 #include "voxel_mesh_sdf_gd.h"
 #endif
@@ -123,6 +125,11 @@ void VoxelToolLodTerrain::do_sphere(Vector3 center, float radius) {
 
 	op();
 
+	// Clear any water mass left behind in voxels this edit just made solid (dig into
+	// water-filled air, or build over a wet voxel). See voxel_water_reclaim.h -- cheap no-op
+	// if this terrain's water channel was never touched to begin with.
+	reclaim_water_in_edited_box(data, world_box);
+
 	_post_edit(world_box);
 }
 
@@ -202,6 +209,11 @@ private:
 	std::shared_ptr<AsyncDependencyTracker> _tracker;
 };
 
+// ponytail: unlike do_sphere() above, this async path doesn't call
+// reclaim_water_in_edited_box() yet (its edit runs on a worker thread via VoxelToolAsyncEdit,
+// so the reclaim would need its own async hookup rather than a same-frame call) -- a dig/build
+// done through this entry point can still leave stale water mass in newly-solid voxels. Close
+// this if/when a game actually uses the async dig/build path with water enabled.
 void VoxelToolLodTerrain::do_sphere_async(Vector3 center, float radius) {
 	ERR_FAIL_COND(_terrain == nullptr);
 

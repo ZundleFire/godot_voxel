@@ -44,6 +44,7 @@
 #include "terrain/voxel_save_completion_tracker.h"
 #include "terrain/voxel_viewer.h"
 #include "util/godot/check_ref_ownership.h"
+#include "water/voxel_water_simulator.h"
 #include "util/macros.h"
 #include "util/noise/fast_noise_lite/fast_noise_lite.h"
 #include "util/noise/fast_noise_lite/fast_noise_lite_gradient.h"
@@ -290,6 +291,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<VoxelTerrain>();
 		ClassDB::register_class<VoxelLodTerrain>();
 		ClassDB::register_class<VoxelViewer>();
+		ClassDB::register_class<VoxelWaterSimulator>();
 
 		// Streams
 		ClassDB::register_abstract_class<VoxelStream>();
