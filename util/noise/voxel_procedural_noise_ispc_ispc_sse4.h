@@ -46,6 +46,42 @@ namespace ispc { /* namespace */
 #endif // defined(__clang__) || !defined(_MSC_VER) || _MSC_VER > 1943
 #endif // __ISPC_ALIGNED_STRUCT__
 
+#ifndef __ISPC_STRUCT_FCErosionParams__
+#define __ISPC_STRUCT_FCErosionParams__
+struct FCErosionParams {
+    int32_t Seed;
+    float PlanetRadius;
+    float TileSize;
+    float TriplanarSharpness;
+    float HeightFrequency;
+    float HeightAmp;
+    int32_t HeightOctaves;
+    float HeightLacunarity;
+    float HeightGain;
+    float Scale;
+    float Strength;
+    float GullyWeight;
+    float Detail;
+    float RoundingRidge;
+    float RoundingCrease;
+    float RoundingInputMult;
+    float RoundingOctaveMult;
+    float OnsetInitial;
+    float OnsetOctave;
+    float RidgeOnsetInitial;
+    float RidgeOnsetOctave;
+    float AssumedSlope;
+    float AssumedSlopeBlend;
+    float CellScale;
+    float Normalization;
+    int32_t Octaves;
+    float Lacunarity;
+    float Gain;
+    float HeightOffset;
+    float HeightOffsetFadeBlend;
+};
+#endif
+
 #ifndef __ISPC_STRUCT_ProceduralOctaveConfig__
 #define __ISPC_STRUCT_ProceduralOctaveConfig__
 struct ProceduralOctaveConfig {
@@ -61,6 +97,7 @@ struct ProceduralOctaveConfig {
 #if defined(__cplusplus) && (! defined(__ISPC_NO_EXTERN_C) || !__ISPC_NO_EXTERN_C )
 extern "C" {
 #endif // __cplusplus
+    extern void VoxelPlanetErosion_Batch(const float * pos_x, const float * pos_y, const float * pos_z, const struct FCErosionParams * params, float * out_height, float * out_ridge, float * out_erosion, const int32_t count);
     extern void VoxelProceduralNoise2D_Batch(const float * pos_x, const float * pos_y, const float amplitude, const float feature_scale, const float lacunarity, const float gain, const float voronoi_smoothness, const float wavelet_phase, const float scratch_smoothness, const int32_t in_seed, const struct ProceduralOctaveConfig * octaves, const int32_t num_octaves, float * output, const int32_t count);
     extern void VoxelProceduralNoise3D_Batch(const float * pos_x, const float * pos_y, const float * pos_z, const float amplitude, const float feature_scale, const float lacunarity, const float gain, const float voronoi_smoothness, const float wavelet_phase, const float scratch_smoothness, const int32_t in_seed, const struct ProceduralOctaveConfig * octaves, const int32_t num_octaves, float * output, const int32_t count);
     extern void VoxelSphereStamp_Batch(const float * pos_x, const float * pos_y, const float * pos_z, const float center_x, const float center_y, const float center_z, const float stamp_size, const float falloff, const float rotation_degrees, const float planet_radius, float * out_local_x, float * out_local_y, float * out_uv_x, float * out_uv_y, float * out_strength, const int32_t count);

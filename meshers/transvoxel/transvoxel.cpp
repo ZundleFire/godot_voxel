@@ -1161,6 +1161,19 @@ StdVector<uint16_t> &get_tls_weights_backing_buffer_u16() {
 	return tls_weights_backing_buffer_u16;
 }
 
+// EDEN FORK: CHANNEL_DATA6 as packed RGBA8 surface data. Empty span (surface data off) if disabled or not 32-bit.
+Span<const uint32_t> get_surface_data(const VoxelBuffer &voxels, const bool enabled) {
+	if (!enabled) {
+		return Span<const uint32_t>();
+	}
+	if (voxels.get_channel_depth(VoxelBuffer::CHANNEL_DATA6) != VoxelBuffer::DEPTH_32_BIT) {
+		ZN_PRINT_WARNING_ONCE("Transvoxel surface data needs CHANNEL_DATA6 at 32-bit depth (see VoxelFormat), ignored");
+		return Span<const uint32_t>();
+	}
+	thread_local StdVector<uint32_t> tls_backing_buffer;
+	return get_or_decompress_channel(voxels, tls_backing_buffer, VoxelBuffer::CHANNEL_DATA6);
+}
+
 // TODO Candidate for temp allocator
 StdVector<uint8_t> &get_tls_u8_conversion_buffer() {
 	static thread_local StdVector<uint8_t> tls_conversion_backing_buffer;
@@ -1253,7 +1266,8 @@ DefaultTextureIndicesData build_regular_mesh(
 		MeshArrays &output,
 		StdVector<CellInfo> *cell_infos,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels
+		const bool textures_ignore_air_voxels,
+		const bool surface_data_enabled
 ) {
 	ZN_PROFILE_SCOPE();
 	// From this point, we expect the buffer to contain allocated data in the relevant channels.
@@ -1311,6 +1325,7 @@ DefaultTextureIndicesData build_regular_mesh(
 				);
 				ZN_ASSERT_RETURN_V(voxel_material_weights.u16_data.size() == voxels_count, default_texture_indices);
 			}
+			const Span<const uint32_t> surface_data = get_surface_data(voxels, surface_data_enabled);
 			build_regular_mesh_dispatch_sd(
 					voxels,
 					sdf_channel,
@@ -1318,7 +1333,9 @@ DefaultTextureIndicesData build_regular_mesh(
 							voxel_material_indices,
 							voxel_material_weights,
 							output.texturing_data_2f32,
-							textures_ignore_air_voxels
+							textures_ignore_air_voxels,
+							surface_data,
+							surface_data.size() == voxels_count ? &output.surface_data : nullptr
 					),
 					lod_index,
 					cache,
@@ -1458,7 +1475,8 @@ void build_transition_mesh(
 		MeshArrays &output,
 		DefaultTextureIndicesData default_texture_indices_data,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels
+		const bool textures_ignore_air_voxels,
+		const bool surface_data_enabled
 ) {
 	ZN_PROFILE_SCOPE();
 	// From this point, we expect the buffer to contain allocated data in the relevant channels.
@@ -1502,11 +1520,21 @@ void build_transition_mesh(
 			);
 			ZN_ASSERT_RETURN(weights_data.u16_data.size() == voxels_count);
 
+			// Transition meshes are appended to the regular mesh, so only add surface data if it already has some,
+			// otherwise the array would not match the vertex count
+			const Span<const uint32_t> surface_data =
+					get_surface_data(voxels, surface_data_enabled && output.surface_data.size() == output.vertices.size());
+
 			build_transition_mesh_dispatch_sd(
 					voxels,
 					sdf_channel,
 					materials::mixel4::Processor<13>(
-							indices_data, weights_data, output.texturing_data_2f32, textures_ignore_air_voxels
+							indices_data,
+							weights_data,
+							output.texturing_data_2f32,
+							textures_ignore_air_voxels,
+							surface_data,
+							surface_data.size() == voxels_count ? &output.surface_data : nullptr
 					),
 					direction,
 					lod_index,

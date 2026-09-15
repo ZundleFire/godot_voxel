@@ -2149,6 +2149,9 @@ FORCEINLINE FCMaterialBlendResult FCTerrainMaterialBlend(
 	return Result;
 }
 
+// MPL-2.0 erosion filter, kept in its own file
+#include "voxel_erosion_filter_impl.h"
+
 #ifndef ISPC
 #undef uniform
 #undef varying

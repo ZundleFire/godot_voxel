@@ -124,6 +124,7 @@ public:
 		NODE_SPHERE_STAMP,
 		NODE_TERRAIN_RIVERS_2D,
 		NODE_TERRAIN_MATERIAL_BLEND,
+		NODE_PLANET_EROSION,
 
 	// Optional features down (to avoid diffs in docs when building both versions)
 	// Keep in mind this enum's values should not be used in persistent context (saves)

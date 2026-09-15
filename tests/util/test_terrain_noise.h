@@ -5,6 +5,7 @@ namespace zylann::voxel::tests {
 
 void test_terrain_noise_determinism();
 void test_terrain_noise_ranges();
+void test_planet_erosion();
 
 } // namespace zylann::voxel::tests
 

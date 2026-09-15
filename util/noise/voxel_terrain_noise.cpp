@@ -94,6 +94,16 @@ void terrain_material_blend_series(
 			out_snow_mask, count);
 }
 
+void planet_erosion_series(
+		const float *x, const float *y, const float *z,
+		float *out_height, float *out_ridge, float *out_erosion,
+		unsigned int count, const TerrainErosionParams &p) {
+	static_assert(sizeof(ispc::FCErosionParams) == sizeof(TerrainErosionParams));
+	ispc::VoxelPlanetErosion_Batch(
+			x, y, z, reinterpret_cast<const ispc::FCErosionParams *>(&p),
+			out_height, out_ridge, out_erosion, count);
+}
+
 } // namespace zylann::voxel
 
 #else // VOXEL_ISPC_ENABLED
@@ -229,6 +239,24 @@ void terrain_material_blend_series(
 		out_tundra_mask[i] = r.TundraMask;
 		out_mountain_mask[i] = r.MountainMask;
 		out_snow_mask[i] = r.SnowMask;
+	}
+}
+
+void planet_erosion_series(
+		const float *x, const float *y, const float *z,
+		float *out_height, float *out_ridge, float *out_erosion,
+		unsigned int count, const TerrainErosionParams &p) {
+	static_assert(sizeof(FCErosionParams) == sizeof(TerrainErosionParams));
+	const FCErosionParams &fp = reinterpret_cast<const FCErosionParams &>(p);
+	for (unsigned int i = 0; i < count; ++i) {
+		const FCErodedTerrain r = FCPlanetErosion(MakeFloat3(x[i], y[i], z[i]), fp);
+		out_height[i] = r.Height;
+		if (out_ridge != nullptr) {
+			out_ridge[i] = r.Ridge;
+		}
+		if (out_erosion != nullptr) {
+			out_erosion[i] = r.Erosion;
+		}
 	}
 }
 

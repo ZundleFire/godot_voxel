@@ -2,6 +2,15 @@
 #include "../../util/math/funcs.h"
 #include "../../util/noise/voxel_terrain_noise.h"
 #include "../../util/testing/test_macros.h"
+#include "../../util/io/log.h"
+#include "../../util/string/format.h"
+#include "../../util/thread/thread.h"
+#include "../../engine/voxel_engine.h"
+#include "../../generators/graph/voxel_generator_graph.h"
+#include "../../storage/voxel_buffer.h"
+#ifdef VOXEL_ENABLE_GPU
+#include "../../engine/gpu/compute_shader.h"
+#endif
 
 #include <cmath>
 #include <cstring>
@@ -153,6 +162,117 @@ void test_terrain_noise_ranges() {
 			0.f, 1.f, 0.f, 500.f, 0.3f, 0.f, 1000.f);
 	ZN_TEST_ASSERT(std::abs(sux - 0.5f) < 1e-4f && std::abs(suy - 0.5f) < 1e-4f);
 	ZN_TEST_ASSERT(ss > 0.999f);
+}
+
+void test_planet_erosion() {
+	const unsigned int count = 512;
+	std::vector<float> x, y, z;
+	fill_positions(x, y, z, count);
+
+	const TerrainErosionParams p = make_default_terrain_erosion_params();
+	const float max_h = get_terrain_erosion_max_height(p);
+
+	std::vector<float> height(count), ridge(count), erosion(count), again(count);
+	planet_erosion_series(x.data(), y.data(), z.data(), height.data(), ridge.data(), erosion.data(), count, p);
+	planet_erosion_series(x.data(), y.data(), z.data(), again.data(), nullptr, nullptr, count, p);
+	ZN_TEST_ASSERT(memcmp(height.data(), again.data(), count * sizeof(float)) == 0);
+
+	float min_h = max_h;
+	float max_seen_h = -max_h;
+	float sum_abs_h = 0.f;
+	for (unsigned int i = 0; i < count; ++i) {
+		ZN_TEST_ASSERT(std::isfinite(height[i]));
+		ZN_TEST_ASSERT(height[i] >= -max_h && height[i] <= max_h);
+		ZN_TEST_ASSERT(ridge[i] >= -1.f && ridge[i] <= 1.f);
+		ZN_TEST_ASSERT(erosion[i] >= 0.f && erosion[i] <= 1.f);
+		min_h = math::min(min_h, height[i]);
+		max_seen_h = math::max(max_seen_h, height[i]);
+		sum_abs_h += std::abs(height[i]);
+	}
+	print_line(format("PlanetErosion relief (m): min {} max {} mean|h| {} bound {}",
+			min_h, max_seen_h, sum_abs_h / count, max_h));
+
+	// Direction-only: scaling positions radially must not change the relief
+	std::vector<float> x2(count), y2(count), z2(count);
+	for (unsigned int i = 0; i < count; ++i) {
+		x2[i] = x[i] * 1.5f;
+		y2[i] = y[i] * 1.5f;
+		z2[i] = z[i] * 1.5f;
+	}
+	planet_erosion_series(x2.data(), y2.data(), z2.data(), again.data(), nullptr, nullptr, count, p);
+	for (unsigned int i = 0; i < count; ++i) {
+		ZN_TEST_ASSERT(std::abs(again[i] - height[i]) <= 1e-3f * max_h);
+	}
+
+	// Erosion must actually change the terrain
+	TerrainErosionParams flat = p;
+	flat.strength = 0.f;
+	planet_erosion_series(x.data(), y.data(), z.data(), again.data(), nullptr, nullptr, count, flat);
+	ZN_TEST_ASSERT(memcmp(height.data(), again.data(), count * sizeof(float)) != 0);
+
+	// Graph node: SDF = altitude - erosion height, must match the direct kernel
+	Ref<VoxelGeneratorGraph> generator;
+	generator.instantiate();
+	{
+		pg::VoxelGraphFunction &g = **generator->get_main_function();
+		const uint32_t n_x = g.create_node(pg::VoxelGraphFunction::NODE_INPUT_X, Vector2());
+		const uint32_t n_y = g.create_node(pg::VoxelGraphFunction::NODE_INPUT_Y, Vector2());
+		const uint32_t n_z = g.create_node(pg::VoxelGraphFunction::NODE_INPUT_Z, Vector2());
+		const uint32_t n_alt = g.create_node(pg::VoxelGraphFunction::NODE_PLANET_ALTITUDE, Vector2());
+		const uint32_t n_ero = g.create_node(pg::VoxelGraphFunction::NODE_PLANET_EROSION, Vector2());
+		const uint32_t n_sub = g.create_node(pg::VoxelGraphFunction::NODE_SUBTRACT, Vector2());
+		const uint32_t n_out = g.create_node(pg::VoxelGraphFunction::NODE_OUTPUT_SDF, Vector2());
+		for (uint32_t n : { n_alt, n_ero }) {
+			g.add_connection(n_x, 0, n, 0);
+			g.add_connection(n_y, 0, n, 1);
+			g.add_connection(n_z, 0, n, 2);
+		}
+		g.set_node_param(n_alt, 0, p.planet_radius);
+		g.add_connection(n_alt, 0, n_sub, 0);
+		g.add_connection(n_ero, 0, n_sub, 1);
+		g.add_connection(n_sub, 0, n_out, 0);
+		const pg::CompilationResult result = generator->compile(false);
+		if (!result.success) {
+			ZN_PRINT_ERROR(result.message.utf8().get_data());
+		}
+		ZN_TEST_ASSERT(result.success);
+	}
+	{
+		// Land near the surface so the SDF isn't clipped
+		const float dx = 0.36f, dy = 0.8f, dz = 0.48f;
+		float h;
+		planet_erosion_series(&dx, &dy, &dz, &h, nullptr, nullptr, 1, p);
+		const float r = p.planet_radius + h;
+		const Vector3i pos(Math::round(dx * r), Math::round(dy * r), Math::round(dz * r));
+		const float px = pos.x, py = pos.y, pz = pos.z;
+		float hp;
+		planet_erosion_series(&px, &py, &pz, &hp, nullptr, nullptr, 1, p);
+		const float expected = Math::sqrt(px * px + py * py + pz * pz) - p.planet_radius - hp;
+		const float sdf = generator->generate_single(pos, VoxelBuffer::CHANNEL_SDF).f;
+		ZN_TEST_ASSERT(std::abs(sdf - expected) < 0.05f);
+	}
+
+#ifdef VOXEL_ENABLE_GPU
+	// GLSL twin must compile
+	VoxelEngine::get_singleton().try_initialize_gpu_features();
+	// The device is created asynchronously on the GPU task thread
+	for (int i = 0; i < 3000 && !VoxelEngine::get_singleton().has_rendering_device(); ++i) {
+		Thread::sleep_usec(1000);
+	}
+	if (VoxelEngine::get_singleton().has_rendering_device()) {
+		generator->compile_shaders();
+		const std::shared_ptr<ComputeShader> shader = generator->get_block_rendering_shader();
+		ZN_TEST_ASSERT(shader != nullptr);
+		// Compiled asynchronously on the GPU task thread
+		for (int i = 0; i < 60000 && !shader->is_compilation_complete(); ++i) {
+			Thread::sleep_usec(1000);
+		}
+		ZN_TEST_ASSERT(shader->is_compilation_complete());
+		ZN_TEST_ASSERT(shader->is_valid());
+	} else {
+		ZN_PRINT_WARNING("No RenderingDevice, skipping PlanetErosion shader compilation check");
+	}
+#endif
 }
 
 } // namespace zylann::voxel::tests

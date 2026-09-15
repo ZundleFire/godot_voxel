@@ -82,6 +82,9 @@ int VoxelMesherTransvoxel::get_used_channels_mask() const {
 			break;
 		case TEXTURES_BLEND_4_OVER_16:
 			mask |= (1 << VoxelBuffer::CHANNEL_INDICES) | (1 << VoxelBuffer::CHANNEL_WEIGHTS);
+			if (_surface_data_enabled) {
+				mask |= (1 << VoxelBuffer::CHANNEL_DATA6);
+			}
 			break;
 		case TEXTURES_SINGLE_S4:
 			mask |= (1 << VoxelBuffer::CHANNEL_INDICES);
@@ -134,6 +137,13 @@ void fill_surface_arrays(Array &arrays, const transvoxel::MeshArrays &src) {
 		texturing_data.resize(src.texturing_data_2f32.size() * 2);
 		memcpy(texturing_data.ptrw(), src.texturing_data_2f32.data(), texturing_data.size() * sizeof(float));
 		arrays[Mesh::ARRAY_CUSTOM1] = texturing_data;
+	}
+
+	if (src.surface_data.size() == src.vertices.size() && src.surface_data.size() != 0) {
+		PackedByteArray surface_data;
+		surface_data.resize(src.surface_data.size() * 4);
+		memcpy(surface_data.ptrw(), src.surface_data.data(), surface_data.size());
+		arrays[Mesh::ARRAY_CUSTOM2] = surface_data;
 	}
 
 	arrays[Mesh::ARRAY_CUSTOM0] = lod_data;
@@ -220,6 +230,7 @@ void simplify(
 	remap_vertex_array(src_mesh.lod_data, dst_mesh.lod_data, remap_indices, unique_vertex_count);
 	remap_vertex_array(src_mesh.texturing_data_1f32, dst_mesh.texturing_data_1f32, remap_indices, unique_vertex_count);
 	remap_vertex_array(src_mesh.texturing_data_2f32, dst_mesh.texturing_data_2f32, remap_indices, unique_vertex_count);
+	remap_vertex_array(src_mesh.surface_data, dst_mesh.surface_data, remap_indices, unique_vertex_count);
 
 	dst_mesh.indices.resize(lod_indices.size());
 	// TODO Not sure if arguments are correct
@@ -327,7 +338,8 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 			mesh_arrays,
 			cell_infos,
 			_edge_clamp_margin,
-			_textures_ignore_air_voxels
+			_textures_ignore_air_voxels,
+			_surface_data_enabled
 	);
 
 	if (mesh_arrays.vertices.size() == 0) {
@@ -375,7 +387,8 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 					*combined_mesh_arrays,
 					default_texture_indices_data,
 					_edge_clamp_margin,
-					_textures_ignore_air_voxels
+					_textures_ignore_air_voxels,
+					_surface_data_enabled
 			);
 		}
 	}
@@ -403,6 +416,9 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 		default:
 			ZN_PRINT_ERROR("Unhandled texture mode");
 			break;
+	}
+	if (combined_mesh_arrays->surface_data.size() == combined_mesh_arrays->vertices.size()) {
+		output.mesh_flags |= (RenderingServerEnums::ARRAY_CUSTOM_RGBA8_UNORM << Mesh::ARRAY_FORMAT_CUSTOM2_SHIFT);
 	}
 }
 
@@ -470,6 +486,14 @@ bool VoxelMesherTransvoxel::get_textures_ignore_air_voxels() const {
 	return _textures_ignore_air_voxels;
 }
 
+void VoxelMesherTransvoxel::set_surface_data_enabled(const bool enable) {
+	_surface_data_enabled = enable;
+}
+
+bool VoxelMesherTransvoxel::get_surface_data_enabled() const {
+	return _surface_data_enabled;
+}
+
 void VoxelMesherTransvoxel::set_mesh_optimization_enabled(bool enabled) {
 	_mesh_optimization_params.enabled = enabled;
 }
@@ -525,6 +549,9 @@ void VoxelMesherTransvoxel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_textures_ignore_air_voxels", "enabled"), &Self::set_textures_ignore_air_voxels);
 	ClassDB::bind_method(D_METHOD("get_textures_ignore_air_voxels"), &Self::get_textures_ignore_air_voxels);
 
+	ClassDB::bind_method(D_METHOD("set_surface_data_enabled", "enabled"), &Self::set_surface_data_enabled);
+	ClassDB::bind_method(D_METHOD("get_surface_data_enabled"), &Self::get_surface_data_enabled);
+
 	ClassDB::bind_method(D_METHOD("set_mesh_optimization_enabled", "enabled"), &Self::set_mesh_optimization_enabled);
 	ClassDB::bind_method(D_METHOD("is_mesh_optimization_enabled"), &Self::is_mesh_optimization_enabled);
 
@@ -558,6 +585,10 @@ void VoxelMesherTransvoxel::_bind_methods() {
 			PropertyInfo(Variant::BOOL, "textures_ignore_air_voxels"),
 			"set_textures_ignore_air_voxels",
 			"get_textures_ignore_air_voxels"
+	);
+
+	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "surface_data_enabled"), "set_surface_data_enabled", "get_surface_data_enabled"
 	);
 
 	ADD_GROUP("Mesh optimization", "mesh_optimization_");

@@ -173,6 +173,7 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_voxel_graph_constant_reduction);
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 	VOXEL_TEST(test_transvoxel_issue772);
+	VOXEL_TEST(test_transvoxel_surface_data);
 #endif
 #ifdef VOXEL_ENABLE_INSTANCER
 	VOXEL_TEST(test_instance_generator_material_filter_issue774);
@@ -180,6 +181,7 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_spot_noise);
 	VOXEL_TEST(test_terrain_noise_determinism);
 	VOXEL_TEST(test_terrain_noise_ranges);
+	VOXEL_TEST(test_planet_erosion);
 	VOXEL_TEST(test_voxel_graph_multiple_function_instances);
 	VOXEL_TEST(test_voxel_graph_issue783);
 	VOXEL_TEST(test_voxel_graph_broad_block);

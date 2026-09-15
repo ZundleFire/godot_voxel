@@ -43,6 +43,10 @@ public:
 	void set_textures_ignore_air_voxels(const bool enable);
 	bool get_textures_ignore_air_voxels() const;
 
+	// EDEN FORK: with Mixel4 texturing, outputs CHANNEL_DATA6 (32-bit, 4 packed unorm bytes) as CUSTOM2 RGBA8
+	void set_surface_data_enabled(const bool enable);
+	bool get_surface_data_enabled() const;
+
 	void set_mesh_optimization_enabled(bool enabled);
 	bool is_mesh_optimization_enabled() const;
 
@@ -104,6 +108,8 @@ private:
 	bool _transitions_enabled = true;
 
 	bool _textures_ignore_air_voxels = false;
+
+	bool _surface_data_enabled = false;
 };
 
 } // namespace zylann::voxel

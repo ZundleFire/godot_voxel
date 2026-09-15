@@ -12,9 +12,58 @@
 #include "../../../util/profiling.h"
 #include "../node_type_db.h"
 
+#include <cstddef>
+#include <iterator>
+
+#ifdef VOXEL_ENABLE_GPU
+#include "../../../util/noise/voxel_erosion_filter_glsl.h"
+#endif
+
 namespace zylann::voxel::pg {
 
 namespace {
+
+// PlanetErosion params map 1:1 to TerrainErosionParams fields, in declaration order
+struct ErosionParamField {
+	const char *name;
+	uint32_t offset;
+	bool is_int;
+};
+
+#define EROSION_FIELD(name, is_int) { #name, offsetof(TerrainErosionParams, name), is_int }
+static const ErosionParamField g_erosion_param_fields[] = {
+	EROSION_FIELD(seed, true),
+	EROSION_FIELD(planet_radius, false),
+	EROSION_FIELD(tile_size, false),
+	EROSION_FIELD(triplanar_sharpness, false),
+	EROSION_FIELD(height_frequency, false),
+	EROSION_FIELD(height_amp, false),
+	EROSION_FIELD(height_octaves, true),
+	EROSION_FIELD(height_lacunarity, false),
+	EROSION_FIELD(height_gain, false),
+	EROSION_FIELD(scale, false),
+	EROSION_FIELD(strength, false),
+	EROSION_FIELD(gully_weight, false),
+	EROSION_FIELD(detail, false),
+	EROSION_FIELD(rounding_ridge, false),
+	EROSION_FIELD(rounding_crease, false),
+	EROSION_FIELD(rounding_input_mult, false),
+	EROSION_FIELD(rounding_octave_mult, false),
+	EROSION_FIELD(onset_initial, false),
+	EROSION_FIELD(onset_octave, false),
+	EROSION_FIELD(ridge_onset_initial, false),
+	EROSION_FIELD(ridge_onset_octave, false),
+	EROSION_FIELD(assumed_slope, false),
+	EROSION_FIELD(assumed_slope_blend, false),
+	EROSION_FIELD(cell_scale, false),
+	EROSION_FIELD(normalization, false),
+	EROSION_FIELD(octaves, true),
+	EROSION_FIELD(lacunarity, false),
+	EROSION_FIELD(gain, false),
+	EROSION_FIELD(height_offset, false),
+	EROSION_FIELD(height_offset_fade_blend, false),
+};
+#undef EROSION_FIELD
 
 // Shared by InfiniteTerrain2D/3D registrations
 inline void add_terrain_height_params(NodeType &t) {
@@ -406,6 +455,103 @@ void register_terrain_diffusion_nodes(Span<NodeType> types) {
 				ctx.set_output(i, Interval(0.f, 1.f));
 			}
 		};
+	}
+	{
+		NodeType &t = types[VoxelGraphFunction::NODE_PLANET_EROSION];
+		t.name = "PlanetErosion";
+		t.category = CATEGORY_GENERATE;
+		t.inputs.push_back(NodeType::Port("x", 0.f, VoxelGraphFunction::AUTO_CONNECT_X));
+		t.inputs.push_back(NodeType::Port("y", 0.f, VoxelGraphFunction::AUTO_CONNECT_Y));
+		t.inputs.push_back(NodeType::Port("z", 0.f, VoxelGraphFunction::AUTO_CONNECT_Z));
+		t.outputs.push_back(NodeType::Port("height"));
+		t.outputs.push_back(NodeType::Port("ridge"));
+		t.outputs.push_back(NodeType::Port("erosion"));
+		{
+			const TerrainErosionParams defaults = make_default_terrain_erosion_params();
+			for (const ErosionParamField &f : g_erosion_param_fields) {
+				const char *field = reinterpret_cast<const char *>(&defaults) + f.offset;
+				if (f.is_int) {
+					t.params.push_back(NodeType::Param(f.name, Variant::INT, *reinterpret_cast<const int32_t *>(field)));
+				} else {
+					t.params.push_back(NodeType::Param(f.name, Variant::FLOAT, *reinterpret_cast<const float *>(field)));
+				}
+			}
+		}
+
+		t.compile_func = [](CompileContext &ctx) {
+			TerrainErosionParams p = make_default_terrain_erosion_params();
+			for (unsigned int i = 0; i < std::size(g_erosion_param_fields); ++i) {
+				const ErosionParamField &f = g_erosion_param_fields[i];
+				char *field = reinterpret_cast<char *>(&p) + f.offset;
+				if (f.is_int) {
+					*reinterpret_cast<int32_t *>(field) = int(ctx.get_param(i));
+				} else {
+					*reinterpret_cast<float *>(field) = float(ctx.get_param(i));
+				}
+			}
+			p.height_octaves = math::clamp(p.height_octaves, 0, 16);
+			p.octaves = math::clamp(p.octaves, 0, 16);
+			if (p.tile_size <= 0.f || p.scale <= 0.f || p.cell_scale <= 0.f) {
+				ctx.make_error("tile_size, scale and cell_scale must be > 0");
+				return;
+			}
+			ctx.set_params(p);
+		};
+
+		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
+			ZN_PROFILE_SCOPE_NAMED("NODE_PLANET_EROSION");
+			const Runtime::Buffer &x = ctx.get_input(0);
+			const Runtime::Buffer &y = ctx.get_input(1);
+			const Runtime::Buffer &z = ctx.get_input(2);
+			Runtime::Buffer &height = ctx.get_output(0);
+			Runtime::Buffer &ridge = ctx.get_output(1);
+			Runtime::Buffer &erosion = ctx.get_output(2);
+			const TerrainErosionParams p = ctx.get_params<TerrainErosionParams>();
+			planet_erosion_series(x.data, y.data, z.data, height.data, ridge.data, erosion.data, height.size, p);
+		};
+
+		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
+			const TerrainErosionParams p = ctx.get_params<TerrainErosionParams>();
+			const float h = get_terrain_erosion_max_height(p);
+			ctx.set_output(0, Interval(-h, h));
+			ctx.set_output(1, Interval(-1.f, 1.f));
+			ctx.set_output(2, Interval(0.f, 1.f));
+		};
+
+#ifdef VOXEL_ENABLE_GPU
+		t.shader_gen_func = [](ShaderGenContext &ctx) {
+			ctx.require_lib_code("vg_erosion_filter", g_erosion_filter_shader);
+			const char *out = ctx.get_output_name(0);
+			ctx.add_format("VgErosionParams {}_prm = VgErosionParams(", out);
+			for (unsigned int i = 0; i < std::size(g_erosion_param_fields); ++i) {
+				if (i > 0) {
+					ctx.add_format("{}", ", ");
+				}
+				if (g_erosion_param_fields[i].is_int) {
+					ctx.add_format("{}", int(ctx.get_param(i)));
+				} else {
+					ctx.add_format("{}", float(ctx.get_param(i)));
+				}
+			}
+			ctx.add_format(
+					");\n"
+					"vec3 {}_r = vg_planet_erosion(vec3({}, {}, {}), {}_prm);\n"
+					"{} = {}_r.x;\n"
+					"{} = {}_r.y;\n"
+					"{} = {}_r.z;\n",
+					out,
+					ctx.get_input_name(0),
+					ctx.get_input_name(1),
+					ctx.get_input_name(2),
+					out,
+					ctx.get_output_name(0),
+					out,
+					ctx.get_output_name(1),
+					out,
+					ctx.get_output_name(2),
+					out);
+		};
+#endif
 	}
 }
 

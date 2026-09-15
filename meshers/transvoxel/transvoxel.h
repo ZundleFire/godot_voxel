@@ -75,6 +75,9 @@ struct MeshArrays {
 	StdVector<float> texturing_data_1f32;
 	StdVector<Vector2f> texturing_data_2f32;
 
+	// EDEN FORK: optional packed RGBA8 per vertex from CHANNEL_DATA6 (see mixel4::Processor)
+	StdVector<uint32_t> surface_data;
+
 	StdVector<int32_t> indices;
 
 	void clear() {
@@ -83,6 +86,7 @@ struct MeshArrays {
 		lod_data.clear();
 		texturing_data_1f32.clear();
 		texturing_data_2f32.clear();
+		surface_data.clear();
 		indices.clear();
 	}
 
@@ -178,7 +182,9 @@ DefaultTextureIndicesData build_regular_mesh(
 		MeshArrays &output,
 		StdVector<CellInfo> *cell_infos,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels
+		const bool textures_ignore_air_voxels,
+		// Only supported with TEXTURES_MIXEL4_S4
+		const bool surface_data_enabled = false
 );
 
 void build_transition_mesh(
@@ -191,7 +197,9 @@ void build_transition_mesh(
 		MeshArrays &output,
 		DefaultTextureIndicesData default_texture_indices_data,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels
+		const bool textures_ignore_air_voxels,
+		// Only supported with TEXTURES_MIXEL4_S4
+		const bool surface_data_enabled = false
 );
 
 } // namespace zylann::voxel::transvoxel

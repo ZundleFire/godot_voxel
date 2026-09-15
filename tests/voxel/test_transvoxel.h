@@ -4,6 +4,7 @@
 namespace zylann::voxel::tests {
 
 void test_transvoxel_issue772();
+void test_transvoxel_surface_data();
 
 } // namespace zylann::voxel::tests
 

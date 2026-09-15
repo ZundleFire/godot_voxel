@@ -188,6 +188,18 @@ inline uint16_t reorder_transition_case_code(const uint16_t case_code) {
 	return alt_case_code;
 }
 
+// EDEN FORK: optional per-vertex surface data. Each voxel of `voxel_surface_data` (CHANNEL_DATA6, 32-bit) holds 4
+// packed unorm bytes, interpolated along the vertex edge like material weights and output as mesh CUSTOM2 (RGBA8).
+inline uint32_t lerp_packed_4u8(const uint32_t a, const uint32_t b, const float alpha) {
+	uint32_t r = 0;
+	for (unsigned int shift = 0; shift < 32; shift += 8) {
+		const float ca = float((a >> shift) & 0xff);
+		const float cb = float((b >> shift) & 0xff);
+		r |= uint32_t(math::clamp(Math::lerp(ca, cb, alpha) + 0.5f, 0.f, 255.f)) << shift;
+	}
+	return r;
+}
+
 template <unsigned int NVoxels>
 struct Processor {
 	const TextureIndicesData voxel_material_indices;
@@ -195,19 +207,32 @@ struct Processor {
 	const bool textures_skip_air_voxels;
 	CellTextureDatas<NVoxels> cell_textures;
 	StdVector<Vector2f> &output_mesh_material_data;
+	// Surface data is off when output_surface_data is null
+	const Span<const uint32_t> voxel_surface_data;
+	StdVector<uint32_t> *output_surface_data;
+	FixedArray<uint32_t, NVoxels> cell_surface_data;
 
 	Processor(
 			const TextureIndicesData p_voxel_material_indices,
 			const WeightSamplerPackedU16 p_voxel_material_weights,
 			StdVector<Vector2f> &p_output_mesh_material_data,
-			const bool p_textures_skip_air_voxels
+			const bool p_textures_skip_air_voxels,
+			const Span<const uint32_t> p_voxel_surface_data = Span<const uint32_t>(),
+			StdVector<uint32_t> *p_output_surface_data = nullptr
 	) :
 			voxel_material_indices(p_voxel_material_indices),
 			voxel_material_weights(p_voxel_material_weights),
 			textures_skip_air_voxels(p_textures_skip_air_voxels),
-			output_mesh_material_data(p_output_mesh_material_data) {}
+			output_mesh_material_data(p_output_mesh_material_data),
+			voxel_surface_data(p_voxel_surface_data),
+			output_surface_data(p_output_surface_data) {}
 
 	inline uint32_t on_cell(const FixedArray<uint32_t, NVoxels> &corner_voxel_indices, const uint8_t case_code) {
+		if (output_surface_data != nullptr) {
+			for (unsigned int i = 0; i < NVoxels; ++i) {
+				cell_surface_data[i] = voxel_surface_data[corner_voxel_indices[i]];
+			}
+		}
 		get_cell_texture_data(
 				cell_textures,
 				voxel_material_indices,
@@ -221,6 +246,14 @@ struct Processor {
 
 	inline uint32_t on_transition_cell(const FixedArray<uint32_t, 9> &corner_voxel_indices, const uint8_t case_code) {
 		const uint16_t alt_case_code = textures_skip_air_voxels ? reorder_transition_case_code(case_code) : 0;
+
+		if (output_surface_data != nullptr) {
+			FixedArray<uint32_t, 9> partial;
+			for (unsigned int i = 0; i < partial.size(); ++i) {
+				partial[i] = voxel_surface_data[corner_voxel_indices[i]];
+			}
+			fill_redundant_transition_cell_values(partial, cell_surface_data);
+		}
 
 		// Get values from 9 significant corners
 		CellTextureDatas<9> cell_textures_partial;
@@ -250,6 +283,9 @@ struct Processor {
 			weights[i] = static_cast<uint8_t>(math::clamp(Math::lerp(weights0[i], weights1[i], alpha), 0.f, 255.f));
 		}
 		add_4i8_4w8_texture_data(output_mesh_material_data, cell_textures.packed_indices, weights);
+		if (output_surface_data != nullptr) {
+			output_surface_data->push_back(lerp_packed_4u8(cell_surface_data[v0], cell_surface_data[v1], alpha));
+		}
 	}
 };
 

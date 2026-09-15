@@ -62,6 +62,72 @@ struct TerrainRiversParams {
 	int32_t seed;
 };
 
+// Advanced erosion filter on a sphere (voxel_erosion_filter_impl.h, MPL-2.0).
+// Layout must match FCErosionParams. Units are "filter units" (tile_size world units each)
+// except seed/planet_radius/tile_size.
+struct TerrainErosionParams {
+	int32_t seed;
+	float planet_radius;
+	float tile_size;
+	float triplanar_sharpness;
+	float height_frequency;
+	float height_amp;
+	int32_t height_octaves;
+	float height_lacunarity;
+	float height_gain;
+	float scale;
+	float strength;
+	float gully_weight;
+	float detail;
+	float rounding_ridge;
+	float rounding_crease;
+	float rounding_input_mult;
+	float rounding_octave_mult;
+	float onset_initial;
+	float onset_octave;
+	float ridge_onset_initial;
+	float ridge_onset_octave;
+	float assumed_slope;
+	float assumed_slope_blend;
+	float cell_scale;
+	float normalization;
+	int32_t octaves;
+	float lacunarity;
+	float gain;
+	float height_offset; // -1 only lowers .. 1 only raises, scaled by erosion magnitude
+	float height_offset_fade_blend;
+};
+
+// Shader defaults, scaled for a 40 km planet
+inline TerrainErosionParams make_default_terrain_erosion_params() {
+	return TerrainErosionParams{ 1337, 40000.f, 16000.f, 4.f, //
+		3.f, 0.125f, 3, 2.f, 0.1f, //
+		0.15f, 0.22f, 0.5f, 1.5f, //
+		0.1f, 0.f, 0.1f, 2.f, //
+		1.25f, 1.25f, 2.8f, 1.5f, //
+		0.7f, 1.f, 0.7f, 0.5f, //
+		5, 2.f, 0.5f, -0.65f, 0.f };
+}
+
+// Worst-case |height| in world units, for range analysis and shell culling
+inline float get_terrain_erosion_max_height(const TerrainErosionParams &p) {
+	float base = 0.f;
+	float amp = 1.f;
+	for (int i = 0; i < p.height_octaves; ++i) {
+		base += amp;
+		amp *= p.height_gain < 0.f ? -p.height_gain : p.height_gain;
+	}
+	float magnitude = 0.f;
+	float strength = (p.strength < 0.f ? -p.strength : p.strength) * p.scale;
+	for (int i = 0; i < p.octaves; ++i) {
+		magnitude += strength;
+		strength *= p.gain < 0.f ? -p.gain : p.gain;
+	}
+	const float offset = p.height_offset < 0.f ? -p.height_offset : p.height_offset;
+	const float h = base * p.height_amp * 0.5f + magnitude * (1.f + (offset > 1.f ? offset : 1.f));
+	return (h < 0.f ? -h : h) * p.tile_size;
+}
+
 inline TerrainShapingParams make_default_terrain_shaping_params() {
 	return TerrainShapingParams{ 0.f, 500.f, 0.f, 2000.f, 0.f, 8000.f, 0.f, 0.f, 1500.f, 0.f, 8.f };
 }
@@ -122,6 +188,14 @@ void terrain_material_blend_series(
 		float *out_river_feature_mask, float *out_vegetation_mask, float *out_desert_mask,
 		float *out_tundra_mask, float *out_mountain_mask, float *out_snow_mask,
 		unsigned int count, float sea_level, float biome_contrast);
+
+// Eroded relief sampled by direction from the planet center (altitude-independent).
+// out_height: world units centered on 0; out_ridge: -1 creases .. 1 ridges;
+// out_erosion: 0..1, 0.5 = untouched. out_ridge/out_erosion may be null.
+void planet_erosion_series(
+		const float *x, const float *y, const float *z,
+		float *out_height, float *out_ridge, float *out_erosion,
+		unsigned int count, const TerrainErosionParams &p);
 
 } // namespace zylann::voxel
 

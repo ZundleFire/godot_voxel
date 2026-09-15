@@ -331,3 +331,30 @@ export void VoxelTerrainMaterialBlend_Batch(
 		out_snow_mask[index] = r.SnowMask;
 	}
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// Advanced erosion filter on a sphere (voxel_erosion_filter_impl.h, MPL-2.0)
+///////////////////////////////////////////////////////////////////////////////
+
+export void VoxelPlanetErosion_Batch(
+		const uniform float pos_x[],
+		const uniform float pos_y[],
+		const uniform float pos_z[],
+		const uniform FCErosionParams * uniform params,
+		uniform float * uniform out_height,
+		uniform float * uniform out_ridge,
+		uniform float * uniform out_erosion,
+		const uniform int32 count) {
+	const uniform bool want_ridge = out_ridge != NULL;
+	const uniform bool want_erosion = out_erosion != NULL;
+	foreach (index = 0 ... count) {
+		const FCErodedTerrain r = FCPlanetErosion(MakeFloat3(pos_x[index], pos_y[index], pos_z[index]), *params);
+		out_height[index] = r.Height;
+		if (want_ridge) {
+			out_ridge[index] = r.Ridge;
+		}
+		if (want_erosion) {
+			out_erosion[index] = r.Erosion;
+		}
+	}
+}
