@@ -124,6 +124,27 @@ void VoxelFormat::_bind_methods() {
 			"get_channel_depth",
 			VoxelBuffer::CHANNEL_COLOR
 	);
+	// EDEN FORK: the general-purpose channels were only settable with set_channel_depth() from code, yet features use
+	// them at specific depths: DATA5 carries water mass (VoxelWaterSimulator) and DATA6 needs 32 bits for Transvoxel
+	// surface data (see VoxelMesherTransvoxel.surface_data_enabled).
+	ADD_PROPERTYI(
+			PropertyInfo(Variant::INT, "data5_depth", PROPERTY_HINT_ENUM, depth_hint_string, PROPERTY_USAGE_EDITOR),
+			"set_channel_depth",
+			"get_channel_depth",
+			VoxelBuffer::CHANNEL_DATA5
+	);
+	ADD_PROPERTYI(
+			PropertyInfo(Variant::INT, "data6_depth", PROPERTY_HINT_ENUM, depth_hint_string, PROPERTY_USAGE_EDITOR),
+			"set_channel_depth",
+			"get_channel_depth",
+			VoxelBuffer::CHANNEL_DATA6
+	);
+	ADD_PROPERTYI(
+			PropertyInfo(Variant::INT, "data7_depth", PROPERTY_HINT_ENUM, depth_hint_string, PROPERTY_USAGE_EDITOR),
+			"set_channel_depth",
+			"get_channel_depth",
+			VoxelBuffer::CHANNEL_DATA7
+	);
 }
 
 } // namespace zylann::voxel::godot
