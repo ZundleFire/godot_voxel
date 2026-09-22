@@ -37,6 +37,10 @@ public:
 	static const char *SIGNAL_NODE_NAME_CHANGED;
 	static const char *SIGNAL_COMPILED;
 
+	// How many (material, weight) slots NODE_MATERIAL_MIXER exposes. Capped well under the 16 voxel
+	// weight layers a material chain can expand into (see MaterialLayerWeights).
+	static const unsigned int MATERIAL_MIXER_SLOT_COUNT = 8;
+
 	// Node indexes within the DB.
 	// Don't use these in saved data,
 	// they can change depending on which features the module is compiled with.
@@ -97,6 +101,7 @@ public:
 		NODE_MATERIAL_SWITCH,
 		NODE_MATERIAL_PROPERTY_OVERRIDE,
 		NODE_MATERIAL_STACK,
+		NODE_MATERIAL_MIXER,
 		NODE_EXPRESSION,
 		NODE_POWI, // pow(x, constant positive integer)
 		NODE_POW, // pow(x, y)

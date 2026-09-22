@@ -1250,6 +1250,7 @@ void VoxelLodTerrain::_notification(int p_what) {
 				_debug_renderer.set_world(is_visible_in_tree() ? world : nullptr);
 			}
 #endif
+			_far_renderer.set_world(world);
 			// DEBUG
 			// set_show_gizmos(true);
 		} break;
@@ -1262,6 +1263,7 @@ void VoxelLodTerrain::_notification(int p_what) {
 					block.set_world(nullptr);
 				});
 			}
+			_far_renderer.set_world(nullptr);
 #ifdef TOOLS_ENABLED
 			_debug_renderer.set_world(nullptr);
 #endif
@@ -1270,6 +1272,8 @@ void VoxelLodTerrain::_notification(int p_what) {
 		case NOTIFICATION_VISIBILITY_CHANGED: {
 			const bool visible = is_visible();
 			VoxelLodTerrainUpdateData::State &state = _update_data->state;
+
+			_far_renderer.set_visible(visible);
 
 			for (unsigned int lod_index = 0; lod_index < state.lods.size(); ++lod_index) {
 				VoxelMeshMap<VoxelMeshBlockVLT> &mesh_map = _mesh_maps_per_lod[lod_index];
@@ -1396,6 +1400,10 @@ void VoxelLodTerrain::process(float delta) {
 		ZN_PROFILE_SCOPE();
 
 		apply_main_thread_update_tasks();
+
+		// The far field is driven off the same update task, so it is applied
+		// here where that task's results are known to be settled.
+		process_far_field();
 
 		// Get viewer location in voxel space
 		const Vector3 viewer_pos = get_local_viewer_pos();
@@ -1867,15 +1875,26 @@ void VoxelLodTerrain::apply_data_block_response(VoxelEngine::BlockDataOutput &ob
 			}
 		}
 		if (!was_loading) {
-			// That block was not requested, or is no longer needed. drop it...
-			ZN_PRINT_VERBOSE(
-					format("Ignoring block {} lod {}, it was not in loading blocks (terrain {})",
-						   ob.position,
-						   static_cast<int>(ob.lod_index),
-						   this)
-			);
-			++_stats.dropped_block_loads;
-			return;
+			// That block was not requested anymore by the time its (already in-flight)
+			// generation/load task completed -- typically because a moving viewer's data box
+			// slid past this position before the async task finished. Normally there is no point
+			// keeping it since nobody wants it. But if cache_generated_blocks is enabled, the
+			// caller (e.g. VoxelWaterSimulator, which depends on real persisted LOD0 data
+			// regardless of transient viewer coverage) explicitly wants every generated block
+			// kept -- dropping it here would silently discard real, already-computed generator
+			// output for no benefit (the work is already done).
+			const bool keep_anyway = _update_data->settings.cache_generated_blocks &&
+					ob.type == VoxelEngine::BlockDataOutput::TYPE_GENERATED && !ob.dropped;
+			if (!keep_anyway) {
+				ZN_PRINT_VERBOSE(
+						format("Ignoring block {} lod {}, it was not in loading blocks (terrain {})",
+							   ob.position,
+							   static_cast<int>(ob.lod_index),
+							   this)
+				);
+				++_stats.dropped_block_loads;
+				return;
+			}
 		}
 	}
 
@@ -3978,6 +3997,306 @@ bool VoxelLodTerrain::_b_is_area_meshed(AABB aabb, int lod_index) const {
 	return is_area_meshed(Box3i(aabb.position, aabb.size), lod_index);
 }
 
+
+// ---------------------------------------------------------------------------
+// Far field
+//
+// Main-thread half. The update thread decides which sectors exist
+// (`voxel_lod_terrain_update_far_streaming.cpp`); this side turns the results
+// into meshes and keeps visibility in step.
+// ---------------------------------------------------------------------------
+
+void VoxelLodTerrain::apply_far_restart() {
+	VoxelLodTerrainUpdateData::FarStreamingState &far = _update_data->state.far_streaming;
+
+	_far_renderer.destroy_all();
+	far.lod_tree.clear();
+	// Invalidate the configuration cache so the next update reconfigures.
+	far.configured = far::FarLodSettings();
+	far.configured.lod_count = 0;
+
+	// A fresh shared state rather than reusing the old one: results from the
+	// previous configuration may still be in flight, and the generation counter
+	// alone would let them through if the counter happened to wrap.
+	if (far.shared != nullptr) {
+		far.shared->shutting_down.store(true, std::memory_order_relaxed);
+		far.shared->generation.fetch_add(1, std::memory_order_relaxed);
+		far.shared->results.clear();
+	}
+	far.shared = std::make_shared<far::FarSharedState>();
+
+	if (_far_cache_enabled) {
+		far.cache = std::make_shared<far::FarCache>();
+		if (!far.cache->open(_far_cache_directory)) {
+			ZN_PRINT_WARNING("VoxelLodTerrain: far cache could not be opened, running without it");
+			far.cache.reset();
+		} else if (_far_clear_cache_on_restart) {
+			far.cache->clear_all();
+		}
+	} else {
+		far.cache.reset();
+	}
+
+	_far_clear_cache_on_restart = false;
+	_far_needs_restart = false;
+}
+
+void VoxelLodTerrain::process_far_field() {
+	ZN_PROFILE_SCOPE();
+
+	VoxelLodTerrainUpdateData::FarStreamingState &far = _update_data->state.far_streaming;
+
+	if (!_update_data->settings.far_enabled) {
+		if (_far_renderer.get_sector_count() > 0) {
+			_far_renderer.destroy_all();
+		}
+		return;
+	}
+
+	if (_far_needs_restart || far.shared == nullptr) {
+		apply_far_restart();
+	}
+
+	// Reached only while the update task is idle, so reading the LOD tree here
+	// needs no lock.
+	_far_renderer.reconcile(far.lod_tree);
+
+	_far_renderer.set_world(*get_world_3d());
+	_far_renderer.drain_results(
+			*far.shared, far.lod_tree, get_global_transform(), _update_data->settings.far_max_uploads_per_frame);
+	_far_renderer.refresh_visibility(far.lod_tree, far.viewer_position);
+}
+
+void VoxelLodTerrain::set_far_enabled(bool enabled) {
+	if (_update_data->settings.far_enabled == enabled) {
+		return;
+	}
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_enabled = enabled;
+	_far_needs_restart = true;
+	update_configuration_warnings();
+}
+
+bool VoxelLodTerrain::is_far_enabled() const {
+	return _update_data->settings.far_enabled;
+}
+
+void VoxelLodTerrain::set_far_first_lod(int lod) {
+	const uint8_t v = static_cast<uint8_t>(math::clamp(lod, 0, 16));
+	if (_update_data->settings.far_first_lod == v) {
+		return;
+	}
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_first_lod = v;
+	_far_needs_restart = true;
+}
+
+int VoxelLodTerrain::get_far_first_lod() const {
+	return _update_data->settings.far_first_lod;
+}
+
+void VoxelLodTerrain::set_far_lod_count(int count) {
+	const uint8_t v = static_cast<uint8_t>(math::clamp(count, 1, 24));
+	if (_update_data->settings.far_lod_count == v) {
+		return;
+	}
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_lod_count = v;
+	_far_needs_restart = true;
+}
+
+int VoxelLodTerrain::get_far_lod_count() const {
+	return _update_data->settings.far_lod_count;
+}
+
+void VoxelLodTerrain::set_far_ring_radius(int radius) {
+	const uint8_t v = static_cast<uint8_t>(math::clamp(radius, 1, 32));
+	if (_update_data->settings.far_ring_radius == v) {
+		return;
+	}
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_ring_radius = v;
+	_far_needs_restart = true;
+}
+
+int VoxelLodTerrain::get_far_ring_radius() const {
+	return _update_data->settings.far_ring_radius;
+}
+
+void VoxelLodTerrain::set_far_near_clip_radius(float radius) {
+	// Not a restart: the clip decides what gets built, but a withheld sector
+	// sits in the LOD tree's deferred set rather than being recorded as
+	// resident, so the next update offers it for loading on its own.
+	_update_data->wait_for_end_of_task();
+	// Three states, so keep the sign: 0 derives from view_distance, positive is
+	// an explicit radius, negative turns clipping off entirely.
+	_update_data->settings.far_near_clip_radius = radius;
+}
+
+float VoxelLodTerrain::get_far_near_clip_radius() const {
+	return _update_data->settings.far_near_clip_radius;
+}
+
+void VoxelLodTerrain::set_far_planet_radius(float radius) {
+	const float v = math::max(radius, 0.f);
+	if (_update_data->settings.far_planet_radius == v) {
+		return;
+	}
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_planet_radius = v;
+	// Switching between flat and planetary changes what every sector id means,
+	// so nothing resident survives it.
+	_far_needs_restart = true;
+	update_configuration_warnings();
+}
+
+float VoxelLodTerrain::get_far_planet_radius() const {
+	return _update_data->settings.far_planet_radius;
+}
+
+void VoxelLodTerrain::set_far_vertical_min(float y) {
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_vertical_min = y;
+	_far_needs_restart = true;
+	update_configuration_warnings();
+}
+
+float VoxelLodTerrain::get_far_vertical_min() const {
+	return _update_data->settings.far_vertical_min;
+}
+
+void VoxelLodTerrain::set_far_vertical_max(float y) {
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_vertical_max = y;
+	_far_needs_restart = true;
+	update_configuration_warnings();
+}
+
+float VoxelLodTerrain::get_far_vertical_max() const {
+	return _update_data->settings.far_vertical_max;
+}
+
+void VoxelLodTerrain::set_far_antialias(bool enabled) {
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_antialias = enabled;
+	_far_needs_restart = true;
+}
+
+bool VoxelLodTerrain::get_far_antialias() const {
+	return _update_data->settings.far_antialias;
+}
+
+void VoxelLodTerrain::set_far_generate_bottoms(bool enabled) {
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.far_generate_bottoms = enabled;
+	_far_needs_restart = true;
+}
+
+bool VoxelLodTerrain::get_far_generate_bottoms() const {
+	return _update_data->settings.far_generate_bottoms;
+}
+
+void VoxelLodTerrain::set_far_material(Ref<Material> material) {
+	_far_material = material;
+	_far_renderer.set_material(material);
+}
+
+Ref<Material> VoxelLodTerrain::get_far_material() const {
+	return _far_material;
+}
+
+void VoxelLodTerrain::set_far_cache_enabled(bool enabled) {
+	if (_far_cache_enabled == enabled) {
+		return;
+	}
+	_far_cache_enabled = enabled;
+	_far_needs_restart = true;
+}
+
+bool VoxelLodTerrain::get_far_cache_enabled() const {
+	return _far_cache_enabled;
+}
+
+void VoxelLodTerrain::set_far_cache_directory(String directory) {
+	if (_far_cache_directory == directory) {
+		return;
+	}
+	_far_cache_directory = directory;
+	_far_needs_restart = true;
+}
+
+String VoxelLodTerrain::get_far_cache_directory() const {
+	return _far_cache_directory;
+}
+
+void VoxelLodTerrain::set_far_max_uploads_per_frame(int count) {
+	_update_data->settings.far_max_uploads_per_frame = static_cast<unsigned int>(math::clamp(count, 1, 256));
+}
+
+int VoxelLodTerrain::get_far_max_uploads_per_frame() const {
+	return static_cast<int>(_update_data->settings.far_max_uploads_per_frame);
+}
+
+void VoxelLodTerrain::far_restart() {
+	_far_needs_restart = true;
+}
+
+void VoxelLodTerrain::far_clear_cache() {
+	VoxelLodTerrainUpdateData::FarStreamingState &far = _update_data->state.far_streaming;
+	if (far.cache != nullptr) {
+		far.cache->clear_all();
+		_far_needs_restart = true;
+		return;
+	}
+	// The cache is only opened by the restart path. Calling this before then --
+	// the obvious thing to do from a setup script -- would otherwise silently do
+	// nothing and then load the very files it was asked to delete.
+	_far_clear_cache_on_restart = true;
+	_far_needs_restart = true;
+}
+
+Dictionary VoxelLodTerrain::get_far_statistics() const {
+	const VoxelLodTerrainUpdateData::FarStreamingState &far = _update_data->state.far_streaming;
+
+	Dictionary d;
+	d["resident_sectors"] = static_cast<int64_t>(far.lod_tree.get_resident_count());
+	d["rendered_sectors"] = static_cast<int64_t>(_far_renderer.get_sector_count());
+	d["sectors_built"] = static_cast<int64_t>(_far_renderer.get_sectors_built());
+	d["stale_results_discarded"] = static_cast<int64_t>(_far_renderer.get_stale_results_discarded());
+	d["max_material"] = static_cast<int64_t>(_far_renderer.get_max_material());
+	d["tasks_in_flight"] =
+			static_cast<int64_t>(far.shared != nullptr ? far.shared->tasks_in_flight.load(std::memory_order_relaxed) : 0);
+	d["pending_uploads"] = static_cast<int64_t>(far.shared != nullptr ? far.shared->results.size() : 0);
+	d["max_resident_bound"] = static_cast<int64_t>(far.lod_tree.get_settings().get_max_resident_sectors());
+	d["near_clip_radius"] = far.lod_tree.get_settings().near_clip_radius;
+
+	int64_t vertices = 0;
+	int64_t triangles = 0;
+	int64_t empty = 0;
+	int64_t clipped = 0;
+	AABB bounds;
+	_far_renderer.get_statistics(vertices, triangles, empty, clipped, bounds);
+	d["total_vertices"] = vertices;
+	d["total_triangles"] = triangles;
+	d["empty_sectors"] = empty;
+	d["clipped_sectors"] = clipped;
+	d["world_aabb"] = bounds;
+
+	if (far.cache != nullptr) {
+		const far::FarCache::Stats stats = far.cache->get_stats();
+		Dictionary cache;
+		cache["loads"] = static_cast<int64_t>(stats.loads);
+		cache["hits"] = static_cast<int64_t>(stats.hits);
+		cache["saves"] = static_cast<int64_t>(stats.saves);
+		cache["bytes_read"] = static_cast<int64_t>(stats.bytes_read);
+		cache["bytes_written"] = static_cast<int64_t>(stats.bytes_written);
+		cache["open_regions"] = static_cast<int64_t>(stats.open_regions);
+		d["cache"] = cache;
+	}
+
+	return d;
+}
+
 void VoxelLodTerrain::_bind_methods() {
 	using Self = VoxelLodTerrain;
 
@@ -4123,6 +4442,40 @@ void VoxelLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_generator_use_gpu"), &Self::get_generator_use_gpu);
 #endif
 
+	ClassDB::bind_method(D_METHOD("set_far_enabled", "enabled"), &Self::set_far_enabled);
+	ClassDB::bind_method(D_METHOD("is_far_enabled"), &Self::is_far_enabled);
+	ClassDB::bind_method(D_METHOD("set_far_first_lod", "lod"), &Self::set_far_first_lod);
+	ClassDB::bind_method(D_METHOD("get_far_first_lod"), &Self::get_far_first_lod);
+	ClassDB::bind_method(D_METHOD("set_far_lod_count", "count"), &Self::set_far_lod_count);
+	ClassDB::bind_method(D_METHOD("get_far_lod_count"), &Self::get_far_lod_count);
+	ClassDB::bind_method(D_METHOD("set_far_ring_radius", "radius"), &Self::set_far_ring_radius);
+	ClassDB::bind_method(D_METHOD("get_far_ring_radius"), &Self::get_far_ring_radius);
+	ClassDB::bind_method(D_METHOD("set_far_near_clip_radius", "radius"), &Self::set_far_near_clip_radius);
+	ClassDB::bind_method(D_METHOD("get_far_near_clip_radius"), &Self::get_far_near_clip_radius);
+	ClassDB::bind_method(D_METHOD("set_far_planet_radius", "radius"), &Self::set_far_planet_radius);
+	ClassDB::bind_method(D_METHOD("get_far_planet_radius"), &Self::get_far_planet_radius);
+	ClassDB::bind_method(D_METHOD("set_far_vertical_min", "y"), &Self::set_far_vertical_min);
+	ClassDB::bind_method(D_METHOD("get_far_vertical_min"), &Self::get_far_vertical_min);
+	ClassDB::bind_method(D_METHOD("set_far_vertical_max", "y"), &Self::set_far_vertical_max);
+	ClassDB::bind_method(D_METHOD("get_far_vertical_max"), &Self::get_far_vertical_max);
+	ClassDB::bind_method(D_METHOD("set_far_antialias", "enabled"), &Self::set_far_antialias);
+	ClassDB::bind_method(D_METHOD("get_far_antialias"), &Self::get_far_antialias);
+	ClassDB::bind_method(D_METHOD("set_far_generate_bottoms", "enabled"), &Self::set_far_generate_bottoms);
+	ClassDB::bind_method(D_METHOD("get_far_generate_bottoms"), &Self::get_far_generate_bottoms);
+	ClassDB::bind_method(D_METHOD("set_far_material", "material"), &Self::set_far_material);
+	ClassDB::bind_method(D_METHOD("get_far_material"), &Self::get_far_material);
+	ClassDB::bind_method(D_METHOD("set_far_cache_enabled", "enabled"), &Self::set_far_cache_enabled);
+	ClassDB::bind_method(D_METHOD("get_far_cache_enabled"), &Self::get_far_cache_enabled);
+	ClassDB::bind_method(D_METHOD("set_far_cache_directory", "directory"), &Self::set_far_cache_directory);
+	ClassDB::bind_method(D_METHOD("get_far_cache_directory"), &Self::get_far_cache_directory);
+	ClassDB::bind_method(
+			D_METHOD("set_far_max_uploads_per_frame", "count"), &Self::set_far_max_uploads_per_frame
+	);
+	ClassDB::bind_method(D_METHOD("get_far_max_uploads_per_frame"), &Self::get_far_max_uploads_per_frame);
+	ClassDB::bind_method(D_METHOD("far_restart"), &Self::far_restart);
+	ClassDB::bind_method(D_METHOD("far_clear_cache"), &Self::far_clear_cache);
+	ClassDB::bind_method(D_METHOD("get_far_statistics"), &Self::get_far_statistics);
+
 	ClassDB::bind_method(D_METHOD("set_streaming_system", "system"), &Self::set_streaming_system);
 	ClassDB::bind_method(D_METHOD("get_streaming_system"), &Self::get_streaming_system);
 
@@ -4239,6 +4592,61 @@ void VoxelLodTerrain::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "normalmap_use_gpu"), "set_normalmap_use_gpu", "get_normalmap_use_gpu");
 #endif
 #endif
+
+	ADD_GROUP("Far field", "far_");
+
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "far_enabled"), "set_far_enabled", "is_far_enabled");
+	ADD_PROPERTY(
+			PropertyInfo(Variant::INT, "far_first_lod", PROPERTY_HINT_RANGE, "0,16,1"),
+			"set_far_first_lod",
+			"get_far_first_lod"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::INT, "far_lod_count", PROPERTY_HINT_RANGE, "1,24,1"),
+			"set_far_lod_count",
+			"get_far_lod_count"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::INT, "far_ring_radius", PROPERTY_HINT_RANGE, "1,32,1"),
+			"set_far_ring_radius",
+			"get_far_ring_radius"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "far_near_clip_radius", PROPERTY_HINT_RANGE, "0,65536,1"),
+			"set_far_near_clip_radius",
+			"get_far_near_clip_radius"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "far_planet_radius"), "set_far_planet_radius", "get_far_planet_radius"
+	);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "far_vertical_min"), "set_far_vertical_min", "get_far_vertical_min");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "far_vertical_max"), "set_far_vertical_max", "get_far_vertical_max");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "far_antialias"), "set_far_antialias", "get_far_antialias");
+	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "far_generate_bottoms"),
+			"set_far_generate_bottoms",
+			"get_far_generate_bottoms"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(
+					Variant::OBJECT, "far_material", PROPERTY_HINT_RESOURCE_TYPE, Material::get_class_static()
+			),
+			"set_far_material",
+			"get_far_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "far_cache_enabled"), "set_far_cache_enabled", "get_far_cache_enabled"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::STRING, "far_cache_directory", PROPERTY_HINT_DIR),
+			"set_far_cache_directory",
+			"get_far_cache_directory"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::INT, "far_max_uploads_per_frame", PROPERTY_HINT_RANGE, "1,256,1"),
+			"set_far_max_uploads_per_frame",
+			"get_far_max_uploads_per_frame"
+	);
 
 	ADD_GROUP("Collisions", "");
 

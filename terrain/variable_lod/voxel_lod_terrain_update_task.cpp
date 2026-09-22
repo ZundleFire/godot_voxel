@@ -1,4 +1,5 @@
 #include "voxel_lod_terrain_update_task.h"
+#include "voxel_lod_terrain_update_far_streaming.h"
 #include "../../engine/buffered_task_scheduler.h"
 #include "../../engine/voxel_engine.h"
 #include "../../generators/generate_block_task.h"
@@ -959,6 +960,11 @@ void VoxelLodTerrainUpdateTask::run(ThreadedTaskContext &ctx) {
 				_meshing_dependency->mesher.is_valid()
 		);
 	}
+	// The far field runs in addition to whichever near system is selected, not
+	// instead of it: it covers what is past view_distance, which neither near
+	// system looks at.
+	process_far_streaming(state, settings, _viewer_pos, generator);
+
 	state.stats.time_detect_required_blocks = profiling_clock.restart();
 
 	BufferedTaskScheduler &task_scheduler = BufferedTaskScheduler::get_for_current_thread();

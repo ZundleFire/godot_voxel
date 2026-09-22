@@ -8,8 +8,10 @@
 #include "../../util/containers/std_map.h"
 #include "../../util/containers/std_unordered_map.h"
 #include "../../util/containers/std_vector.h"
+#include "../../util/ref_count.h"
 #include "../../util/safe_ref_count.h"
 #include "../../util/tasks/cancellation_token.h"
+#include "../../far/tasks/far_tasks.h"
 #include "../voxel_mesh_map.h"
 #include "lod_octree.h"
 
@@ -89,6 +91,34 @@ struct VoxelLodTerrainUpdateData {
 		DetailRenderingSettings detail_texture_settings;
 #endif
 		Ref<VoxelGenerator> detail_texture_generator_override;
+
+		// -- Far field ----------------------------------------------------
+		// Renders past `view_distance_voxels` from column data. Off by default:
+		// it costs generator time, and a terrain that does not need a horizon
+		// should not pay for one.
+		bool far_enabled = false;
+		// Finest far level. The setting that matters most: every level whose
+		// ring fits inside the near terrain is generated and then never drawn,
+		// and the fine levels are by far the most expensive. Pick it so that
+		// `far_ring_radius * 32 * 2^far_first_lod` lands just past
+		// `view_distance_voxels`.
+		uint8_t far_first_lod = 4;
+		uint8_t far_lod_count = 6;
+		uint8_t far_ring_radius = 4;
+		// 0 means "derive from view_distance_voxels", which is what you want
+		// unless the near terrain's visible edge is not its view distance.
+		float far_near_clip_radius = 0.f;
+		float far_vertical_min = -256.f;
+		float far_vertical_max = 512.f;
+		bool far_antialias = true;
+		bool far_generate_bottoms = true;
+		// Non-zero turns the far field into a planet: columns run radially from
+		// the terrain's origin instead of along Y, and sectors tile the six
+		// faces of a cubesphere instead of one unbounded XZ grid.
+		// `far_vertical_min`/`max` are then heights relative to this radius.
+		float far_planet_radius = 0.f;
+		float far_skirt_depth_cells = 2.f;
+		unsigned int far_max_uploads_per_frame = 4;
 	};
 
 	enum MeshState {
@@ -316,6 +346,29 @@ struct VoxelLodTerrainUpdateData {
 		BinaryMutex dropped_data_blocks_mutex;
 	};
 
+	// Far field: everything past `view_distance_voxels`, rendered from column
+	// data rather than voxels. See `voxel_lod_terrain_update_far_streaming.h`.
+	struct FarStreamingState {
+		far::FarLodTree lod_tree;
+		// What the tree was last configured with, so a settings change is
+		// detected without reconfiguring -- and so clearing residency -- on
+		// every update.
+		far::FarLodSettings configured;
+
+		// Shared with in-flight tasks. Tasks hold a shared_ptr and check the
+		// generation counter, so they never touch the terrain node.
+		std::shared_ptr<far::FarSharedState> shared;
+		std::shared_ptr<far::FarCache> cache;
+
+		// Last viewer position the far field was updated against. The main
+		// thread reads it to re-evaluate near-clip visibility.
+		far::Vec3f viewer_position;
+
+		// Scratch, reused each update.
+		std::vector<far::SectorRequest> to_load;
+		std::vector<far::SectorId> to_unload;
+	};
+
 	struct EditNotificationInputs {
 		// Entry point for notifying data changes, which will cause data LODs and mesh updates.
 		// Contains blocks that were edited and need their LOD counterparts to be updated.
@@ -335,6 +388,7 @@ struct VoxelLodTerrainUpdateData {
 	struct State {
 		OctreeStreamingState octree_streaming;
 		ClipboxStreamingState clipbox_streaming;
+		FarStreamingState far_streaming;
 
 		FixedArray<Lod, constants::MAX_LOD> lods;
 

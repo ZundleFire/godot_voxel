@@ -15,5 +15,6 @@
 *.ilk
 
 shaders/dev/.godot/
+far/tests/godot/.godot/
 *.gen.glsl
 *.gen.h

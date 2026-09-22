@@ -30,6 +30,7 @@
 #include "voxel/test_voxel_water.h"
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
+#include "voxel/test_surface_nets.h"
 #include "voxel/test_transvoxel.h"
 #ifdef VOXEL_ENABLE_GPU
 #include "voxel/test_detail_rendering_gpu.h"
@@ -89,6 +90,7 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_voxel_graph_generate_block_with_input_sdf);
 	VOXEL_TEST(test_voxel_graph_planet_nodes);
 	VOXEL_TEST(test_voxel_graph_material_nodes);
+	VOXEL_TEST(test_voxel_graph_material_mixer_node);
 	VOXEL_TEST(test_voxel_graph_functions_pass_through);
 	VOXEL_TEST(test_voxel_graph_functions_nested_pass_through);
 	VOXEL_TEST(test_voxel_graph_functions_autoconnect);
@@ -174,6 +176,11 @@ void run_voxel_tests(const testing::TestOptions &options) {
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 	VOXEL_TEST(test_transvoxel_issue772);
 	VOXEL_TEST(test_transvoxel_surface_data);
+	VOXEL_TEST(test_surface_nets_block_bounds);
+	VOXEL_TEST(test_surface_nets_lod_scaling);
+	VOXEL_TEST(test_surface_nets_regular_mesh);
+	VOXEL_TEST(test_surface_nets_skirts);
+	VOXEL_TEST(test_surface_nets_material_output);
 #endif
 #ifdef VOXEL_ENABLE_INSTANCER
 	VOXEL_TEST(test_instance_generator_material_filter_issue774);

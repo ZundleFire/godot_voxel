@@ -1355,7 +1355,11 @@ void VoxelData::unview_area(
 }
 
 std::shared_ptr<VoxelBuffer> VoxelData::try_get_block_voxels(Vector3i bpos) {
-	Lod &lod = _lods[0];
+	return try_get_block_voxels(bpos, 0);
+}
+
+std::shared_ptr<VoxelBuffer> VoxelData::try_get_block_voxels(Vector3i bpos, unsigned int lod_index) {
+	Lod &lod = _lods[lod_index];
 
 	// The caller must lock the spatial lock and keep it locked until done accessing blocks
 	// SpatialLock3D::Read srlock(lod.spatial_lock, BoxBounds3i::from_position(bpos));

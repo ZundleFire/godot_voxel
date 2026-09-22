@@ -11,6 +11,7 @@
 #include "../voxel_node.h"
 #include "lod_octree.h"
 #include "shader_material_pool_vlt.h"
+#include "../../far/far_renderer.h"
 #include "voxel_lod_terrain_update_data.h"
 #include "voxel_mesh_block_vlt.h"
 
@@ -216,6 +217,60 @@ public:
 	// progressively.
 	StreamingSystem get_streaming_system() const;
 	void set_streaming_system(StreamingSystem v);
+
+	// -- Far field ----------------------------------------------------------
+	// Terrain past `view_distance`, rendered from column data instead of
+	// voxels. See `far/` and `voxel_lod_terrain_update_far_streaming.h`.
+
+	void set_far_enabled(bool enabled);
+	bool is_far_enabled() const;
+
+	void set_far_first_lod(int lod);
+	int get_far_first_lod() const;
+
+	void set_far_lod_count(int count);
+	int get_far_lod_count() const;
+
+	void set_far_ring_radius(int radius);
+	int get_far_ring_radius() const;
+
+	// 0 derives it from `view_distance`, which is almost always what you want.
+	void set_far_near_clip_radius(float radius);
+	float get_far_near_clip_radius() const;
+
+	// Non-zero makes the far field planetary. See far/far_sphere.h.
+	void set_far_planet_radius(float radius);
+	float get_far_planet_radius() const;
+
+	void set_far_vertical_min(float y);
+	float get_far_vertical_min() const;
+
+	void set_far_vertical_max(float y);
+	float get_far_vertical_max() const;
+
+	void set_far_antialias(bool enabled);
+	bool get_far_antialias() const;
+
+	void set_far_generate_bottoms(bool enabled);
+	bool get_far_generate_bottoms() const;
+
+	void set_far_material(Ref<Material> material);
+	Ref<Material> get_far_material() const;
+
+	void set_far_cache_enabled(bool enabled);
+	bool get_far_cache_enabled() const;
+
+	void set_far_cache_directory(String directory);
+	String get_far_cache_directory() const;
+
+	void set_far_max_uploads_per_frame(int count);
+	int get_far_max_uploads_per_frame() const;
+
+	// Drops the far field and starts over. Needed after changing the generator.
+	void far_restart();
+	void far_clear_cache();
+
+	Dictionary get_far_statistics() const;
 
 	Node3D *convert_to_nodes(const BitField<NodeConversionFlags> flags) const override;
 
@@ -455,6 +510,18 @@ private:
 	bool _refreshing_material_from_graph_generator = false;
 	std::shared_ptr<VoxelData> _data;
 	std::shared_ptr<VoxelLodTerrainUpdateData> _update_data;
+
+	// Main-thread half of the far field. The update thread's half lives in
+	// `_update_data->state.far_streaming`.
+	far::FarRenderer _far_renderer;
+	Ref<Material> _far_material;
+	bool _far_cache_enabled = true;
+	String _far_cache_directory = "user://far_lod_cache";
+	bool _far_needs_restart = false;
+	bool _far_clear_cache_on_restart = false;
+
+	void process_far_field();
+	void apply_far_restart();
 	std::shared_ptr<StreamingDependency> _streaming_dependency;
 	std::shared_ptr<MeshingDependency> _meshing_dependency;
 

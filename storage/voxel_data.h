@@ -335,6 +335,11 @@ public:
 	// Can return null.
 	std::shared_ptr<VoxelBuffer> try_get_block_voxels(Vector3i bpos);
 
+	// Same as try_get_block_voxels(), but for an arbitrary LOD instead of always LOD0. `bpos` is a block position
+	// already expressed at `lod_index` (i.e. in units of that LOD's own block grid, not LOD0's).
+	// WARNING: same locking requirement as try_get_block_voxels().
+	std::shared_ptr<VoxelBuffer> try_get_block_voxels(Vector3i bpos, unsigned int lod_index);
+
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	// Reference-counted API (LOD0 only)
 	// Data blocks have a reference count that can be optionally used.

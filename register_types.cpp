@@ -57,6 +57,7 @@
 #include "util/tasks/godot/threaded_task_gd.h"
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
+#include "meshers/surface_nets/voxel_mesher_surface_nets.h"
 #include "meshers/transvoxel/voxel_mesher_transvoxel.h"
 #endif
 
@@ -339,6 +340,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		ClassDB::register_class<VoxelMesherTransvoxel>();
+		ClassDB::register_class<VoxelMesherSurfaceNets>();
 #endif
 
 #ifdef VOXEL_ENABLE_MODIFIERS
@@ -431,6 +433,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		VoxelMesherTransvoxel::load_static_resources();
+		VoxelMesherSurfaceNets::load_static_resources();
 #endif
 
 #ifdef VOXEL_TESTS
@@ -593,6 +596,7 @@ void uninitialize_voxel_module(ModuleInitializationLevel p_level) {
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		VoxelMesherTransvoxel::free_static_resources();
+		VoxelMesherSurfaceNets::free_static_resources();
 #endif
 		VoxelStringNames::destroy_singleton();
 		pg::NodeTypeDB::destroy_singleton();

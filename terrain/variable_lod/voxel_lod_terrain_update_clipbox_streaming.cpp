@@ -1,5 +1,6 @@
 #include "voxel_lod_terrain_update_clipbox_streaming.h"
 #include "../../util/containers/std_unordered_set.h"
+#include "../../util/io/log.h"
 #include "../../util/math/conv.h"
 #include "../../util/profiling.h"
 #include "../../util/string/format.h"

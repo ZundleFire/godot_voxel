@@ -468,7 +468,16 @@ void VoxelEngine::set_generation_thread_count(uint32_t count) {
 	}
 	if (!_use_separate_generation_pool) {
 		_generation_thread_pool.set_name("Voxel generation");
-		_generation_thread_pool.set_priority_update_period(64);
+		// Re-sorting the pending task list is O(N) (recomputes every task's priority, then sorts),
+		// done under a mutex that blocks every worker thread trying to pick up work. At the
+		// default 64ms period this is fine for the small backlogs typical of most scenes, but a
+		// large world streamed under a fast-moving viewer can queue on the order of 10^5 pending
+		// generation tasks (a viewer's LOD0 data box alone can be tens of thousands of blocks) --
+		// at that size, re-sorting 15+ times/sec serializes the whole pool behind the sort and
+		// visibly starves actual generation throughput. A period this large only costs a bit of
+		// staleness in task ordering (irrelevant at normal camera speeds) in exchange for far
+		// less time spent fully blocked resorting instead of generating.
+		_generation_thread_pool.set_priority_update_period(500);
 	}
 	_generation_thread_pool.set_thread_count(count);
 	_use_separate_generation_pool = true;

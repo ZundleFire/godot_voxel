@@ -14,6 +14,7 @@ void test_voxel_graph_equivalence_merging();
 void test_voxel_graph_generate_block_with_input_sdf();
 void test_voxel_graph_planet_nodes();
 void test_voxel_graph_material_nodes();
+void test_voxel_graph_material_mixer_node();
 void test_voxel_graph_functions_pass_through();
 void test_voxel_graph_functions_nested_pass_through();
 void test_voxel_graph_functions_autoconnect();

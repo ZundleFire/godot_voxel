@@ -85,6 +85,12 @@ def get_sources(env, is_editor_build):
         "terrain/fixed_lod/*.cpp",
         "terrain/variable_lod/*.cpp",
 
+        # Far field. far/core/ deliberately includes no Godot headers, so it
+        # also compiles standalone against the host tests in far/tests/.
+        "far/*.cpp",
+        "far/core/*.cpp",
+        "far/tasks/*.cpp",
+
         "engine/*.cpp",
 
         "edition/floating_chunks.cpp",
@@ -213,12 +219,16 @@ def get_sources(env, is_editor_build):
 
         sources += [
             "meshers/transvoxel/*.cpp",
-            
+            "meshers/surface_nets/*.cpp",
+
             "engine/detail_rendering/detail_rendering.cpp",
             "engine/detail_rendering/render_detail_texture_task.cpp",
 
             "thirdparty/meshoptimizer/*.cpp"
         ]
+
+        if tests_enabled:
+            sources += ["tests/voxel/test_surface_nets.cpp"]
 
         if gpu_enabled:
             sources += ["engine/detail_rendering/render_detail_texture_gpu_task.cpp"]

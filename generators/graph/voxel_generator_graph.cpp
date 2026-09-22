@@ -358,11 +358,7 @@ render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_sc
 uniform int u_transition_mask;
 uniform vec2 u_lod_fade;
 uniform bool u_auto_material_use_flat_shading = true;
-uniform vec4 u_auto_material_albedo[16];
-uniform vec4 u_auto_material_emission[16];
-uniform float u_auto_material_roughness[16];
-uniform float u_auto_material_metallic[16];
-uniform float u_auto_material_specular[16];
+//__AUTO_MATERIAL_LAYER_TABLES__
 
 varying flat vec4 v_indices;
 varying vec4 v_weights;
@@ -493,6 +489,98 @@ void fragment() {
 }
 )SHADER";
 
+// Token both generated shaders carry where their 16-layer material table goes. See
+// build_layer_tables_shader_source.
+static const char *AUTO_MATERIAL_LAYER_TABLES_TOKEN = "//__AUTO_MATERIAL_LAYER_TABLES__";
+
+// Always emits a decimal point: Godot's shading language will not accept an int literal where a
+// float is expected, and "%g" would render 1.0 as "1".
+void append_shader_float(StdString &dst, const float value) {
+	char buffer[32];
+	snprintf(buffer, sizeof(buffer), "%.6f", Math::is_finite(value) ? value : 0.f);
+	dst += buffer;
+}
+
+// Bakes the per-layer material properties into the shader source as constants.
+//
+// These used to be `uniform vec4 u_auto_material_albedo[16]` and friends, set with
+// set_shader_parameter. That works until the scene is saved: Godot lists shader array uniforms as
+// saveable properties but restores them as null on load, so the arrays came back empty and every
+// layer lookup returned zero -- a terrain that rendered correctly until you hit save, then went
+// black, then came back on the next graph edit (which regenerates the material). Shader code is a
+// plain String and round-trips fine, and the table is fully known at generation time anyway, so
+// there is nothing to gain from it being a uniform.
+StdString build_layer_tables_shader_source(const FixedArray<Ref<StandardMaterial3D>, 16> &layer_materials) {
+	StdString albedo = "const vec4 u_auto_material_albedo[16] = {";
+	StdString emission = "const vec4 u_auto_material_emission[16] = {";
+	StdString roughness = "const float u_auto_material_roughness[16] = {";
+	StdString metallic = "const float u_auto_material_metallic[16] = {";
+	StdString specular = "const float u_auto_material_specular[16] = {";
+
+	for (unsigned int i = 0; i < 16; ++i) {
+		Ref<StandardMaterial3D> material = layer_materials[i];
+		Color layer_albedo(1.f, 1.f, 1.f, 1.f);
+		Color layer_emission(0.f, 0.f, 0.f, 1.f);
+		float layer_roughness = 1.f;
+		float layer_metallic = 0.f;
+		float layer_specular = 0.5f;
+		if (material.is_valid()) {
+			layer_albedo = material->get_albedo();
+			layer_emission = material->get_emission();
+			layer_roughness = material->get_roughness();
+			layer_metallic = material->get_metallic();
+			layer_specular = material->get_specular();
+		}
+
+		const char *separator = (i == 0) ? "\n\t" : ",\n\t";
+		albedo += separator;
+		albedo += "vec4(";
+		append_shader_float(albedo, layer_albedo.r);
+		albedo += ", ";
+		append_shader_float(albedo, layer_albedo.g);
+		albedo += ", ";
+		append_shader_float(albedo, layer_albedo.b);
+		albedo += ", 1.0)";
+
+		emission += separator;
+		emission += "vec4(";
+		append_shader_float(emission, layer_emission.r);
+		emission += ", ";
+		append_shader_float(emission, layer_emission.g);
+		emission += ", ";
+		append_shader_float(emission, layer_emission.b);
+		emission += ", 1.0)";
+
+		roughness += separator;
+		append_shader_float(roughness, layer_roughness);
+
+		metallic += separator;
+		append_shader_float(metallic, layer_metallic);
+
+		specular += separator;
+		append_shader_float(specular, layer_specular);
+	}
+
+	StdString out;
+	out += albedo + "\n};\n";
+	out += emission + "\n};\n";
+	out += roughness + "\n};\n";
+	out += metallic + "\n};\n";
+	out += specular + "\n};\n";
+	return out;
+}
+
+// Substitutes the layer table into a generated shader. The token is present in both generated
+// shaders; if it ever goes missing the shader would fail to compile with an undeclared identifier,
+// so fail loudly here instead.
+bool insert_layer_tables(StdString &shader_code, const FixedArray<Ref<StandardMaterial3D>, 16> &layer_materials) {
+	const size_t token_pos = shader_code.find(AUTO_MATERIAL_LAYER_TABLES_TOKEN);
+	ZN_ASSERT_RETURN_V(token_pos != StdString::npos, false);
+	shader_code.replace(token_pos, strlen(AUTO_MATERIAL_LAYER_TABLES_TOKEN),
+			build_layer_tables_shader_source(layer_materials));
+	return true;
+}
+
 struct MaterialLayerWeights {
 	FixedArray<uint32_t, 16> node_ids;
 	FixedArray<bool, 16> used_layers;
@@ -525,6 +613,10 @@ struct MaterialShaderControlRequest {
 	enum Operation {
 		OP_DIRECT,
 		OP_SUBTRACT,
+		// max(a, 0) / max(sum of max(sum_srcs[i], 0), epsilon). This is the running mix factor a
+		// MaterialMixer slot needs so the accumulated blend equals the normalized weighted average of
+		// every slot up to and including this one.
+		OP_MIXER_ALPHA,
 	};
 
 	Operation operation = OP_DIRECT;
@@ -533,6 +625,10 @@ struct MaterialShaderControlRequest {
 	float a_default = 0.f;
 	float b_default = 0.f;
 	bool step_from_zero = false;
+	// OP_MIXER_ALPHA only: the weights to sum for the denominator. Parallel arrays, one entry per
+	// mixer slot considered so far; a NULL_ID source means "use the default value instead".
+	StdVector<ProgramGraph::PortLocation> sum_srcs;
+	StdVector<float> sum_defaults;
 };
 
 struct MaterialGraphShaderBuildState {
@@ -830,6 +926,46 @@ StdString build_material_shader_expr(MaterialGraphShaderBuildState &state, const
 					control_index);
 		}
 
+		case pg::VoxelGraphFunction::NODE_MATERIAL_MIXER: {
+			// Fold the connected slots into one running normalized blend. Slot i contributes with
+			// factor w_i / (w_0 + ... + w_i), which is the standard incremental weighted average, so
+			// the result is the same whatever the weights sum to.
+			StdString acc_expr;
+			MaterialShaderControlRequest running;
+			for (unsigned int slot = 0; slot < pg::VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT; ++slot) {
+				const StdString slot_expr = build_material_shader_input_expr(state, node, slot * 2);
+				if (slot_expr.empty()) {
+					continue;
+				}
+				ProgramGraph::PortLocation weight_src{ ProgramGraph::NULL_ID, 0 };
+				float weight_default = 0.f;
+				get_node_input_source_or_default(
+						*state.source_graph, node, slot * 2 + 1, 0.f, weight_src, weight_default);
+				running.sum_srcs.push_back(weight_src);
+				running.sum_defaults.push_back(weight_default);
+
+				if (acc_expr.empty()) {
+					// First connected slot seeds the accumulator, so it also acts as the fallback when
+					// every weight ends up at zero.
+					acc_expr = slot_expr;
+					continue;
+				}
+
+				MaterialShaderControlRequest request = running;
+				request.operation = MaterialShaderControlRequest::OP_MIXER_ALPHA;
+				request.a = weight_src;
+				request.a_default = weight_default;
+				const int control_index = state.controls.size();
+				state.controls.push_back(request);
+				acc_expr = format(
+						"mix_material_props({}, {}, clamp(auto_material_control_{}, 0.0, 1.0))",
+						acc_expr,
+						slot_expr,
+						control_index);
+			}
+			return acc_expr;
+		}
+
 		case pg::VoxelGraphFunction::NODE_MATERIAL_PROPERTY_OVERRIDE:
 		case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL:
 			return build_material_shader_input_expr(state, node, 0);
@@ -970,6 +1106,21 @@ MaterialLayerWeights select_material_layer_weights(
 	return result;
 }
 
+// Tiny denominator guard shared by the mixer paths, so all-zero weights fall back to the first
+// connected material instead of dividing by zero.
+static const float MATERIAL_MIXER_EPSILON = 0.000001f;
+
+// Clamps a weight to >= 0 in graph nodes, matching what MaterialMixer's process function does.
+ProgramGraph::PortLocation create_clamped_weight(
+		MaterialWeightBuildState &state,
+		const ProgramGraph::PortLocation weight_src
+) {
+	const ProgramGraph::PortLocation zero_src = get_or_create_constant_output(state, 0.f);
+	return ProgramGraph::PortLocation{
+		create_binary_math_node(state, pg::VoxelGraphFunction::NODE_MAX, weight_src, zero_src), 0
+	};
+}
+
 MaterialLayerWeights build_material_layer_weights(MaterialWeightBuildState &state, const uint32_t node_id) {
 	const auto cached_it = state.cache.find(node_id);
 	if (cached_it != state.cache.end()) {
@@ -1020,6 +1171,47 @@ MaterialLayerWeights build_material_layer_weights(MaterialWeightBuildState &stat
 				result = build_material_layer_weights(state, a_src.node_id);
 			} else if (has_b) {
 				result = build_material_layer_weights(state, b_src.node_id);
+			}
+		} break;
+
+		case pg::VoxelGraphFunction::NODE_MATERIAL_MIXER: {
+			// Same incremental normalized blend as the shader path, expressed in graph nodes:
+			// acc = mix(acc, slot_i, w_i / (w_0 + ... + w_i)).
+			ProgramGraph::PortLocation running_sum{ ProgramGraph::NULL_ID, 0 };
+			bool has_acc = false;
+			for (unsigned int slot = 0; slot < pg::VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT; ++slot) {
+				ProgramGraph::PortLocation material_src;
+				if (!state.graph->try_get_connection_to(
+							ProgramGraph::PortLocation{ node.id, slot * 2 }, material_src)) {
+					continue;
+				}
+				const MaterialLayerWeights slot_layers = build_material_layer_weights(state, material_src.node_id);
+				const ProgramGraph::PortLocation weight_src =
+						create_clamped_weight(state, get_input_source_or_default(state, node, slot * 2 + 1, 0.f));
+
+				if (!has_acc) {
+					result = slot_layers;
+					running_sum = weight_src;
+					has_acc = true;
+					continue;
+				}
+
+				const ProgramGraph::PortLocation new_sum{
+					create_binary_math_node(state, pg::VoxelGraphFunction::NODE_ADD, running_sum, weight_src), 0
+				};
+				const ProgramGraph::PortLocation denominator{
+					create_binary_math_node(
+							state,
+							pg::VoxelGraphFunction::NODE_MAX,
+							new_sum,
+							get_or_create_constant_output(state, MATERIAL_MIXER_EPSILON)),
+					0
+				};
+				const ProgramGraph::PortLocation alpha_src{
+					create_binary_math_node(state, pg::VoxelGraphFunction::NODE_DIVIDE, weight_src, denominator), 0
+				};
+				result = combine_material_layer_weights(state, result, slot_layers, alpha_src);
+				running_sum = new_sum;
 			}
 		} break;
 
@@ -1139,6 +1331,39 @@ bool build_material_controls_shader_source(
 				connect_or_set_default(control.b, control.b_default, subtract_node_id, 1);
 				shader_graph->add_connection(subtract_node_id, 0, output_node_id, 0);
 			} break;
+			case MaterialShaderControlRequest::OP_MIXER_ALPHA: {
+				auto clamp_to_positive = [&](const ProgramGraph::PortLocation src, const float default_value) {
+					const uint32_t max_node_id = shader_graph->create_node(pg::VoxelGraphFunction::NODE_MAX);
+					connect_or_set_default(src, default_value, max_node_id, 0);
+					shader_graph->set_node_default_input(max_node_id, 1, 0.f);
+					return max_node_id;
+				};
+
+				const uint32_t numerator_node_id = clamp_to_positive(control.a, control.a_default);
+
+				uint32_t sum_node_id = ProgramGraph::NULL_ID;
+				for (unsigned int i = 0; i < control.sum_srcs.size(); ++i) {
+					const uint32_t term_node_id = clamp_to_positive(control.sum_srcs[i], control.sum_defaults[i]);
+					if (sum_node_id == ProgramGraph::NULL_ID) {
+						sum_node_id = term_node_id;
+					} else {
+						const uint32_t add_node_id = shader_graph->create_node(pg::VoxelGraphFunction::NODE_ADD);
+						shader_graph->add_connection(sum_node_id, 0, add_node_id, 0);
+						shader_graph->add_connection(term_node_id, 0, add_node_id, 1);
+						sum_node_id = add_node_id;
+					}
+				}
+				ZN_ASSERT_CONTINUE(sum_node_id != ProgramGraph::NULL_ID);
+
+				const uint32_t denominator_node_id = shader_graph->create_node(pg::VoxelGraphFunction::NODE_MAX);
+				shader_graph->add_connection(sum_node_id, 0, denominator_node_id, 0);
+				shader_graph->set_node_default_input(denominator_node_id, 1, MATERIAL_MIXER_EPSILON);
+
+				const uint32_t divide_node_id = shader_graph->create_node(pg::VoxelGraphFunction::NODE_DIVIDE);
+				shader_graph->add_connection(numerator_node_id, 0, divide_node_id, 0);
+				shader_graph->add_connection(denominator_node_id, 0, divide_node_id, 1);
+				shader_graph->add_connection(divide_node_id, 0, output_node_id, 0);
+			} break;
 			default:
 				break;
 		}
@@ -1204,38 +1429,6 @@ Ref<Material> create_spatial_material_from_graph(
 		return Ref<Material>();
 	}
 
-	PackedColorArray albedo_array;
-	PackedColorArray emission_array;
-	PackedFloat32Array roughness_array;
-	PackedFloat32Array metallic_array;
-	PackedFloat32Array specular_array;
-	albedo_array.resize(16);
-	emission_array.resize(16);
-	roughness_array.resize(16);
-	metallic_array.resize(16);
-	specular_array.resize(16);
-
-	for (int i = 0; i < 16; ++i) {
-		Ref<StandardMaterial3D> material = material_weight_state.layer_materials[i];
-		Color albedo(1.f, 1.f, 1.f, 1.f);
-		Color emission(0.f, 0.f, 0.f, 1.f);
-		float roughness = 1.f;
-		float metallic = 0.f;
-		float specular = 0.5f;
-		if (material.is_valid()) {
-			albedo = material->get_albedo();
-			emission = material->get_emission();
-			roughness = material->get_roughness();
-			metallic = material->get_metallic();
-			specular = material->get_specular();
-		}
-		albedo_array.set(i, albedo);
-		emission_array.set(i, emission);
-		roughness_array.set(i, roughness);
-		metallic_array.set(i, metallic);
-		specular_array.set(i, specular);
-	}
-
 	StdString shader_code = R"SHADER(shader_type spatial;
 render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
 
@@ -1245,11 +1438,7 @@ uniform int u_voxel_lod_info;
 uniform bool u_auto_material_per_pixel = true;
 uniform bool u_auto_material_per_pixel_lod0_only = true;
 uniform bool u_auto_material_use_flat_shading = true;
-uniform vec4 u_auto_material_albedo[16];
-uniform vec4 u_auto_material_emission[16];
-uniform float u_auto_material_roughness[16];
-uniform float u_auto_material_metallic[16];
-uniform float u_auto_material_specular[16];
+//__AUTO_MATERIAL_LAYER_TABLES__
 
 varying flat vec4 v_indices;
 varying vec4 v_weights;
@@ -1422,6 +1611,10 @@ AutoMaterialProps get_weight_material_props(vec4 indices, vec4 weights) {
 			"\t}\n"
 			"}\n";
 
+	if (!insert_layer_tables(shader_code, material_weight_state.layer_materials)) {
+		return Ref<Material>();
+	}
+
 	Ref<Shader> shader;
 	shader.instantiate();
 	shader->set_code(shader_code.c_str());
@@ -1432,60 +1625,23 @@ AutoMaterialProps get_weight_material_props(vec4 indices, vec4 weights) {
 	material->set_shader_parameter("u_auto_material_per_pixel", true);
 	material->set_shader_parameter("u_auto_material_per_pixel_lod0_only", true);
 	material->set_shader_parameter("u_auto_material_use_flat_shading", true);
-	material->set_shader_parameter("u_auto_material_albedo", albedo_array);
-	material->set_shader_parameter("u_auto_material_emission", emission_array);
-	material->set_shader_parameter("u_auto_material_roughness", roughness_array);
-	material->set_shader_parameter("u_auto_material_metallic", metallic_array);
-	material->set_shader_parameter("u_auto_material_specular", specular_array);
 	return material;
 }
 
 Ref<Material> create_spatial_material_from_layers(const FixedArray<Ref<StandardMaterial3D>, 16> &layer_materials) {
-	PackedColorArray albedo_array;
-	PackedColorArray emission_array;
-	PackedFloat32Array roughness_array;
-	PackedFloat32Array metallic_array;
-	PackedFloat32Array specular_array;
-	albedo_array.resize(16);
-	emission_array.resize(16);
-	roughness_array.resize(16);
-	metallic_array.resize(16);
-	specular_array.resize(16);
-
-	for (int i = 0; i < 16; ++i) {
-		Ref<StandardMaterial3D> material = layer_materials[i];
-		Color albedo(1.f, 1.f, 1.f, 1.f);
-		Color emission(0.f, 0.f, 0.f, 1.f);
-		float roughness = 1.f;
-		float metallic = 0.f;
-		float specular = 0.5f;
-		if (material.is_valid()) {
-			albedo = material->get_albedo();
-			emission = material->get_emission();
-			roughness = material->get_roughness();
-			metallic = material->get_metallic();
-			specular = material->get_specular();
-		}
-		albedo_array.set(i, albedo);
-		emission_array.set(i, emission);
-		roughness_array.set(i, roughness);
-		metallic_array.set(i, metallic);
-		specular_array.set(i, specular);
+	StdString shader_code = AUTO_SPATIAL_MATERIAL_SHADER;
+	if (!insert_layer_tables(shader_code, layer_materials)) {
+		return Ref<Material>();
 	}
 
 	Ref<Shader> shader;
 	shader.instantiate();
-	shader->set_code(AUTO_SPATIAL_MATERIAL_SHADER);
+	shader->set_code(shader_code.c_str());
 
 	Ref<ShaderMaterial> material;
 	material.instantiate();
 	material->set_shader(shader);
 	material->set_shader_parameter("u_auto_material_use_flat_shading", true);
-	material->set_shader_parameter("u_auto_material_albedo", albedo_array);
-	material->set_shader_parameter("u_auto_material_emission", emission_array);
-	material->set_shader_parameter("u_auto_material_roughness", roughness_array);
-	material->set_shader_parameter("u_auto_material_metallic", metallic_array);
-	material->set_shader_parameter("u_auto_material_specular", specular_array);
 	return material;
 }
 
@@ -2533,6 +2689,33 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 				return blend_standard_material_resources(stacked_material, top_material, top_alpha);
 			}
 
+			case pg::VoxelGraphFunction::NODE_MATERIAL_MIXER: {
+				// Constant-folded preview of the mixer, used when the graph can't be turned into a
+				// per-pixel shader. Same incremental normalized blend as the other two paths.
+				Ref<Material> accumulated;
+				float running_sum = 0.f;
+				bool has_acc = false;
+				for (unsigned int slot = 0; slot < pg::VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT; ++slot) {
+					ProgramGraph::PortLocation material_src;
+					if (!_main_function->try_get_connection_to(
+								ProgramGraph::PortLocation{ node.id, slot * 2 }, material_src)) {
+						continue;
+					}
+					Ref<Material> slot_material = evaluate_material_node(material_src.node_id);
+					const float weight = math::max(sample_material_scalar(node, slot * 2 + 1, 0.f), 0.f);
+					if (!has_acc) {
+						accumulated = slot_material;
+						running_sum = weight;
+						has_acc = true;
+						continue;
+					}
+					const float alpha = weight / math::max(running_sum + weight, MATERIAL_MIXER_EPSILON);
+					accumulated = blend_standard_material_resources(accumulated, slot_material, alpha);
+					running_sum += weight;
+				}
+				return accumulated;
+			}
+
 			case pg::VoxelGraphFunction::NODE_OUTPUT_MATERIAL:
 				return evaluate_material_input(node.id, 0);
 
@@ -2707,7 +2890,7 @@ pg::CompilationResult VoxelGeneratorGraph::compile(bool debug) {
 			pg::CompilationResult error;
 			error.success = false;
 			error.message = ZN_TTR(
-					"MaterialOutput must be connected to a supported material chain (Material, BlendMaterial, MaterialSwitch, MaterialPropertyOverride or MaterialStack)");
+					"MaterialOutput must be connected to a supported material chain (Material, BlendMaterial, MaterialSwitch, MaterialMixer, MaterialPropertyOverride or MaterialStack)");
 			error.node_id = material_output_node_id;
 			return error;
 		}

@@ -66,9 +66,30 @@ CellTextureDatas<NVoxels> select_textures_4_per_voxel(
 			weights_temp[ti] = weights[j];
 		}
 	}
+	// EDEN FORK: an earlier version of this comparator ranked purely by "any nonzero weight"
+	// then by material INDEX ascending, ignoring weight MAGNITUDE entirely once a material was
+	// merely present. That's wrong: a genuinely dominant material (e.g. weight 250 out of 255)
+	// with a numerically HIGH index could get bumped out of the top MAX_TEXTURE_BLENDS entirely
+	// by three or more unrelated materials that only have TRACE presence (weight 1-2) at some
+	// corner but happen to have LOWER index values -- common on real terrain, where a cell's
+	// corners can each carry a little noise-driven trace of some other category. Confirmed via
+	// u_debug_mode=2 (raw blend weights as RGB, see planet_land.gdshader): large areas rendered
+	// with near-zero weight in the first 3 slots, meaning the true dominant material had been
+	// pushed to the last slot or dropped outright, even though a direct VoxelBuffer probe of the
+	// generator's own output was completely uniform there.
+	//
+	// Correct fix: rank by weight magnitude FIRST (as upstream always did -- this guarantees the
+	// true dominant materials always survive into the top MAX_TEXTURE_BLENDS), and use material
+	// index as a tie-break ONLY when weights are EXACTLY equal. This still fixes the original
+	// instability being chased (two cells with an identical, EXACTLY-tied weight distribution --
+	// e.g. several zero-weight filler slots -- now agree deterministically on tie order) without
+	// ever letting a low-index trace material outrank a genuinely dominant one.
 	struct IndexAndWeightComparator {
 		inline bool operator()(const IndexAndWeight &a, const IndexAndWeight &b) const {
-			return a.weight > b.weight;
+			if (a.weight != b.weight) {
+				return a.weight > b.weight;
+			}
+			return a.index < b.index;
 		}
 	};
 	SortArray<IndexAndWeight, IndexAndWeightComparator> sorter;

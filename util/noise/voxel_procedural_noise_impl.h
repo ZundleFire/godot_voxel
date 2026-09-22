@@ -2062,15 +2062,23 @@ FORCEINLINE FCMaterialBlendResult FCTerrainMaterialBlend(
 			LandMask * (1.f - FCSmoothstep(0.03f, FCLerp(0.16f, 0.08f, Contrast), LandT));
 	const float MountainMask = LandMask *
 			FCSmoothstep(FCLerp(0.68f, 0.60f, Contrast), FCLerp(0.84f, 0.74f, Contrast), LandT);
-	const float SnowStart = FCLerp(0.60f, 0.90f, Warmth);
+	// Thresholds below synced from VCET's VoxelNode_TerrainMaterialBlend (VCETProceduralNoiseNodesImpl.ispc,
+	// ~line 2688-2796, read 2026-08-16) to keep this port's biome bands in line with VCET's latest tuning.
+	// VCET's own inline changelog for these: the SnowStart floor was raised 0.52->0.78 so cold climates
+	// still get a visible "bare rock, not yet snowy" band above Mountain's onset before Snow kicks in; the
+	// Desert warmth thresholds were raised 0.48/0.66->0.70/0.90 so ordinary mild-temperate warmth no longer
+	// saturates to desert. VCET also has a CoastWidth multiplier on the Coast/Mountain edges that this
+	// function has no equivalent input for, so those two lines are left as this codebase's existing
+	// Contrast-only formulation (unaffected by the sync).
+	const float SnowStart = FCLerp(0.78f, 0.95f, Warmth);
 	const float SnowMask =
-			LandMask * FCSmoothstep(SnowStart - 0.08f * Sharpness, SnowStart + 0.08f, LandT);
-	const float DesertMask = LandMask * FCSmoothstep(0.58f, 0.42f, Warmth) *
-			FCSmoothstep(0.48f, 0.70f, Dryness) * (1.f - SnowMask);
-	const float TundraMask = LandMask * FCSmoothstep(0.58f, 0.74f, 1.f - Warmth) *
-			(1.f - SnowMask) * (1.f - DesertMask);
-	const float VegetationMask =
-			LandMask * FCSmoothstep(0.34f, 0.62f, Mst) * (1.f - DesertMask) * (1.f - SnowMask);
+			LandMask * FCSmoothstep(SnowStart - 0.10f * Sharpness, SnowStart + 0.06f, LandT);
+	const float DesertMask = LandMask * FCSmoothstep(0.70f, 0.90f, Warmth) *
+			FCSmoothstep(0.42f, 0.74f, Dryness) * (1.f - SnowMask) * (1.f - CoastMask);
+	const float TundraMask = LandMask * FCSmoothstep(0.48f, 0.78f, 1.f - Warmth) *
+			(1.f - 0.55f * MountainMask) * (1.f - SnowMask) * (1.f - DesertMask);
+	const float VegetationMask = LandMask * FCSmoothstep(0.30f, 0.68f, Mst) *
+			(1.f - DesertMask) * (1.f - 0.75f * SnowMask);
 	const float RiverFeatureMask = LandMask * RivM;
 
 	// Ocean depth split for shallow/deep classes

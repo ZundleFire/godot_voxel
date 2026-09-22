@@ -479,6 +479,77 @@ void register_material_nodes(Span<NodeType> types) {
 	}
 
 	{
+		NodeType &t = types[VoxelGraphFunction::NODE_MATERIAL_MIXER];
+		t.name = "MaterialMixer";
+		t.category = CATEGORY_MATERIAL;
+		// Connect a Material to each `material_i` and its coverage mask (from Climate2D, SlopeMask,
+		// AltitudeMask, NoiseMask...) to the matching `weight_i`. The weights don't have to sum to 1:
+		// the node normalizes them, so masks that overlap or leave gaps still give a usable blend.
+		// Unconnected material slots are skipped entirely. If every weight is 0 the first connected
+		// material wins, so a base material with no mask is a valid "fallback" slot.
+		for (unsigned int i = 0; i < VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT; ++i) {
+			t.inputs.push_back(NodeType::Port(String("material_{0}").format(varray(i))));
+			t.inputs.push_back(NodeType::Port(String("weight_{0}").format(varray(i)), 0.f));
+		}
+		t.outputs.push_back(NodeType::Port("material"));
+		t.process_buffer_func = [](Runtime::ProcessBufferContext &ctx) {
+			Runtime::Buffer &out = ctx.get_output(0);
+			// Materials only carry a placeholder scalar at runtime (the real routing happens at
+			// compile time, see build_material_layer_weights in voxel_generator_graph.cpp). Mirror the
+			// blend anyway so previews and BlendMaterial chains stay consistent.
+			const unsigned int slot_count = VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT;
+			for (uint32_t i = 0; i < out.size; ++i) {
+				float acc = 0.f;
+				float total = 0.f;
+				for (unsigned int slot = 0; slot < slot_count; ++slot) {
+					const float w = MAX(ctx.get_input(slot * 2 + 1).data[i], 0.f);
+					acc += ctx.get_input(slot * 2).data[i] * w;
+					total += w;
+				}
+				out.data[i] = total > 0.f ? acc / total : ctx.get_input(0).data[i];
+			}
+		};
+		t.range_analysis_func = [](Runtime::RangeAnalysisContext &ctx) {
+			Interval r = ctx.get_input(0);
+			for (unsigned int slot = 1; slot < VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT; ++slot) {
+				r = Interval::from_union(r, ctx.get_input(slot * 2));
+			}
+			ctx.set_output(0, r);
+		};
+#ifdef VOXEL_ENABLE_GPU
+		t.shader_gen_func = [](ShaderGenContext &ctx) {
+			ctx.add_format(
+					"float {}_acc = 0.0;\n"
+					"float {}_total = 0.0;\n"
+					"float {}_w = 0.0;\n",
+					ctx.get_output_name(0),
+					ctx.get_output_name(0),
+					ctx.get_output_name(0));
+			for (unsigned int slot = 0; slot < VoxelGraphFunction::MATERIAL_MIXER_SLOT_COUNT; ++slot) {
+				ctx.add_format(
+						"{}_w = max({}, 0.0);\n"
+						"{}_acc += {} * {}_w;\n"
+						"{}_total += {}_w;\n",
+						ctx.get_output_name(0),
+						ctx.get_input_name(slot * 2 + 1),
+						ctx.get_output_name(0),
+						ctx.get_input_name(slot * 2),
+						ctx.get_output_name(0),
+						ctx.get_output_name(0),
+						ctx.get_output_name(0));
+			}
+			ctx.add_format(
+					"{} = {}_total > 0.0 ? {}_acc / {}_total : {};\n",
+					ctx.get_output_name(0),
+					ctx.get_output_name(0),
+					ctx.get_output_name(0),
+					ctx.get_output_name(0),
+					ctx.get_input_name(0));
+		};
+#endif
+	}
+
+	{
 		NodeType &t = types[VoxelGraphFunction::NODE_OUTPUT_MATERIAL];
 		t.name = "MaterialOutput";
 		t.category = CATEGORY_OUTPUT;

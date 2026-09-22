@@ -1255,6 +1255,138 @@ void test_voxel_graph_material_nodes() {
 	memdelete(lod_terrain);
 }
 
+void test_voxel_graph_material_mixer_node() {
+	Ref<VoxelGeneratorGraph> generator;
+	generator.instantiate();
+	Ref<VoxelGraphFunction> graph = generator->get_main_function();
+	ZN_TEST_ASSERT(graph.is_valid());
+
+	Ref<StandardMaterial3D> material_a;
+	material_a.instantiate();
+	material_a->set_albedo(Color(0.2f, 0.4f, 0.8f));
+	material_a->set_roughness(0.1f);
+
+	Ref<StandardMaterial3D> material_b;
+	material_b.instantiate();
+	material_b->set_albedo(Color(0.8f, 0.6f, 0.2f));
+	material_b->set_roughness(0.9f);
+
+	Ref<StandardMaterial3D> material_c;
+	material_c.instantiate();
+	material_c->set_albedo(Color(0.1f, 0.9f, 0.3f));
+	material_c->set_roughness(0.5f);
+
+	// Constant weights that don't sum to 1, plus a slot weighted 0, to check the node normalizes and
+	// that a zero-weight slot contributes nothing.
+	const uint32_t n_mat_a = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_mat_b = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_mat_c = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_mixer = graph->create_node(VoxelGraphFunction::NODE_MATERIAL_MIXER);
+	const uint32_t n_out_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_sdf_const = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_out_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+
+	graph->set_node_param(n_mat_a, 0, material_a);
+	graph->set_node_param(n_mat_b, 0, material_b);
+	graph->set_node_param(n_mat_c, 0, material_c);
+	graph->set_node_param(n_sdf_const, 0, 0.f);
+	graph->add_connection(n_mat_a, 0, n_mixer, 0);
+	graph->set_node_default_input(n_mixer, 1, 1.f);
+	graph->add_connection(n_mat_b, 0, n_mixer, 2);
+	graph->set_node_default_input(n_mixer, 3, 3.f);
+	graph->add_connection(n_mat_c, 0, n_mixer, 4);
+	graph->set_node_default_input(n_mixer, 5, 0.f);
+	graph->add_connection(n_mixer, 0, n_out_material, 0);
+	graph->add_connection(n_sdf_const, 0, n_out_sdf, 0);
+
+	pg::CompilationResult result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(
+			result.success, String("Failed to compile MaterialMixer graph: {0}").format(varray(result.message)));
+
+	Ref<StandardMaterial3D> mixed = generator->get_final_material();
+	ZN_TEST_ASSERT(mixed.is_valid());
+	if (mixed.is_valid()) {
+		// weights 1:3:0 -> a and b at 25%/75%, c absent.
+		const Color expected_albedo = material_a->get_albedo().lerp(material_b->get_albedo(), 0.75f);
+		ZN_TEST_ASSERT(Math::is_equal_approx(mixed->get_albedo().r, expected_albedo.r));
+		ZN_TEST_ASSERT(Math::is_equal_approx(mixed->get_albedo().g, expected_albedo.g));
+		ZN_TEST_ASSERT(Math::is_equal_approx(mixed->get_albedo().b, expected_albedo.b));
+		ZN_TEST_ASSERT(Math::is_equal_approx(mixed->get_roughness(), Math::lerp(0.1f, 0.9f, 0.75f)));
+	}
+
+	// Same node with non-constant weights: this takes the per-pixel shader path instead, which builds
+	// the mixer's normalization as generated graph controls (OP_MIXER_ALPHA).
+	graph->clear();
+	const uint32_t n_y = graph->create_node(VoxelGraphFunction::NODE_INPUT_Y);
+	const uint32_t n_splitter = graph->create_node(VoxelGraphFunction::NODE_HEIGHT_SPLITTER);
+	const uint32_t n_smat_a = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_smat_b = graph->create_node(VoxelGraphFunction::NODE_MATERIAL);
+	const uint32_t n_smixer = graph->create_node(VoxelGraphFunction::NODE_MATERIAL_MIXER);
+	const uint32_t n_sout_material = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_MATERIAL);
+	const uint32_t n_ssdf = graph->create_node(VoxelGraphFunction::NODE_CONSTANT);
+	const uint32_t n_sout_sdf = graph->create_node(VoxelGraphFunction::NODE_OUTPUT_SDF);
+	graph->set_node_param(n_smat_a, 0, material_a);
+	graph->set_node_param(n_smat_b, 0, material_b);
+	graph->set_node_param(n_ssdf, 0, 0.f);
+	graph->set_node_default_input(n_splitter, 1, 0.f);
+	graph->set_node_default_input(n_splitter, 2, 2.f);
+	graph->set_node_default_input(n_splitter, 3, 2.f);
+	graph->add_connection(n_y, 0, n_splitter, 0);
+	graph->add_connection(n_smat_a, 0, n_smixer, 0);
+	graph->add_connection(n_splitter, 1, n_smixer, 1); // "below" mask
+	graph->add_connection(n_smat_b, 0, n_smixer, 2);
+	graph->add_connection(n_splitter, 0, n_smixer, 3); // "above" mask
+	graph->add_connection(n_smixer, 0, n_sout_material, 0);
+	graph->add_connection(n_ssdf, 0, n_sout_sdf, 0);
+
+	result = generator->compile(false);
+	ZN_TEST_ASSERT_MSG(
+			result.success,
+			String("Failed to compile spatial MaterialMixer graph: {0}").format(varray(result.message)));
+
+	Ref<ShaderMaterial> spatial_material = generator->get_final_material();
+	ZN_TEST_ASSERT(spatial_material.is_valid());
+	if (spatial_material.is_valid()) {
+		Ref<Shader> shader = spatial_material->get_shader();
+		ZN_TEST_ASSERT(shader.is_valid());
+		if (shader.is_valid()) {
+			const String shader_code = shader->get_code();
+			ZN_TEST_ASSERT(shader_code.contains("auto_material_control_0"));
+
+			// The 16-layer table must be baked into the shader source, not passed as array uniforms.
+			// Godot lists shader array uniforms as saveable properties but restores them as null on
+			// load, so a `uniform vec4 u_auto_material_albedo[16]` came back empty the moment the
+			// scene was saved and every layer lookup returned zero -- black terrain until the next
+			// graph edit regenerated the material.
+			ZN_TEST_ASSERT(shader_code.contains("const vec4 u_auto_material_albedo[16]"));
+			ZN_TEST_ASSERT(shader_code.contains("const float u_auto_material_roughness[16]"));
+			ZN_TEST_ASSERT(!shader_code.contains("uniform vec4 u_auto_material_albedo"));
+			ZN_TEST_ASSERT(!shader_code.contains("uniform vec4 u_auto_material_emission"));
+			ZN_TEST_ASSERT(!shader_code.contains("uniform float u_auto_material_roughness"));
+			ZN_TEST_ASSERT(!shader_code.contains("uniform float u_auto_material_metallic"));
+			ZN_TEST_ASSERT(!shader_code.contains("uniform float u_auto_material_specular"));
+
+			// ...and the values in it must be the ones the Material nodes carry.
+			ZN_TEST_ASSERT(shader_code.contains("vec4(0.200000, 0.400000, 0.800000, 1.0)"));
+			ZN_TEST_ASSERT(shader_code.contains("vec4(0.800000, 0.600000, 0.200000, 1.0)"));
+		}
+	}
+
+	// And the voxel-weight expansion the mixer feeds when the mesher blends textures instead.
+	VoxelBuffer buffer(VoxelBuffer::ALLOCATOR_DEFAULT);
+	buffer.create(Vector3i(8, 8, 8));
+	buffer.set_channel_depth(VoxelBuffer::CHANNEL_INDICES, VoxelBuffer::DEPTH_16_BIT);
+	buffer.set_channel_depth(VoxelBuffer::CHANNEL_WEIGHTS, VoxelBuffer::DEPTH_16_BIT);
+	VoxelGenerator::VoxelQueryData query{ buffer, Vector3i(0, 0, 0), 0 };
+	generator->generate_block(query);
+	const FixedArray<uint8_t, 4> weights_low = mixel4::decode_weights_from_packed_u16(
+			buffer.get_voxel(0, 0, 0, VoxelBuffer::CHANNEL_WEIGHTS));
+	const FixedArray<uint8_t, 4> weights_high = mixel4::decode_weights_from_packed_u16(
+			buffer.get_voxel(0, 6, 0, VoxelBuffer::CHANNEL_WEIGHTS));
+	// Slot 0 is weighted by "below" and slot 1 by "above", so which one dominates flips with height.
+	ZN_TEST_ASSERT(weights_low[0] > weights_low[1]);
+	ZN_TEST_ASSERT(weights_high[1] > weights_high[0]);
+}
 
 Ref<VoxelGraphFunction> create_pass_through_function() {
 	Ref<VoxelGraphFunction> func;

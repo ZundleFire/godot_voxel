@@ -94,6 +94,7 @@ void run_one_tick(
 			p_sim->get_instance_id(),
 			p_data,
 			p_data->get_block_size(),
+			0, // lod_index
 			p_blocks,
 			p_gravity_mode,
 			p_planet_center,

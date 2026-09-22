@@ -25,6 +25,7 @@ public:
 			ObjectID p_simulator_id,
 			std::shared_ptr<VoxelData> p_data,
 			unsigned int p_block_size,
+			unsigned int p_lod_index,
 			StdVector<Vector3i> p_blocks_to_process,
 			VoxelWaterSimulator::GravityMode p_gravity_mode,
 			Vector3 p_planet_center,
@@ -49,6 +50,7 @@ private:
 	ObjectID _simulator_id;
 	std::shared_ptr<VoxelData> _data;
 	unsigned int _block_size;
+	unsigned int _lod_index;
 	StdVector<Vector3i> _blocks_to_process;
 	VoxelWaterSimulator::GravityMode _gravity_mode;
 	Vector3 _planet_center;

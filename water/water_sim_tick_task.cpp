@@ -19,7 +19,8 @@ const Vector3i FACE_OFFSETS[6] = { Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector
 // `_blocks_to_process` there).
 class TickDataView {
 public:
-	TickDataView(VoxelData &data, unsigned int block_size) : _data(data), _block_size(int(block_size)) {}
+	TickDataView(VoxelData &data, unsigned int block_size, unsigned int lod_index) :
+			_data(data), _block_size(int(block_size)), _lod_index(lod_index) {}
 
 	inline Vector3i block_of(Vector3i global_pos) const {
 		return math::floordiv(global_pos, _block_size);
@@ -30,7 +31,7 @@ public:
 		if (it != _cache.end()) {
 			return it->second;
 		}
-		std::shared_ptr<VoxelBuffer> buf = _data.try_get_block_voxels(block_pos);
+		std::shared_ptr<VoxelBuffer> buf = _data.try_get_block_voxels(block_pos, _lod_index);
 		_cache[block_pos] = buf;
 		return buf;
 	}
@@ -70,15 +71,24 @@ public:
 private:
 	VoxelData &_data;
 	int _block_size;
+	unsigned int _lod_index;
 	StdUnorderedMap<Vector3i, std::shared_ptr<VoxelBuffer>> _cache;
 };
 
-// Ranks the 6 face-neighbor offsets of `global_pos` by alignment with "down": index 0 is the
-// single most-down neighbor, index 5 the single most-up, 1-4 the remaining sideways targets.
+// Ranks the 6 face-neighbor offsets of `global_pos` (expressed in `lod_index`'s own coordinate
+// space) by alignment with "down": index 0 is the single most-down neighbor, index 5 the single
+// most-up, 1-4 the remaining sideways targets.
 void classify_neighbors(
-		VoxelWaterSimulator::GravityMode mode, Vector3 planet_center, Vector3i global_pos, Vector3i r_ranked[6]
+		VoxelWaterSimulator::GravityMode mode, Vector3 planet_center, Vector3i global_pos,
+		unsigned int lod_index, Vector3i r_ranked[6]
 ) {
-	const Vector3 down = VoxelWaterSimulator::compute_down_dir(mode, planet_center, global_pos);
+	// GRAVITY_RADIAL needs a real-world-space position to compute a direction relative to
+	// planet_center (also real-world-space) -- global_pos here is in lod_index's own grid,
+	// where each unit is 2^lod_index world units, so it must be scaled up first. Neighbor
+	// ranking below stays in global_pos's own (unscaled) space, since r_ranked indexes voxels
+	// in that same LOD's buffer.
+	const Vector3i world_pos = global_pos << int(lod_index);
+	const Vector3 down = VoxelWaterSimulator::compute_down_dir(mode, planet_center, world_pos);
 	float dots[6];
 	for (int i = 0; i < 6; ++i) {
 		r_ranked[i] = global_pos + FACE_OFFSETS[i];
@@ -144,6 +154,7 @@ WaterSimTickTask::WaterSimTickTask(
 		ObjectID p_simulator_id,
 		std::shared_ptr<VoxelData> p_data,
 		unsigned int p_block_size,
+		unsigned int p_lod_index,
 		StdVector<Vector3i> p_blocks_to_process,
 		VoxelWaterSimulator::GravityMode p_gravity_mode,
 		Vector3 p_planet_center,
@@ -154,6 +165,7 @@ WaterSimTickTask::WaterSimTickTask(
 		_simulator_id(p_simulator_id),
 		_data(p_data),
 		_block_size(p_block_size),
+		_lod_index(p_lod_index),
 		_blocks_to_process(p_blocks_to_process),
 		_gravity_mode(p_gravity_mode),
 		_planet_center(p_planet_center),
@@ -179,10 +191,10 @@ void WaterSimTickTask::run(ThreadedTaskContext &ctx) {
 	lock_min -= Vector3i(1, 1, 1);
 	lock_max += Vector3i(2, 2, 2); // -1/+1 neighbor margin, plus 1 because max is exclusive
 
-	SpatialLock3D &lock = _data->get_spatial_lock(0);
+	SpatialLock3D &lock = _data->get_spatial_lock(_lod_index);
 	SpatialLock3D::Read rlock(lock, BoxBounds3i(lock_min, lock_max));
 
-	TickDataView view(*_data, _block_size);
+	TickDataView view(*_data, _block_size, _lod_index);
 	StdUnorderedSet<Vector3i> touched_blocks;
 	StdUnorderedSet<Vector3i> missing_blocks;
 
@@ -210,7 +222,7 @@ void WaterSimTickTask::run(ThreadedTaskContext &ctx) {
 					const Vector3i global = block_pos * block_size + Vector3i(x, y, z);
 
 					Vector3i ranked[6];
-					classify_neighbors(_gravity_mode, _planet_center, global, ranked);
+					classify_neighbors(_gravity_mode, _planet_center, global, _lod_index, ranked);
 					const Vector3i down_n = ranked[0];
 					const Vector3i up_n = ranked[5];
 
@@ -340,7 +352,7 @@ void WaterSimTickTask::apply_result() {
 	}
 
 	if (_data != nullptr && _any_touched) {
-		SpatialLock3D &lock = _data->get_spatial_lock(0);
+		SpatialLock3D &lock = _data->get_spatial_lock(_lod_index);
 		const Box3i block_box = Box3i(
 				math::floordiv(_touched_voxel_box.position, int(_block_size)),
 				_touched_voxel_box.size / int(_block_size)
@@ -358,7 +370,7 @@ void WaterSimTickTask::apply_result() {
 		// and got silently dropped, leaking mass with no matching debit anywhere.
 		for (const auto &kv : _mass_deltas) {
 			const Vector3i block_pos = math::floordiv(kv.first, int(_block_size));
-			std::shared_ptr<VoxelBuffer> buf = _data->try_get_block_voxels(block_pos);
+			std::shared_ptr<VoxelBuffer> buf = _data->try_get_block_voxels(block_pos, _lod_index);
 			if (buf == nullptr) {
 				continue;
 			}
@@ -369,7 +381,7 @@ void WaterSimTickTask::apply_result() {
 		}
 		for (const auto &kv : _absorbed_deltas) {
 			const Vector3i block_pos = math::floordiv(kv.first, int(_block_size));
-			std::shared_ptr<VoxelBuffer> buf = _data->try_get_block_voxels(block_pos);
+			std::shared_ptr<VoxelBuffer> buf = _data->try_get_block_voxels(block_pos, _lod_index);
 			if (buf == nullptr) {
 				continue;
 			}
@@ -380,12 +392,26 @@ void WaterSimTickTask::apply_result() {
 		}
 	}
 
+	// post_edit_area()'s update_mesh=true path exists to cascade an SDF-affecting edit up to
+	// coarser LODs so their downsampled mesh stays correct (see VoxelData::mark_area_modified()
+	// -- update_mesh gates block->set_needs_lodding(true), which is what later triggers
+	// VoxelData::update_lods()'s cascade). Water edits only ever touch CHANNEL_DATA5, never
+	// CHANNEL_SDF, and our own water rendering re-scans+regenerates independently every refresh
+	// (see eden_stress_test.gd/voxel_water_demo.gd's _refresh_water_meshes()) rather than
+	// depending on this notification system at all -- so update_mesh=false here is correct, not
+	// just an optimization: real terrain meshing genuinely has nothing to redo. Passing true
+	// was benign at the old, much lower LOD0 tick rate, but at the default 0.2s cadence it was
+	// cascading to coarser LODs constantly, and printing a real (not just verbose) error every
+	// time the destination block wasn't resident -- itself a measurable per-tick main-thread
+	// cost once ticks got frequent enough (confirmed: eliminated a full-second-plus stall).
+	// Still LOD0-only: coarser-LOD ticks never called this at all (their water is rendered the
+	// same script-side-rescan way, so there was never anything for it to invalidate there either).
 	VoxelLodTerrain *terrain = sim->_get_terrain();
-	if (terrain != nullptr && _any_touched) {
-		terrain->post_edit_area(_touched_voxel_box, true);
+	if (terrain != nullptr && _any_touched && _lod_index == 0) {
+		terrain->post_edit_area(_touched_voxel_box, false);
 	}
 
-	sim->_on_tick_completed(_block_results);
+	sim->_on_tick_completed(_block_results, _lod_index);
 }
 
 } // namespace zylann::voxel
