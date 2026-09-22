@@ -38,8 +38,6 @@ Return                                                                | Signatur
 
 Sets whether this viewer will cause loading to occur in the editor. This is mainly intented for testing purposes.
 
-Note that streaming in editor can also be turned off on terrains.
-
 ### [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)<span id="i_requires_collisions"></span> **requires_collisions** = true
 
 If set to `true`, the engine will generate classic collision shapes around this viewer.
@@ -76,4 +74,4 @@ This property has limitations: it is only implemented on [VoxelLodTerrain](Voxel
 
 *(This method has no documentation)*
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

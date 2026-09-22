@@ -75,4 +75,4 @@ Gets the depth of a specific channel. See [Depth](VoxelBuffer.md#enumerations) f
 
 Sets the depth of a specific channel. See [Depth](VoxelBuffer.md#enumerations) for more information.
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

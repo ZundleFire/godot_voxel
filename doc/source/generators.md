@@ -357,7 +357,7 @@ Columns may be designated in two different ways in this process:
     Accessing neighbors doesn't mean this generator has access to *voxels of the terrain players have access to*. Internally, the generator has its own separate representation of the world, and only stores blocks that are generating. Columns don't interact with the game, and the game can't interact with them.
 
 !!! note
-    Just like `VoxelGeneratorScript`, `run_stream_in_editor` will turn off if you have a script attached to the generator. This is because modifying scripts while another thread is running them in the editor can lead to unpredictable behavior and crashes.
+    Generator scripts can run directly in the editor with tool mode, **but need extra caution**. For more info, see [tool scripts](editor.md#tool-scripts).
 
 
 ### Column inter-dependencies
@@ -404,7 +404,7 @@ Since columns will have to be re-accessed many times, they are cached in an inte
 
 ![Screenshot of the inspector showing the generator, in which the cache of columns is shown](images/multipass_cache_viewer.webp)
 
-Each pass can be seen as concentric rectangular areas extending *beyond the view distance of the viewer* (note, you won't see those passes if your terrain has `run_stream_in_editor` disabled).
+Each pass can be seen as concentric rectangular areas extending *beyond the view distance of the viewer* (note, you won't see a preview of these passes if your script is not in tool mode. If it is however, take extra caution, see [Editor preview](editor.md#tool-scripts)).
 Passes that can access neighbors use two shades of color, where the brighter shade means all neighbors have run the same pass.
 
 

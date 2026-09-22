@@ -91,4 +91,4 @@ GLTF: if your terrain uses [ShaderMaterial](https://docs.godotengine.org/en/stab
 
 LOD: if your terrain has LOD, you will only get a snapshot of which LODs are currently active. Detailed meshes will be centered around viewers, and have less and less details further away.
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

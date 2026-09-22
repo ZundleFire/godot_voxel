@@ -45,6 +45,14 @@
 #include "../instancing/voxel_instancer.h"
 #endif
 
+#ifdef ZN_GODOT
+#include "../../util/godot/core/class_db.h"
+#endif
+
+#ifdef VOXEL_ENABLE_GPU
+#include "../../util/godot/classes/rendering_server.h"
+#endif
+
 namespace zylann::voxel {
 
 namespace {
@@ -303,20 +311,6 @@ void VoxelLodTerrain::set_stream(Ref<VoxelStream> p_stream) {
 
 	StreamingDependency::reset(_streaming_dependency, p_stream, get_generator());
 
-#ifdef TOOLS_ENABLED
-	if (p_stream.is_valid()) {
-		if (Engine::get_singleton()->is_editor_hint()) {
-			Ref<Script> stream_script = p_stream->get_script();
-			if (stream_script.is_valid()) {
-				// Safety check. It's too easy to break threads by making a script reload.
-				// You can turn it back on, but be careful.
-				_update_data->settings.run_stream_in_editor = false;
-				notify_property_list_changed();
-			}
-		}
-	}
-#endif
-
 	_on_stream_params_changed();
 }
 
@@ -347,20 +341,6 @@ void VoxelLodTerrain::set_generator(Ref<VoxelGenerator> p_generator) {
 
 	MeshingDependency::reset(_meshing_dependency, _mesher, p_generator);
 	StreamingDependency::reset(_streaming_dependency, get_stream(), p_generator);
-
-#ifdef TOOLS_ENABLED
-	if (p_generator.is_valid()) {
-		if (Engine::get_singleton()->is_editor_hint()) {
-			Ref<Script> generator_script = p_generator->get_script();
-			if (generator_script.is_valid()) {
-				// Safety check. It's too easy to break threads by making a script reload.
-				// You can turn it back on, but be careful.
-				_update_data->settings.run_stream_in_editor = false;
-				notify_property_list_changed();
-			}
-		}
-	}
-#endif
 
 	_on_stream_params_changed();
 }
@@ -504,8 +484,7 @@ void VoxelLodTerrain::_on_stream_params_changed() {
 
 	Ref<VoxelGenerator> generator = get_generator();
 
-	if ((stream.is_valid() || generator.is_valid()) &&
-		(Engine::get_singleton()->is_editor_hint() == false || _update_data->settings.run_stream_in_editor)) {
+	if (((stream.is_valid() && stream->is_runnable()) || (generator.is_valid() && generator->is_runnable()))) {
 		start_streamer();
 		start_updater();
 	}
@@ -737,10 +716,10 @@ void VoxelLodTerrain::push_async_edit(IThreadedTask *task, Box3i box, std::share
 }
 
 Ref<VoxelTool> VoxelLodTerrain::get_voxel_tool() {
-	VoxelToolLodTerrain *vt = memnew(VoxelToolLodTerrain(this));
+	Ref<VoxelToolLodTerrain> vt(memnew(VoxelToolLodTerrain(this)));
 	// Set to most commonly used channel on this kind of terrain
 	vt->set_channel(VoxelBuffer::CHANNEL_SDF);
-	return Ref<VoxelTool>(vt);
+	return vt;
 }
 
 int VoxelLodTerrain::get_view_distance() const {
@@ -2827,29 +2806,6 @@ Dictionary VoxelLodTerrain::_b_get_statistics() const {
 	return d;
 }
 
-void VoxelLodTerrain::set_run_stream_in_editor(bool enable) {
-	if (enable == _update_data->settings.run_stream_in_editor) {
-		return;
-	}
-
-	_update_data->wait_for_end_of_task();
-	_update_data->settings.run_stream_in_editor = enable;
-
-	if (Engine::get_singleton()->is_editor_hint()) {
-		if (enable) {
-			_on_stream_params_changed();
-
-		} else {
-			// This is expected to block the main thread until the streaming thread is done.
-			stop_streamer();
-		}
-	}
-}
-
-bool VoxelLodTerrain::is_stream_running_in_editor() const {
-	return _update_data->settings.run_stream_in_editor;
-}
-
 void VoxelLodTerrain::restart_stream() {
 	_on_stream_params_changed();
 }
@@ -3121,7 +3077,7 @@ void VoxelLodTerrain::get_configuration_warnings(PackedStringArray &warnings) co
 			warnings.append(String("`use_gpu_generation` is enabled, but {0} does not support running on the GPU.")
 									.format(varray(generator->get_class())));
 		}
-		if (!VoxelEngine::get_singleton().has_rendering_device()) {
+		if (!zylann::godot::supports_rendering_device()) {
 			warnings.append(String("`use_gpu_generation` is enabled, but the selected renderer does not support the "
 								   "RenderingDevice API ({0}).")
 									.format(varray(get_current_rendering_method())));
@@ -4362,11 +4318,7 @@ void VoxelLodTerrain::_bind_methods() {
 			D_METHOD("voxel_to_mesh_block_position", "voxel_position", "lod_index"), &Self::voxel_to_mesh_block_position
 	);
 
-	ClassDB::bind_method(D_METHOD("get_voxel_tool"), &Self::get_voxel_tool);
 	ClassDB::bind_method(D_METHOD("save_modified_blocks"), &Self::_b_save_modified_blocks);
-
-	ClassDB::bind_method(D_METHOD("set_run_stream_in_editor"), &Self::set_run_stream_in_editor);
-	ClassDB::bind_method(D_METHOD("is_stream_running_in_editor"), &Self::is_stream_running_in_editor);
 
 	ClassDB::bind_method(D_METHOD("is_area_meshed", "area_in_voxels", "lod_index"), &Self::_b_is_area_meshed);
 
@@ -4675,12 +4627,6 @@ void VoxelLodTerrain::_bind_methods() {
 
 	ADD_GROUP("Advanced", "");
 
-	// TODO Probably should be in parent class?
-	ADD_PROPERTY(
-			PropertyInfo(Variant::BOOL, "run_stream_in_editor"),
-			"set_run_stream_in_editor",
-			"is_stream_running_in_editor"
-	);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "mesh_block_size"), "set_mesh_block_size", "get_mesh_block_size");
 	ADD_PROPERTY(
 			PropertyInfo(Variant::FLOAT, "voxel_size", PROPERTY_HINT_RANGE, "0.01,100.0,0.01,or_greater"),

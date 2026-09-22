@@ -3,11 +3,17 @@
 #include "../../util/containers/container_funcs.h"
 #include "../../util/dstack.h"
 #include "../../util/godot/check_ref_ownership.h"
+#include "../../util/godot/classes/engine.h"
+#include "../../util/godot/classes/script.h"
 #include "../../util/godot/classes/time.h"
 #include "../../util/godot/core/array.h"
 #include "../../util/profiling.h"
 #include "../../util/string/format.h"
 #include "generate_block_multipass_cb_task.h"
+
+#ifdef ZN_GODOT
+#include "../../util/godot/core/class_db.h"
+#endif
 
 namespace zylann::voxel {
 
@@ -383,6 +389,17 @@ void VoxelGeneratorMultipassCB::clear_cache() {
 	}
 	map.columns.clear();
 	*/
+}
+
+bool VoxelGeneratorMultipassCB::is_runnable() const {
+	Ref<Script> my_script = get_script();
+	if (my_script.is_null()) {
+		return false;
+	}
+	if (Engine::get_singleton()->is_editor_hint()) {
+		return my_script->is_tool();
+	}
+	return true;
 }
 
 bool VoxelGeneratorMultipassCB::debug_try_get_column_states(StdVector<DebugColumnState> &out_states) {

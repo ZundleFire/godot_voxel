@@ -232,7 +232,13 @@ Note: if you use a [ShaderMaterial](https://docs.godotengine.org/en/stable/class
 
 ### [int](https://docs.godotengine.org/en/stable/classes/class_int.html)<span id="i_mesh_block_size"></span> **mesh_block_size** = 16
 
-Size of meshes used for chunks of this volume, in voxels. Can only be set to either 16 or 32. Using 32 is expected to increase rendering performance, and slightly increase the cost of edits.
+Sets how many voxels across meshes of the terrain span.
+
+Voxel chunks are stored in cubic chunks of 16x16x16 voxels, and by default meshes of the terrain match that size. But you can set this to 32 so meshes will span 2x2x2 voxel chunks. This is a performance tradeoff. Higher mesh size may speed up rendering, at the cost of slower mesh updates.
+
+Values other than 16 and 32 are not supported.
+
+Note: this setting also affects [VoxelInstancer](VoxelInstancer.md) chunks.
 
 ### [int](https://docs.godotengine.org/en/stable/classes/class_int.html)<span id="i_normalmap_begin_lod_index"></span> **normalmap_begin_lod_index** = 2
 
@@ -268,7 +274,7 @@ Enables GPU detail normalmaps generation, which can speed it up. This is only va
 
 ### [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)<span id="i_run_stream_in_editor"></span> **run_stream_in_editor** = true
 
-Sets wether the [generator](VoxelLodTerrain.md#i_generator) and the [stream](VoxelLodTerrain.md#i_stream) will run in the editor. This setting may turn on automatically if either contain a script, as multithreading can clash with script reloading in unexpected ways.
+*(This property has no documentation)*
 
 ### [float](https://docs.godotengine.org/en/stable/classes/class_float.html)<span id="i_secondary_lod_distance"></span> **secondary_lod_distance** = 48.0
 
@@ -485,4 +491,4 @@ Converts a voxel position into a data block position for a specific LOD index.
 
 Converts a voxel position into a mesh block position for a specific LOD index.
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

@@ -77,7 +77,6 @@ struct VoxelLodTerrainUpdateData {
 		unsigned int view_distance_voxels = 512;
 		StreamingSystem streaming_system = STREAMING_SYSTEM_LEGACY_OCTREE;
 		// bool full_load_mode = false;
-		bool run_stream_in_editor = true;
 		// If true, try to generate blocks and store them in the data map before posting mesh requests.
 		// If false, meshing will generate non-edited voxels on the fly instead.
 		// If streaming is disabled, this option has no effect.

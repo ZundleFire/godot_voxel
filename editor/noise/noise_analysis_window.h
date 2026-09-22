@@ -1,26 +1,32 @@
 #ifndef NOISE_ANALYSIS_WINDOW_H
 #define NOISE_ANALYSIS_WINDOW_H
 
-#include "../../util/noise/fast_noise_2.h"
-#include <scene/gui/dialogs.h>
+#include "../../util/godot/classes/accept_dialog.h"
+#include "../../util/godot/core/random_pcg.h"
+#include "../../util/godot/macros.h"
+#include "../../util/noise/fast_noise_lite/fast_noise_lite.h"
+#include "noise_adapter.h"
 
-class SpinBox;
-class LineEdit;
-class ProgressBar;
-class OptionButton;
+ZN_GODOT_FORWARD_DECLARE(class SpinBox)
+ZN_GODOT_FORWARD_DECLARE(class LineEdit)
+ZN_GODOT_FORWARD_DECLARE(class ProgressBar)
+ZN_GODOT_FORWARD_DECLARE(class OptionButton)
 
 namespace zylann {
 
-class ChartView;
+class ZN_ChartView;
 
 // This is an experimental tool to check noise properties empirically,
 // by sampling it a lot of times and seeing what the minimum and maximum values are.
-class NoiseAnalysisWindow : public AcceptDialog {
-	GDCLASS(NoiseAnalysisWindow, AcceptDialog)
+class ZN_NoiseAnalysisWindow : public AcceptDialog {
+	GDCLASS(ZN_NoiseAnalysisWindow, AcceptDialog)
 public:
-	NoiseAnalysisWindow();
+	ZN_NoiseAnalysisWindow();
 
+#ifdef VOXEL_ENABLE_FAST_NOISE_2
 	void set_noise(Ref<FastNoise2> noise);
+#endif
+	void set_noise(Ref<ZN_FastNoiseLite> noise);
 
 private:
 	enum Dimension { //
@@ -31,11 +37,11 @@ private:
 
 	void _on_calculate_button_pressed();
 	void _notification(int p_what);
-	void _process();
+	void process();
 
 	static void _bind_methods();
 
-	Ref<FastNoise2> _noise;
+	NoiseAdapter _adapter;
 
 	OptionButton *_dimension_option_button = nullptr;
 	SpinBox *_step_count_spinbox = nullptr;
@@ -44,7 +50,7 @@ private:
 	SpinBox *_area_size_spinbox = nullptr;
 	SpinBox *_samples_count_spinbox = nullptr;
 
-	ChartView *_chart_view = nullptr;
+	ZN_ChartView *_chart_view = nullptr;
 
 	ProgressBar *_progress_bar = nullptr;
 
@@ -74,6 +80,8 @@ private:
 	};
 
 	AnalysisResults _results;
+
+	RandomPCG _rng;
 };
 
 } // namespace zylann

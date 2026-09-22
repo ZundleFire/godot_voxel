@@ -152,6 +152,7 @@ TypedArray<Dictionary> ZN_EditorImportPlugin::_get_import_options(const String &
 		d[property_hint_key] = option.option.hint;
 		d[hint_string_key] = String(option.option.hint_string);
 		d[usage_key] = option.option.usage;
+		output.push_back(d);
 	}
 
 	return output;

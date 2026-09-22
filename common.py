@@ -128,6 +128,7 @@ def get_sources(env, is_editor_build):
 
         "util/godot/classes/array_mesh.cpp",
         "util/godot/classes/concave_polygon_shape_3d.cpp",
+        "util/godot/classes/directory.cpp",
         "util/godot/classes/geometry_2d.cpp",
         "util/godot/classes/geometry_instance_3d.cpp",
         "util/godot/classes/input_event_key.cpp",
@@ -156,6 +157,7 @@ def get_sources(env, is_editor_build):
         "util/godot/direct_static_body.cpp",
         "util/godot/file_utils.cpp",
         "util/godot/shader_material_pool.cpp",
+        "util/godot/string_names.cpp",
 
         "util/io/*.cpp",
 
@@ -171,6 +173,7 @@ def get_sources(env, is_editor_build):
             "editor/terrain/*.cpp",
             "editor/fast_noise_lite/*.cpp",
             "editor/spot_noise/*.cpp",
+            "editor/noise/*.cpp",
             "editor/graph/*.cpp",
             "editor/blocky_library/*.cpp",
             "editor/blocky_library/types/*.cpp",
@@ -228,15 +231,17 @@ def get_sources(env, is_editor_build):
         ]
 
         if tests_enabled:
-            sources += ["tests/voxel/test_surface_nets.cpp"]
+            sources += [
+                "tests/voxel/test_surface_nets.cpp",
+                "tests/voxel/test_transvoxel.cpp",
+            ]
 
         if gpu_enabled:
             sources += ["engine/detail_rendering/render_detail_texture_gpu_task.cpp"]
 
             if tests_enabled:
                 sources += [
-                    "tests/voxel/test_detail_rendering_gpu.cpp",
-                    "tests/voxel/test_transvoxel.cpp"
+                    "tests/voxel/test_detail_rendering_gpu.cpp"
                 ]
         
     if modifiers_enabled:

@@ -187,6 +187,10 @@ public:
 
 	virtual void clear_cache();
 
+	// Hints whether the stream's functions can be called. Mainly used in case of script implementations, to avoid error
+	// spams.
+	virtual bool is_runnable() const;
+
 	// Editor
 
 #ifdef TOOLS_ENABLED

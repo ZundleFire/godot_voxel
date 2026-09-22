@@ -45,6 +45,7 @@
 #include "terrain/voxel_viewer.h"
 #include "util/godot/check_ref_ownership.h"
 #include "water/voxel_water_simulator.h"
+#include "util/godot/string_names.h"
 #include "util/macros.h"
 #include "util/noise/fast_noise_lite/fast_noise_lite.h"
 #include "util/noise/fast_noise_lite/fast_noise_lite_gradient.h"
@@ -107,6 +108,7 @@
 #endif
 
 #include "util/godot/classes/engine.h"
+#include "util/godot/classes/os.h" // for get_command_line_arguments
 #include "util/godot/classes/project_settings.h"
 #include "util/godot/core/class_db.h"
 // Just for size reminders
@@ -173,6 +175,8 @@
 #include "editor/graph/voxel_range_analysis_dialog.h"
 #include "editor/mesh_sdf/voxel_mesh_sdf_viewer.h"
 #include "editor/multipass/voxel_generator_multipass_cache_viewer.h"
+#include "editor/noise/chart_view.h"
+#include "editor/noise/noise_analysis_window.h"
 #include "editor/spot_noise/spot_noise_editor_inspector_plugin.h"
 #include "editor/spot_noise/spot_noise_viewer.h"
 #include "editor/terrain/editor_property_aabb_min_max.h"
@@ -413,6 +417,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 		// Setup engine after classes are registered.
 		// This is necessary when using GDExtension because classes can't be instantiated until they are registered.
 
+		zylann::godot::StringNames::create_singleton();
 		VoxelMemoryPool::create_singleton();
 		VoxelStringNames::create_singleton();
 		pg::NodeTypeDB::create_singleton();
@@ -470,6 +475,8 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 		ClassDB::register_internal_class<ZN_FastNoiseLiteEditorPlugin>();
 		ClassDB::register_internal_class<ZN_FastNoiseLiteEditorInspectorPlugin>();
 		ClassDB::register_internal_class<ZN_FastNoiseLiteViewer>();
+		ClassDB::register_internal_class<ZN_ChartView>();
+		ClassDB::register_internal_class<ZN_NoiseAnalysisWindow>();
 
 		ClassDB::register_internal_class<ZN_SpotNoiseEditorPlugin>();
 		ClassDB::register_internal_class<ZN_SpotNoiseEditorInspectorPlugin>();
@@ -605,6 +612,8 @@ void uninitialize_voxel_module(ModuleInitializationLevel p_level) {
 
 		// Do this last as VoxelEngine might still be holding some refs to voxel blocks
 		VoxelMemoryPool::destroy_singleton();
+
+		zylann::godot::StringNames::destroy_singleton();
 
 #ifdef ZN_DEBUG_LOG_FILE_ENABLED
 		close_log_file();

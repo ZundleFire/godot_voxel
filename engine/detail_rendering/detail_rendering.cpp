@@ -762,8 +762,13 @@ Vector<Ref<Image>> store_atlas_to_image_array(
 ) {
 	ZN_PROFILE_SCOPE();
 
-	const unsigned int pixel_size = octahedral_encoding ? 2 : 3;
-	const Image::Format format = octahedral_encoding ? Image::FORMAT_RG8 : Image::FORMAT_RGB8;
+	const unsigned int pixel_size = octahedral_encoding ? 2 : 4;
+	const Image::Format format =
+			octahedral_encoding ? Image::FORMAT_RG8 :
+								// We don't use the alpha channel, but Godot would spam warnings about RGB8 not being
+								// supported by GPU. So we waste a bit of memory for now, which is unfortunate for a
+								// kind of texture stored in large numbers. Maybe one day it will be used for something.
+			Image::FORMAT_RGBA8;
 	const unsigned int tile_size_in_pixels = math::squared(tile_resolution);
 	const unsigned int tile_size_in_bytes = tile_size_in_pixels * pixel_size;
 
@@ -796,8 +801,13 @@ Ref<Image> store_atlas_to_image(
 ) {
 	ZN_PROFILE_SCOPE();
 
-	const unsigned int pixel_size = octahedral_encoding ? 2 : 3;
-	const Image::Format format = octahedral_encoding ? Image::FORMAT_RG8 : Image::FORMAT_RGB8;
+	const unsigned int pixel_size = octahedral_encoding ? 2 : 4;
+	const Image::Format format =
+			octahedral_encoding ? Image::FORMAT_RG8 :
+								// We don't use the alpha channel, but Godot would spam warnings about RGB8 not being
+								// supported by GPU. So we waste a bit of memory for now, which is unfortunate for a
+								// kind of texture stored in large numbers. Maybe one day it will be used for something.
+			Image::FORMAT_RGBA8;
 	const unsigned int tile_size_in_pixels = math::squared(tile_resolution);
 	const unsigned int tile_size_in_bytes = tile_size_in_pixels * pixel_size;
 
@@ -884,6 +894,37 @@ unsigned int get_detail_texture_tile_resolution_for_lod(
 			int(settings.tile_resolution_max)
 	);
 	return tile_resolution;
+}
+
+void copy_2d_region_from_packed_to_atlased(
+		Span<uint8_t> dst,
+		const Vector2i dst_size,
+		const Span<const uint8_t> src,
+		const Vector2i src_size,
+		const Vector2i dst_pos,
+		const unsigned int item_size_in_bytes
+) {
+#ifdef DEBUG_ENABLED
+	ZN_ASSERT(src_size.x >= 0 && src_size.y >= 0);
+	ZN_ASSERT(dst_size.x >= 0 && dst_size.y >= 0);
+	ZN_ASSERT(
+			dst_pos.x >= 0 && dst_pos.y >= 0 && dst_pos.x + src_size.x <= dst_size.x &&
+			dst_pos.y + src_size.y <= dst_size.y
+	);
+	ZN_ASSERT(src.size() == src_size.x * src_size.y * item_size_in_bytes);
+	ZN_ASSERT(dst.size() == dst_size.x * dst_size.y * item_size_in_bytes);
+	ZN_ASSERT(!src.overlaps(dst));
+#endif
+	const unsigned int dst_begin = (dst_pos.x + dst_pos.y * dst_size.x) * item_size_in_bytes;
+	const unsigned int src_row_size = src_size.x * item_size_in_bytes;
+	const unsigned int dst_row_size = dst_size.x * item_size_in_bytes;
+	uint8_t *dst_p = dst.data() + dst_begin;
+	const uint8_t *src_p = src.data();
+	for (unsigned int src_y = 0; src_y < (unsigned int)src_size.y; ++src_y) {
+		memcpy(dst_p, src_p, src_row_size);
+		dst_p += dst_row_size;
+		src_p += src_row_size;
+	}
 }
 
 } // namespace zylann::voxel

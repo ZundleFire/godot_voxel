@@ -317,9 +317,6 @@ public:
 
 	// Editor
 
-	void set_run_stream_in_editor(bool enable);
-	bool is_stream_running_in_editor() const;
-
 #ifdef TOOLS_ENABLED
 	void get_configuration_warnings(PackedStringArray &warnings) const override;
 #endif // TOOLS_ENABLED

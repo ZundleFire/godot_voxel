@@ -75,6 +75,7 @@ def find_godot(bindir): # bindir: Path
     names = [
         prefix + os_prefix + ".editor.dev" + arch + suffix,
         prefix + os_prefix + ".editor" + arch + suffix,
+        prefix + os_prefix + ".editor.dev.double" + arch + suffix,
     ]
 
     # Of all that we find, pick the most recent

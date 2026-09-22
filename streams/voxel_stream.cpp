@@ -121,6 +121,10 @@ godot::VoxelBlockSerializer::Compression VoxelStream::get_compression_mode() con
 	return godot::VoxelBlockSerializer::compression_to_gd(_compression_mode);
 }
 
+bool VoxelStream::is_runnable() const {
+	return true;
+}
+
 // Binding land
 
 VoxelStream::ResultCode VoxelStream::_b_load_voxel_block(

@@ -45,4 +45,4 @@ The purpose of `batch_count` is to optimize the picking process through the inte
 
 `batch` can bias randomness by concentrating picks in specific blocks, but if this function is used every frame over time, that bias should average out. If you want no bias at all, set `batch_count` to 1.
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

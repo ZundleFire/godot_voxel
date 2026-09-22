@@ -34,6 +34,8 @@ public:
 	Dictionary get_sdf_compute_params() const;
 	void generate_materials(VoxelGenerator::VoxelQueryData input);
 
+	bool is_runnable() const override;
+
 protected:
 	GDVIRTUAL3(_generate_block, Ref<godot::VoxelBuffer>, Vector3i, int)
 	GDVIRTUAL3R(bool, _generate_broad_block, Ref<godot::VoxelBuffer>, Vector3i, int)

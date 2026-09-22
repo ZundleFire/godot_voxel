@@ -6,9 +6,13 @@
 #include "../../util/godot/classes/texture_rect.h"
 #include "../../util/godot/editor_scale.h"
 #include "../../util/noise/fast_noise_2.h"
-#include "noise_analysis_window.h"
+#include "../noise/noise_analysis_window.h"
 
 #include <core/core_string_names.h>
+
+#ifdef ZN_GODOT
+#include "../../util/godot/core/callable_mp.h"
+#endif
 
 namespace zylann {
 
@@ -56,14 +60,16 @@ public:
 
 		if (_noise.is_valid()) {
 			_noise->disconnect(
-					CoreStringNames::get_singleton()->changed, callable_mp(this, &FastNoise2Viewer::_on_noise_changed));
+					CoreStringNames::get_singleton()->changed, callable_mp(this, &FastNoise2Viewer::_on_noise_changed)
+			);
 		}
 
 		_noise = noise;
 
 		if (_noise.is_valid()) {
 			_noise->connect(
-					CoreStringNames::get_singleton()->changed, callable_mp(this, &FastNoise2Viewer::_on_noise_changed));
+					CoreStringNames::get_singleton()->changed, callable_mp(this, &FastNoise2Viewer::_on_noise_changed)
+			);
 			set_process(true);
 			update_preview();
 
@@ -73,7 +79,7 @@ public:
 		}
 	}
 
-	void set_noise_analysis_window(NoiseAnalysisWindow *win) {
+	void set_noise_analysis_window(ZN_NoiseAnalysisWindow *win) {
 		_noise_analysis_window = win;
 	}
 
@@ -116,7 +122,7 @@ private:
 
 		const Vector2i preview_size(PREVIEW_WIDTH, PREVIEW_HEIGHT);
 
-		Ref<Image> im = Image::create_empty(preview_size.x, preview_size.y, false, Image::FORMAT_RGB8);
+		Ref<Image> im = Image::create_empty(preview_size.x, preview_size.y, false, Image::FORMAT_L8);
 
 		if (_noise.is_valid()) {
 			_noise->generate_image(im, false);
@@ -130,7 +136,7 @@ private:
 	float _time_before_update = -1.f;
 	TextureRect *_texture_rect = nullptr;
 	PopupMenu *_context_menu = nullptr;
-	NoiseAnalysisWindow *_noise_analysis_window = nullptr;
+	ZN_NoiseAnalysisWindow *_noise_analysis_window = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -155,12 +161,12 @@ public:
 		}
 	}
 
-	void set_noise_analysis_window(NoiseAnalysisWindow *noise_analysis_window) {
+	void set_noise_analysis_window(ZN_NoiseAnalysisWindow *noise_analysis_window) {
 		_noise_analysis_window = noise_analysis_window;
 	}
 
 private:
-	NoiseAnalysisWindow *_noise_analysis_window = nullptr;
+	ZN_NoiseAnalysisWindow *_noise_analysis_window = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -172,7 +178,7 @@ FastNoise2EditorPlugin::FastNoise2EditorPlugin() {}
 void FastNoise2EditorPlugin::init() {
 	Control *base_control = get_editor_interface()->get_base_control();
 
-	_noise_analysis_window = memnew(NoiseAnalysisWindow);
+	_noise_analysis_window = memnew(ZN_NoiseAnalysisWindow);
 	base_control->add_child(_noise_analysis_window);
 
 	Ref<FastNoise2EditorInspectorPlugin> plugin;

@@ -902,8 +902,8 @@ void VoxelLodTerrainUpdateTask::run(ThreadedTaskContext &ctx) {
 	ProfilingClock profiling_clock_total;
 
 	// TODO This is not a good name, "streaming" has several meanings. Rename "can_load"?
-	const bool stream_enabled = (stream.is_valid() || generator.is_valid()) &&
-			(Engine::get_singleton()->is_editor_hint() == false || settings.run_stream_in_editor);
+	const bool stream_enabled =
+			((stream.is_valid() && stream->is_runnable()) || (generator.is_valid() && generator->is_runnable()));
 
 	const unsigned int lod_count = data.get_lod_count();
 

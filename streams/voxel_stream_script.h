@@ -22,6 +22,8 @@ public:
 
 	int get_used_channels_mask() const override;
 
+	bool is_runnable() const override;
+
 protected:
 	// TODO Why is it unable to convert `Result` into `Variant` even though a cast is defined in voxel_stream.h???
 	GDVIRTUAL3R(int, _load_voxel_block, Ref<godot::VoxelBuffer>, Vector3i, int)

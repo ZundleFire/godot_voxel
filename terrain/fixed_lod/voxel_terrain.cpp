@@ -147,20 +147,6 @@ void VoxelTerrain::set_stream(Ref<VoxelStream> p_stream) {
 
 	StreamingDependency::reset(_streaming_dependency, p_stream, get_generator());
 
-#ifdef TOOLS_ENABLED
-	if (p_stream.is_valid()) {
-		if (Engine::get_singleton()->is_editor_hint()) {
-			Ref<Script> stream_script = p_stream->get_script();
-			if (stream_script.is_valid()) {
-				// Safety check. It's too easy to break threads by making a script reload.
-				// You can turn it back on, but be careful.
-				_run_stream_in_editor = false;
-				notify_property_list_changed();
-			}
-		}
-	}
-#endif
-
 	_on_stream_params_changed();
 }
 
@@ -195,20 +181,6 @@ void VoxelTerrain::set_generator(Ref<VoxelGenerator> p_generator) {
 
 	MeshingDependency::reset(_meshing_dependency, _mesher, p_generator);
 	StreamingDependency::reset(_streaming_dependency, get_stream(), p_generator);
-
-#ifdef TOOLS_ENABLED
-	if (p_generator.is_valid()) {
-		if (Engine::get_singleton()->is_editor_hint()) {
-			Ref<Script> generator_script = p_generator->get_script();
-			if (generator_script.is_valid()) {
-				// Safety check. It's too easy to break threads by making a script reload.
-				// You can turn it back on, but be careful.
-				_run_stream_in_editor = false;
-				notify_property_list_changed();
-			}
-		}
-	}
-#endif
 
 	_on_stream_params_changed();
 }
@@ -320,8 +292,8 @@ void VoxelTerrain::_on_stream_params_changed() {
 
 	_data->set_format(get_internal_format());
 
-	if ((get_stream().is_valid() || get_generator().is_valid()) &&
-		(Engine::get_singleton()->is_editor_hint() == false || _run_stream_in_editor)) {
+	if (((get_stream().is_valid() && get_stream()->is_runnable()) ||
+		 (get_generator().is_valid() && get_generator()->is_runnable()))) {
 		start_streamer();
 		start_updater();
 	}
@@ -1493,10 +1465,11 @@ void VoxelTerrain::process_viewers() {
 		VoxelEngine::get_singleton().for_each_viewer(u);
 	}
 
-	const bool can_load_blocks = ((_automatic_loading_enabled &&
-								   (_multiplayer_synchronizer == nullptr || _multiplayer_synchronizer->is_server())) &&
-								  (get_stream().is_valid() || get_generator().is_valid())) &&
-			(Engine::get_singleton()->is_editor_hint() == false || _run_stream_in_editor);
+	const bool can_load_blocks =
+			((_automatic_loading_enabled &&
+			  (_multiplayer_synchronizer == nullptr || _multiplayer_synchronizer->is_server())) &&
+			 ((get_stream().is_valid() && get_stream()->is_runnable()) ||
+			  (get_generator().is_valid() && get_generator()->is_runnable())));
 
 	// Find out which blocks need to appear and which need to be unloaded
 	{
@@ -1622,8 +1595,7 @@ void VoxelTerrain::process_viewer_data_box_change(
 	// TODO Any reason to unview old blocks before viewing new blocks?
 	// Because if a viewer is removed and another is added, it will reload the whole area even if their box is the same.
 	{
-		const bool may_save =
-				get_stream().is_valid() && (!Engine::get_singleton()->is_editor_hint() || _run_stream_in_editor);
+		const bool may_save = get_stream().is_valid() && get_stream()->is_runnable();
 
 		tls_missing_blocks.clear();
 		tls_found_blocks_positions.clear();
@@ -2193,28 +2165,6 @@ Ref<VoxelTool> VoxelTerrain::get_voxel_tool() {
 	return vt;
 }
 
-void VoxelTerrain::set_run_stream_in_editor(bool enable) {
-	if (enable == _run_stream_in_editor) {
-		return;
-	}
-
-	_run_stream_in_editor = enable;
-
-	if (Engine::get_singleton()->is_editor_hint()) {
-		if (_run_stream_in_editor) {
-			_on_stream_params_changed();
-
-		} else {
-			// This is expected to block the main thread until the streaming thread is done.
-			stop_streamer();
-		}
-	}
-}
-
-bool VoxelTerrain::is_stream_running_in_editor() const {
-	return _run_stream_in_editor;
-}
-
 void VoxelTerrain::set_bounds(Box3i box) {
 	Box3i bounds_in_voxels =
 			box.clipped(Box3i::from_center_extents(Vector3i(), Vector3iUtil::create(constants::MAX_VOLUME_EXTENT)));
@@ -2555,13 +2505,9 @@ void VoxelTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_mesh_block_size", "size"), &Self::set_mesh_block_size);
 
 	ClassDB::bind_method(D_METHOD("get_statistics"), &Self::_b_get_statistics);
-	ClassDB::bind_method(D_METHOD("get_voxel_tool"), &Self::get_voxel_tool);
 
 	ClassDB::bind_method(D_METHOD("save_modified_blocks"), &Self::_b_save_modified_blocks);
 	ClassDB::bind_method(D_METHOD("save_block", "position"), &Self::_b_save_block);
-
-	ClassDB::bind_method(D_METHOD("set_run_stream_in_editor", "enable"), &Self::set_run_stream_in_editor);
-	ClassDB::bind_method(D_METHOD("is_stream_running_in_editor"), &Self::is_stream_running_in_editor);
 
 	ClassDB::bind_method(D_METHOD("set_automatic_loading_enabled", "enable"), &Self::set_automatic_loading_enabled);
 	ClassDB::bind_method(D_METHOD("is_automatic_loading_enabled"), &Self::is_automatic_loading_enabled);
@@ -2658,12 +2604,6 @@ void VoxelTerrain::_bind_methods() {
 
 	ADD_GROUP("Advanced", "");
 
-	// TODO Should probably be in the parent class?
-	ADD_PROPERTY(
-			PropertyInfo(Variant::BOOL, "run_stream_in_editor"),
-			"set_run_stream_in_editor",
-			"is_stream_running_in_editor"
-	);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "mesh_block_size"), "set_mesh_block_size", "get_mesh_block_size");
 #ifdef VOXEL_ENABLE_GPU
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "use_gpu_generation"), "set_generator_use_gpu", "get_generator_use_gpu");

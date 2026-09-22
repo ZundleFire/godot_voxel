@@ -1,12 +1,14 @@
 #include "chart_view.h"
+#include "../../util/godot/classes/font.h"
+#include "../../util/godot/classes/line_2d.h"
+#include "../../util/godot/core/packed_arrays.h"
 #include "../../util/godot/editor_scale.h"
+#include "../../util/godot/string_names.h"
 #include "../../util/math/funcs.h"
-
-#include <scene/2d/line_2d.h>
 
 namespace zylann {
 
-ChartView::ChartView() {
+ZN_ChartView::ZN_ChartView() {
 	_line_renderer = memnew(Line2D);
 	add_child(_line_renderer);
 
@@ -16,16 +18,13 @@ ChartView::ChartView() {
 	_view_max = Vector2(1, 1);
 }
 
-void ChartView::set_points(Span<const Vector2> points) {
+void ZN_ChartView::set_points(Span<const Vector2> points) {
 	_points.resize(points.size());
-	for (size_t i = 0; i < points.size(); ++i) {
-		_points.write[i] = points[i];
-	}
-
+	points.copy_to(to_span(_points));
 	queue_redraw();
 }
 
-void ChartView::auto_fit_view(Vector2 margin_ratios) {
+void ZN_ChartView::auto_fit_view(Vector2 margin_ratios) {
 	if (_points.size() > 0) {
 		Vector2 min_point = _points[0];
 		Vector2 max_point = min_point;
@@ -47,10 +46,10 @@ void ChartView::auto_fit_view(Vector2 margin_ratios) {
 	queue_redraw();
 }
 
-void ChartView::_notification(int p_what) {
+void ZN_ChartView::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_DRAW:
-			_draw();
+			on_draw();
 			break;
 
 			// case NOTIFICATION_RESIZED:
@@ -62,7 +61,7 @@ void ChartView::_notification(int p_what) {
 	}
 }
 
-void ChartView::_draw() {
+void ZN_ChartView::on_draw() {
 	const Color line_color(Color(0.8, 0.8, 0.8, 1.0));
 	const Color x_axis_color(Color(1.0, 1.0, 1.0, 0.5));
 	const Color y_axis_color(Color(1.0, 1.0, 1.0, 0.5));
@@ -71,7 +70,9 @@ void ChartView::_draw() {
 
 	// Background
 
-	draw_style_box(get_theme_stylebox(SNAME("bg"), SNAME("Tree")), Rect2(Point2(), view_size_pixels));
+	const zylann::godot::StringNames &sn = zylann::godot::StringNames::get_singleton();
+
+	draw_style_box(get_theme_stylebox(sn.bg, sn.Tree), Rect2(Point2(), view_size_pixels));
 
 	if (_view_min.is_equal_approx(_view_max) || _points.size() == 0) {
 		return;
@@ -97,8 +98,10 @@ void ChartView::_draw() {
 	if (_visual_points.size() != _points.size()) {
 		_visual_points.resize(_points.size());
 	}
+	// Note, writing to an index has different syntax between Godot core and GDExtensions
+	Span<Vector2> visual_points = to_span(_visual_points);
 	for (int i = 0; i < _points.size(); ++i) {
-		_visual_points.write[i] = m.xform(_points[i]);
+		visual_points[i] = m.xform(_points[i]);
 	}
 
 	// draw_polyline(_visual_points, line_color, 2.0, true);
@@ -119,16 +122,30 @@ void ChartView::_draw() {
 
 	// Markings
 
-	Ref<Font> font = get_theme_font(SNAME("font"), SNAME("Label"));
-	const int font_size = get_theme_font_size(SNAME("font_size"), SNAME("Label"));
-	const Color text_color = get_theme_color(SNAME("font_color"), SNAME("Editor"));
+	Ref<Font> font = get_theme_font(sn.font, sn.Label);
+	const int font_size = get_theme_font_size(sn.font_size, sn.Label);
+	const Color text_color = get_theme_color(sn.font_color, sn.Editor);
 
 	const int font_height = font->get_height(font_size);
 	const Vector2 text_offset(2.f * EDSCALE, -2.f * EDSCALE);
-	draw_string(font, Vector2(0, font_height) + text_offset, String::num_real(_view_max.y), HORIZONTAL_ALIGNMENT_LEFT,
-			-1.f, font_size, text_color);
-	draw_string(font, Vector2(0, view_size_pixels.y) + text_offset, String::num_real(_view_min.y),
-			HORIZONTAL_ALIGNMENT_LEFT, -1.f, font_size, text_color);
+	draw_string(
+			font,
+			Vector2(0, font_height) + text_offset,
+			String::num_real(_view_max.y),
+			HORIZONTAL_ALIGNMENT_LEFT,
+			-1.f,
+			font_size,
+			text_color
+	);
+	draw_string(
+			font,
+			Vector2(0, view_size_pixels.y) + text_offset,
+			String::num_real(_view_min.y),
+			HORIZONTAL_ALIGNMENT_LEFT,
+			-1.f,
+			font_size,
+			text_color
+	);
 
 	// TODO Draw hovered value
 }

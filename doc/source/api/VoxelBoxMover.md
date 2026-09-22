@@ -78,4 +78,4 @@ Sets the maximum height that can be climbed like "stairs".
 
 When enabled, [get_motion](VoxelBoxMover.md#i_get_motion) will attempt to climb up small steps. This allows to implement Minecraft-like stairs.
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

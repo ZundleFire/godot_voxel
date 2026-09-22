@@ -31,6 +31,8 @@ inline Error rename_directory(const String &from, const String &to) {
 	return DirAccess::rename_absolute(from, to);
 }
 
+Error erase_directory_contents_recursive(DirAccess &da);
+
 } // namespace zylann::godot
 
 #endif // ZN_GODOT_DIRECTORY_H

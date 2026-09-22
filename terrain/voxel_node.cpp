@@ -11,6 +11,7 @@
 #include "../util/godot/core/string.h"
 
 #ifdef ZN_GODOT
+#include "../util/godot/core/callable_mp.h"
 #include "../util/godot/core/class_db.h"
 #endif
 
@@ -176,7 +177,8 @@ void VoxelNode::get_configuration_warnings(PackedStringArray &warnings) const {
 				// properly?
 				warnings.append(
 						ZN_TTR("Careful, don't edit your custom stream while it's running, "
-							   "it can cause crashes. Turn off `run_stream_in_editor` before doing so.")
+							   "it can cause crashes. To prevent it from running in the editor, remove tool mode from "
+							   "your script.")
 				);
 			} else {
 				warnings.append(ZN_TTR("The custom stream is not tool, the editor won't be able to use it."));
@@ -208,7 +210,8 @@ void VoxelNode::get_configuration_warnings(PackedStringArray &warnings) const {
 				// properly?
 				warnings.append(
 						ZN_TTR("Careful, don't edit your custom generator while it's running, "
-							   "it can cause crashes. Turn off `run_stream_in_editor` before doing so.")
+							   "it can cause crashes. To prevent it from running in the editor, remove tool mode from "
+							   "your script.")
 				);
 			} else {
 				can_check_generator_channels = false;
@@ -376,6 +379,8 @@ void VoxelNode::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_render_layers_mask", "mask"), &VoxelNode::set_render_layers_mask);
 	ClassDB::bind_method(D_METHOD("get_render_layers_mask"), &VoxelNode::get_render_layers_mask);
+
+	ClassDB::bind_method(D_METHOD("get_voxel_tool"), &VoxelNode::get_voxel_tool);
 
 	ClassDB::bind_method(D_METHOD("convert_to_nodes", "flags"), &VoxelNode::convert_to_nodes);
 

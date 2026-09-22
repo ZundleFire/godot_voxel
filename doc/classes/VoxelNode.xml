@@ -23,6 +23,13 @@
 				LOD: if your terrain has LOD, you will only get a snapshot of which LODs are currently active. Detailed meshes will be centered around viewers, and have less and less details further away.
 			</description>
 		</method>
+		<method name="get_voxel_tool">
+			<return type="VoxelTool" />
+			<description>
+				Creates an instance of [VoxelTool] bound to this node, to access voxels and edition methods.
+				You can keep it in a member variable to avoid creating one again, as long as the node still exists.
+			</description>
+		</method>
 	</methods>
 	<members>
 		<member name="cast_shadow" type="int" setter="set_shadow_casting" getter="get_shadow_casting" enum="GeometryInstance3D.ShadowCastingSetting" default="1">

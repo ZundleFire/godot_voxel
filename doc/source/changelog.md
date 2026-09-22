@@ -10,10 +10,28 @@ I try to minimize breaking changes, but there are usually a few in each release 
 Development - master branch
 -----------------------------
 
+- Improvements
+    - Added compute shader caching (thanks to chalecampb #866)
+    - `VoxelNode`: exposes `get_voxel_tool` instead of it being repeated in its child classes.
+    - `ZN_FastNoiseLite`: Editor: added support for noise analysis window, formerly present only on `FastNoise2` (This is mainly a debug tool for internal development of graph generators).
+    - Editor: range analysis debugging now also shows actual min/max on outputs connected to `SdfPreview` nodes. This is mainly to investigate internal bugs.
+
 - Fixes
-    - `VoxelBlockyModelFluid`: fixed fluid voxels below another fluid voxel were producing mesh collisions. They should never do because mesh collisions are for solid stuff.
-    - `VoxelInstanceLibraryMultimeshItem`: fixed mesh LOD distances did not scale properly with `lod_index` when using `VoxelLodTerrain` with the `Octree` streaming system
     - Extension: fixed crash when expanding plugin resources in the inspector and other similar actions involving previews (see https://github.com/godotengine/godot-cpp/pull/1928)
+    - Extension: fixed .vox importer options (#882)
+    - Noises: editor: allow to set `period` larger than what inspector sliders allow, by typing the value.
+    - `VoxelBlockSerializer`: fixed incorrect serialization when using a compression mode. LZ4 mode was incorrectly writing the LZ4_BE header, which couldn't be deserialized (and still can't without manually replacing the header with LZ4), and ZSTD mode was producing LZ4 instead.
+    - `VoxelBlockyModelFluid`: fixed fluid voxels below another fluid voxel were producing mesh collisions. They should never do because mesh collisions are for solid stuff.
+    - `VoxelBoxMover`: fixed some cases where step climbing didn't trigger or made player intersect with blocks (thanks to help from NuclearPhoenixx #813)
+    - `VoxelGeneratorGraph`: fixed FastNoiseLite cellular noise range wasn't properly estimated when a fractal was used, leading to disappearing chunks at close range
+    - `VoxelInstanceLibraryMultimeshItem`: fixed mesh LOD distances did not scale properly with `lod_index` when using `VoxelLodTerrain` with the `Octree` streaming system
+    - `VoxelLodTerrain`: added option to set each LOD distances manually (#379)
+    - `VoxelStreamSQLite`: fixed some hangs and failures when using functions of the stream on the main thread while the terrain's threaded tasks are still using it (#881)
+    - `VoxelTool`: fixed `do_path` was sometimes generating `is_valid_block_position` errors
+    - `VoxelToolBuffer`: `paste_masked_writable_list` is now implemented
+
+- Breaking changes
+    - `VoxelTerrain` and `VoxelLodTerrain`: removed `run_stream_in_editor`. Streams and generators will always run in editor, unless they use a script that is not in tool mode.
 
 
 1.6 - 04/02/2026 - tag `v1.6`

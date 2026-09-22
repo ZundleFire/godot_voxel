@@ -3,7 +3,7 @@
 #include "../string/format.h"
 
 #ifdef ZN_DEBUG_LOG_FILE_ENABLED
-#include "thread/mutex.h"
+#include "../thread/mutex.h"
 #include <fstream>
 #endif
 

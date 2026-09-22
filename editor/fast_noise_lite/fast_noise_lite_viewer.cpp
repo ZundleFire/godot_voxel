@@ -1,11 +1,17 @@
 #include "fast_noise_lite_viewer.h"
 #include "../../util/godot/classes/image.h"
 #include "../../util/godot/classes/image_texture.h"
+#include "../../util/godot/classes/input_event_mouse_button.h"
 #include "../../util/godot/classes/node.h"
+#include "../../util/godot/classes/popup_menu.h"
 #include "../../util/godot/classes/texture_rect.h"
+#include "../../util/godot/core/mouse_button.h"
 #include "../../util/godot/editor_scale.h"
+#include "../../util/string/format.h"
+#include "../noise/noise_analysis_window.h"
 
 #ifdef ZN_GODOT
+#include "../../util/godot/core/callable_mp.h"
 #include "../../util/godot/core/class_db.h"
 #endif
 
@@ -41,6 +47,8 @@ void ZN_FastNoiseLiteViewer::set_noise(Ref<ZN_FastNoiseLite> noise) {
 		set_process(false);
 		_time_before_update = -1.f;
 	}
+
+	update_context_menu();
 }
 
 void ZN_FastNoiseLiteViewer::set_noise_gradient(Ref<ZN_FastNoiseLiteGradient> noise_gradient) {
@@ -63,6 +71,58 @@ void ZN_FastNoiseLiteViewer::set_noise_gradient(Ref<ZN_FastNoiseLiteGradient> no
 	} else {
 		set_process(false);
 		_time_before_update = -1.f;
+	}
+
+	update_context_menu();
+}
+
+void ZN_FastNoiseLiteViewer::update_context_menu() {
+	if (_noise.is_valid()) {
+		if (_context_menu == nullptr) {
+			_context_menu = memnew(PopupMenu);
+			_context_menu->add_item("Analyze...", MENU_ANALYZE);
+			_context_menu->connect(
+					"id_pressed", callable_mp(this, &ZN_FastNoiseLiteViewer::on_context_menu_id_pressed)
+			);
+			add_child(_context_menu);
+		}
+	} else {
+		if (_context_menu != nullptr) {
+			_context_menu->queue_free();
+			_context_menu = nullptr;
+		}
+	}
+}
+
+#ifdef ZN_GODOT
+void ZN_FastNoiseLiteViewer::gui_input(const Ref<InputEvent> &p_event) {
+#elif defined(ZN_GODOT_EXTENSION)
+void ZN_FastNoiseLiteViewer::_gui_input(const Ref<InputEvent> &p_event) {
+#endif
+	if (_context_menu == nullptr) {
+		return;
+	}
+	Ref<InputEventMouseButton> mb = p_event;
+	if (mb.is_valid()) {
+		if (mb->get_button_index() == ZN_GODOT_MouseButton_RIGHT && mb->is_pressed()) {
+			_context_menu->set_position(mb->get_global_position());
+			_context_menu->popup();
+		}
+	}
+}
+
+void ZN_FastNoiseLiteViewer::on_context_menu_id_pressed(int id) {
+	switch (id) {
+		case MENU_ANALYZE:
+			ERR_FAIL_COND(_noise_analysis_window == nullptr);
+			ERR_FAIL_COND(_noise.is_null());
+			_noise_analysis_window->set_noise(_noise);
+			_noise_analysis_window->popup_centered();
+			break;
+
+		default:
+			ZN_PRINT_ERROR(format("Unknown ID pressed: {}", id));
+			break;
 	}
 }
 
@@ -87,9 +147,11 @@ void ZN_FastNoiseLiteViewer::_notification(int p_what) {
 void ZN_FastNoiseLiteViewer::update_preview() {
 	const Vector2i preview_size(PREVIEW_WIDTH, PREVIEW_HEIGHT);
 
-	Ref<Image> im = godot::create_empty_image(preview_size.x, preview_size.y, false, Image::FORMAT_RGB8);
+	Ref<Image> im;
 
 	if (_noise.is_valid()) {
+		im = godot::create_empty_image(preview_size.x, preview_size.y, false, Image::FORMAT_L8);
+
 		for (int y = 0; y < preview_size.y; ++y) {
 			for (int x = 0; x < preview_size.x; ++x) {
 				// Assuming -1..1 output. Some noise types can have different range though.
@@ -100,6 +162,8 @@ void ZN_FastNoiseLiteViewer::update_preview() {
 		}
 
 	} else if (_noise_gradient.is_valid()) {
+		im = godot::create_empty_image(preview_size.x, preview_size.y, false, Image::FORMAT_RG8);
+
 		const float amp = _noise_gradient->get_amplitude();
 		float m = (amp == 0.f ? 1.f : 1.f / amp);
 		for (int y = 0; y < preview_size.y; ++y) {

@@ -101,6 +101,8 @@ public:
 
 	void clear_cache() override;
 
+	bool is_runnable() const override;
+
 	// Editor
 
 #ifdef TOOLS_ENABLED

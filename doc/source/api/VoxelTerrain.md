@@ -97,6 +97,8 @@ If turned off, the terrain will no longer automatically load blocks around viewe
 
 Defines the bounds within which the terrain is allowed to have voxels. If an infinite world generator is used, blocks will only generate within this region. Everything outside will be left empty.
 
+If any dimension of the new bounds is larger than 512 and [max_view_distance](VoxelTerrain.md#i_max_view_distance) is larger than 512, then [max_view_distance](VoxelTerrain.md#i_max_view_distance) will be clamped to 512. This measure is to avoid crashing due to a potential huge amount of chunks that would load.
+
 ### [int](https://docs.godotengine.org/en/stable/classes/class_int.html)<span id="i_collision_layer"></span> **collision_layer** = 1
 
 *(This property has no documentation)*
@@ -145,17 +147,19 @@ Note 2: If you need simple Minecraft/AABB physics, you can use [VoxelBoxMover](V
 
 Sets the maximum distance this terrain can support. If a [VoxelViewer](VoxelViewer.md) requests more, it will be clamped.
 
-Note: there is an internal limit of 512 for constant LOD terrains, because going further can affect performance and memory very badly at the moment.
-
 ### [int](https://docs.godotengine.org/en/stable/classes/class_int.html)<span id="i_mesh_block_size"></span> **mesh_block_size** = 16
 
-*(This property has no documentation)*
+Sets how many voxels across meshes of the terrain span.
+
+Voxel chunks are stored in cubic chunks of 16x16x16 voxels, and by default meshes of the terrain match that size. But you can set this to 32 so meshes will span 2x2x2 voxel chunks. This is a performance tradeoff. Higher mesh size may speed up rendering, at the cost of slower mesh updates.
+
+Values other than 16 and 32 are not supported.
+
+Note: this setting also affects [VoxelInstancer](VoxelInstancer.md) chunks.
 
 ### [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)<span id="i_run_stream_in_editor"></span> **run_stream_in_editor** = true
 
-Makes the terrain appear in the editor.
-
-Important: this option will turn off automatically if you setup a script world generator. Modifying scripts while they are in use by threads causes undefined behaviors. You can still turn on this option if you need a preview, but it is strongly advised to turn it back off and wait until all generation has finished before you edit the script again.
+*(This property has no documentation)*
 
 ### [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)<span id="i_use_gpu_generation"></span> **use_gpu_generation** = false
 
@@ -257,4 +261,4 @@ Note that blocks getting unloaded as the viewer moves around can also trigger sa
 
 *(This method has no documentation)*
 
-_Generated on Jan 26, 2026_
+_Generated on Aug 06, 2026_

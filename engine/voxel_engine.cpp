@@ -5,10 +5,10 @@
 #include "../streams/load_all_blocks_data_task.h"
 #include "../streams/load_block_data_task.h"
 #include "../streams/save_block_data_task.h"
+#include "../util/godot/classes/display_server.h"
 #include "../util/godot/classes/os.h"
 #include "../util/godot/classes/project_settings.h"
 #include "../util/godot/classes/rd_sampler_state.h"
-#include "../util/godot/classes/rendering_device.h"
 #include "../util/godot/classes/rendering_server.h"
 #include "../util/io/log.h"
 #include "../util/macros.h"
@@ -94,6 +94,21 @@ VoxelEngine::~VoxelEngine() {
 static bool auto_detect_threaded_graphics_resource_building_support() {
 	const ProjectSettings *project = ProjectSettings::get_singleton();
 	ZN_ASSERT_RETURN_V(project != nullptr, false);
+
+#if GODOT_VERSION_MAJOR == 4 && GODOT_VERSION_MINOR <= 7
+	// A headless DisplayServer installs the dummy rasterizer
+	// (DisplayServerHeadless::create_func -> RasterizerDummy::make_current()), whose storage is not
+	// safe for concurrent access from multiple threads. The project's rendering_method/
+	// rendering_driver settings keep reporting their configured values in that case, so they
+	// cannot be used to detect it.
+	// This is a workaround for a Godot issue (the renderer is not thread-safe in headless mode):
+	// https://github.com/godotengine/godot/issues/121949
+	// It can be removed once that is fixed in Godot itself.
+	const DisplayServer *display_server = DisplayServer::get_singleton();
+	if (display_server == nullptr || display_server->get_name() == "headless") {
+		return false;
+	}
+#endif
 
 	const zylann::godot::RenderThreadModel rendering_thread_model = zylann::godot::get_render_thread_model(*project);
 	const zylann::godot::RenderMethod rendering_method = zylann::godot::get_current_rendering_method();

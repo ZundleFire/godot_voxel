@@ -160,6 +160,10 @@ public:
 	void set_compression_mode(const godot::VoxelBlockSerializer::Compression mode);
 	godot::VoxelBlockSerializer::Compression get_compression_mode() const;
 
+	// Hints whether the stream's functions can be called. Mainly used in case of script implementations, to avoid error
+	// spams.
+	virtual bool is_runnable() const;
+
 protected:
 	CompressedData::Compression _compression_mode = CompressedData::COMPRESSION_LZ4;
 
