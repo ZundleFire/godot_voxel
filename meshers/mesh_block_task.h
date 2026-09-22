@@ -5,6 +5,7 @@
 #include "../engine/ids.h"
 #include "../engine/meshing_dependency.h"
 #include "../engine/priority_dependency.h"
+#include "../gpu_driven/core/gpu_vertex_pack.h"
 #include "../storage/voxel_buffer.h"
 #include "../util/containers/std_vector.h"
 #include "../util/godot/classes/array_mesh.h"
@@ -71,6 +72,8 @@ public:
 	uint8_t detail_texture_generator_override_begin_lod_index = 0;
 	bool detail_texture_use_gpu = false;
 	bool block_generation_use_gpu = false;
+	// If true (and require_visual), outputs packed vertices for VoxelGpuDrivenRenderer instead of a Mesh resource.
+	bool gpu_driven = false;
 	PriorityDependency priority_dependency;
 	std::shared_ptr<MeshingDependency> meshing_dependency;
 	std::shared_ptr<VoxelData> data;
@@ -98,6 +101,7 @@ private:
 	Ref<Mesh> _mesh;
 	Ref<Mesh> _shadow_occluder_mesh;
 	StdVector<uint16_t> _mesh_material_indices; // Indexed by mesh surface
+	gpu_driven::PackedMesh _gpu_mesh;
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 	std::shared_ptr<DetailTextureOutput> _detail_textures;
 #endif
@@ -118,6 +122,13 @@ Ref<ArrayMesh> build_mesh( //
 
 // Builds a triangles mesh resource from a single surface. If the surface is empty, returns null.
 Ref<ArrayMesh> build_mesh(Array surface);
+
+// Packs all triangle surfaces (including separate transition surfaces, tagged with their side) for the GPU-driven
+// renderer.
+gpu_driven::PackedMesh pack_mesher_output_for_gpu(
+		const VoxelMesher::Output &output,
+		gpu_driven::Custom0Kind custom0_kind
+);
 
 } // namespace zylann::voxel
 

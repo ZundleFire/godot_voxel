@@ -31,6 +31,8 @@ VoxelMeshBlockVLT::VoxelMeshBlockVLT(const Vector3i bpos, unsigned int size, uns
 }
 
 VoxelMeshBlockVLT::~VoxelMeshBlockVLT() {
+	drop_gpu_mesh();
+
 	if (_mesh_instance.is_valid()) {
 		// Make sure no material override is set, because it's possible the material will get destroyed before the mesh
 		// instance, which would cause errors in RenderingServer. Our thin wrapper does not take ownership of the
@@ -120,7 +122,46 @@ void VoxelMeshBlockVLT::set_mesh(
 	col_index_end = p_col_index_end;
 }
 
+bool VoxelMeshBlockVLT::has_mesh() const {
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (has_gpu_mesh()) {
+		return true;
+	}
+#endif
+	return VoxelMeshBlock::has_mesh();
+}
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+void VoxelMeshBlockVLT::set_gpu_mesh(VoxelGpuDrivenRenderer &renderer, gpu_driven::PackedMesh &&mesh) {
+	if (_gpu_renderer != &renderer || mesh.is_empty()) {
+		drop_gpu_mesh();
+	}
+	if (mesh.is_empty()) {
+		return;
+	}
+	if (_gpu_chunk == VoxelGpuDrivenRenderer::INVALID_CHUNK) {
+		_gpu_renderer = &renderer;
+		_gpu_chunk = renderer.create_chunk();
+	}
+	renderer.set_chunk_mesh(_gpu_chunk, std::move(mesh), Vector3(_position_in_voxels));
+	renderer.set_chunk_visible(_gpu_chunk, _visible && _parent_visible);
+	renderer.set_chunk_transition_mask(_gpu_chunk, get_shader_transition_mask());
+}
+#endif
+
+void VoxelMeshBlockVLT::drop_gpu_mesh() {
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (_gpu_chunk != VoxelGpuDrivenRenderer::INVALID_CHUNK) {
+		_gpu_renderer->remove_chunk(_gpu_chunk);
+		_gpu_chunk = VoxelGpuDrivenRenderer::INVALID_CHUNK;
+		_gpu_renderer = nullptr;
+	}
+#endif
+}
+
 void VoxelMeshBlockVLT::drop_visuals() {
+	drop_gpu_mesh();
+
 	if (_mesh_instance.is_valid()) {
 		// Make sure no material override is set, because it's possible the material will get destroyed before the mesh
 		// instance, which would cause errors in RenderingServer. Our thin wrapper does not take ownership of the
@@ -242,6 +283,12 @@ void VoxelMeshBlockVLT::set_visible(bool visible) {
 void VoxelMeshBlockVLT::_set_visible(bool visible) {
 	VoxelMeshBlock::_set_visible(visible);
 
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (has_gpu_mesh()) {
+		_gpu_renderer->set_chunk_visible(_gpu_chunk, visible);
+	}
+#endif
+
 	if (_shadow_occluder.is_valid()) {
 		set_mesh_instance_visible(_shadow_occluder, visible);
 	}
@@ -310,28 +357,39 @@ void VoxelMeshBlockVLT::set_transition_mask(uint8_t m) {
 	}
 	_transition_mask = m;
 	if (_shader_material.is_valid()) {
-		// TODO Needs translation here, because Cube:: tables use slightly different order...
-		// We may get rid of this once cube tables respects -x+x-y+y-z+z order
-		uint8_t bits[Cube::SIDE_COUNT];
-		for (unsigned int dir = 0; dir < Cube::SIDE_COUNT; ++dir) {
-			bits[dir] = (m >> dir) & 1;
-		}
-		uint8_t tm = bits[Cube::SIDE_NEGATIVE_X];
-		tm |= bits[Cube::SIDE_POSITIVE_X] << 1;
-		tm |= bits[Cube::SIDE_NEGATIVE_Y] << 2;
-		tm |= bits[Cube::SIDE_POSITIVE_Y] << 3;
-		tm |= bits[Cube::SIDE_NEGATIVE_Z] << 4;
-		tm |= bits[Cube::SIDE_POSITIVE_Z] << 5;
-
 		// TODO Godot 4: we may replace this with a per-instance parameter so we can lift material access limitation
-		_shader_material->set_shader_parameter(VoxelStringNames::get_singleton().u_transition_mask, tm);
+		_shader_material->set_shader_parameter(
+				VoxelStringNames::get_singleton().u_transition_mask, get_shader_transition_mask()
+		);
 	}
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (has_gpu_mesh()) {
+		_gpu_renderer->set_chunk_transition_mask(_gpu_chunk, get_shader_transition_mask());
+	}
+#endif
 	for (int dir = 0; dir < Cube::SIDE_COUNT; ++dir) {
 		DirectMeshInstance &mi = _transition_mesh_instances[dir];
 		if (mi.is_valid() && (diff & (1 << dir))) {
 			set_mesh_instance_visible(mi, _visible && _parent_visible && _is_transition_visible(dir));
 		}
 	}
+}
+
+uint8_t VoxelMeshBlockVLT::get_shader_transition_mask() const {
+	// TODO Needs translation here, because Cube:: tables use slightly different order...
+	// We may get rid of this once cube tables respects -x+x-y+y-z+z order
+	const uint8_t m = _transition_mask;
+	uint8_t bits[Cube::SIDE_COUNT];
+	for (unsigned int dir = 0; dir < Cube::SIDE_COUNT; ++dir) {
+		bits[dir] = (m >> dir) & 1;
+	}
+	uint8_t tm = bits[Cube::SIDE_NEGATIVE_X];
+	tm |= bits[Cube::SIDE_POSITIVE_X] << 1;
+	tm |= bits[Cube::SIDE_NEGATIVE_Y] << 2;
+	tm |= bits[Cube::SIDE_POSITIVE_Y] << 3;
+	tm |= bits[Cube::SIDE_NEGATIVE_Z] << 4;
+	tm |= bits[Cube::SIDE_POSITIVE_Z] << 5;
+	return tm;
 }
 
 void VoxelMeshBlockVLT::set_parent_visible(bool parent_visible) {

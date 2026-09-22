@@ -68,6 +68,10 @@ unsigned int GPUTaskRunner::get_pending_task_count() const {
 // 	return _rendering_device;
 // }
 
+bool GPUTaskRunner::has_rendering_device() const {
+	return _has_rendering_device;
+}
+
 void GPUTaskRunner::thread_func() {
 	ZN_PROFILE_SET_THREAD_NAME("Voxel GPU tasks");
 	ZN_DSTACK();
@@ -85,6 +89,8 @@ void GPUTaskRunner::thread_func() {
 		ZN_PRINT_VERBOSE("Could not create local RenderingDevice, GPU functionality won't be supported.");
 		return;
 	}
+
+	_has_rendering_device = true;
 
 	_storage_buffer_pool.set_rendering_device(_rendering_device);
 	_base_resources.load(*_rendering_device);

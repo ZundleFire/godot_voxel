@@ -218,6 +218,21 @@ public:
 	StreamingSystem get_streaming_system() const;
 	void set_streaming_system(StreamingSystem v);
 
+	enum RenderMode : uint8_t { //
+		// One MeshInstance per block, rendered by Godot's scene renderer with the terrain material
+		RENDER_MODE_TRADITIONAL = 0,
+		// Blocks packed into GPU storage buffers, compute-culled and drawn with one indirect multi-draw.
+		// See VoxelGpuDrivenRenderer for what it doesn't support.
+		RENDER_MODE_GPU_DRIVEN = 1
+	};
+
+	// Switching re-meshes every block through the new path.
+	void set_render_mode(RenderMode mode);
+	RenderMode get_render_mode() const;
+
+	// Memory and upload counters of the GPU-driven path. Empty in traditional mode.
+	Dictionary get_gpu_driven_statistics() const;
+
 	// -- Far field ----------------------------------------------------------
 	// Terrain past `view_distance`, rendered from column data instead of
 	// voxels. See `far/` and `voxel_lod_terrain_update_far_streaming.h`.
@@ -394,6 +409,11 @@ private:
 	void _on_stream_params_changed();
 
 	void update_shader_material_pool_template();
+	void drop_all_visuals();
+	bool is_gpu_driven_rendering_active() const;
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	VoxelGpuDrivenRenderer::Style get_gpu_driven_style() const;
+#endif
 
 	void save_all_modified_blocks(bool with_copy, std::shared_ptr<AsyncDependencyTracker> tracker);
 
@@ -447,6 +467,13 @@ private:
 	ShaderMaterialPoolVLT _shader_material_pool;
 
 	FixedArray<VoxelMeshMap<VoxelMeshBlockVLT>, constants::MAX_LOD> _mesh_maps_per_lod;
+
+	RenderMode _render_mode = RENDER_MODE_TRADITIONAL;
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// Only exists in RENDER_MODE_GPU_DRIVEN. Mesh blocks hold raw pointers to it, so they must release their chunks
+	// (drop_visuals or destruction) before it is destroyed.
+	VoxelGpuDrivenRenderer *_gpu_renderer = nullptr;
+#endif
 
 	// Copies of meshes just for fading out.
 	// Used when a transition mask changes. This can make holes appear if not smoothly faded.
@@ -566,5 +593,6 @@ private:
 VARIANT_ENUM_CAST(zylann::voxel::VoxelLodTerrain::ProcessCallback)
 VARIANT_ENUM_CAST(zylann::voxel::VoxelLodTerrain::DebugDrawFlag)
 VARIANT_ENUM_CAST(zylann::voxel::VoxelLodTerrain::StreamingSystem);
+VARIANT_ENUM_CAST(zylann::voxel::VoxelLodTerrain::RenderMode);
 
 #endif // VOXEL_LOD_TERRAIN_HPP

@@ -84,6 +84,8 @@ struct VoxelLodTerrainUpdateData {
 		bool collision_enabled = true;
 		bool detail_textures_use_gpu = false;
 		bool generator_use_gpu = false;
+		// Mesh tasks output packed vertices for VoxelGpuDrivenRenderer instead of Mesh resources
+		bool gpu_driven_rendering = false;
 		uint8_t detail_texture_generator_override_begin_lod_index = 0;
 		unsigned int mesh_block_size_po2 = 4;
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING

@@ -1,6 +1,7 @@
 #ifndef VOXEL_MESH_BLOCK_VLT_H
 #define VOXEL_MESH_BLOCK_VLT_H
 
+#include "../../gpu_driven/voxel_gpu_driven_renderer.h"
 #include "../../util/godot/classes/shader_material.h"
 #include "../../util/memory/memory.h"
 #include "../../util/tasks/time_spread_task_runner.h"
@@ -71,6 +72,18 @@ public:
 	);
 	void drop_visuals();
 
+	// True if the block has visual geometry, either as a mesh instance or in the GPU-driven renderer.
+	// Hides VoxelMeshBlock::has_mesh on purpose (no virtuals in mesh blocks).
+	bool has_mesh() const;
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// Replaces the mesh instance path when the terrain renders with VoxelGpuDrivenRenderer.
+	void set_gpu_mesh(VoxelGpuDrivenRenderer &renderer, gpu_driven::PackedMesh &&mesh);
+	inline bool has_gpu_mesh() const {
+		return _gpu_chunk != VoxelGpuDrivenRenderer::INVALID_CHUNK;
+	}
+#endif
+
 	void set_transition_mask(uint8_t m);
 	inline uint8_t get_transition_mask() const {
 		return _transition_mask;
@@ -123,6 +136,14 @@ public:
 private:
 	void set_material_override_internal(Ref<Material> material);
 	void _set_visible(bool visible);
+	void drop_gpu_mesh();
+	uint8_t get_shader_transition_mask() const;
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// Not owned. The terrain destroys its blocks (or drops their visuals) before destroying the renderer.
+	VoxelGpuDrivenRenderer *_gpu_renderer = nullptr;
+	uint32_t _gpu_chunk = VoxelGpuDrivenRenderer::INVALID_CHUNK;
+#endif
 
 	inline bool _is_transition_visible(unsigned int side) const {
 		return _transition_mask & (1 << side);

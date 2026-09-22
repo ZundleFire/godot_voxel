@@ -193,6 +193,17 @@ VoxelLodTerrain::~VoxelLodTerrain() {
 	_meshing_dependency->valid = false;
 	VoxelEngine::get_singleton().remove_volume(_volume_id);
 	// Instancer can take care of itself
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (_gpu_renderer != nullptr) {
+		// Blocks release their chunks on destruction, so they must go before the renderer
+		for (unsigned int lod_index = 0; lod_index < _mesh_maps_per_lod.size(); ++lod_index) {
+			_mesh_maps_per_lod[lod_index].clear();
+		}
+		_gpu_renderer->destroy();
+		_gpu_renderer = nullptr;
+	}
+#endif
 }
 
 Ref<Material> VoxelLodTerrain::get_material() const {
@@ -1235,6 +1246,11 @@ void VoxelLodTerrain::_notification(int p_what) {
 		} break;
 
 		case NOTIFICATION_EXIT_WORLD: {
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+			if (_gpu_renderer != nullptr) {
+				_gpu_renderer->detach(get_world_3d().ptr());
+			}
+#endif
 			VoxelLodTerrainUpdateData::State &state = _update_data->state;
 			for (unsigned int lod_index = 0; lod_index < state.lods.size(); ++lod_index) {
 				VoxelMeshMap<VoxelMeshBlockVLT> &mesh_map = _mesh_maps_per_lod[lod_index];
@@ -1330,6 +1346,15 @@ void VoxelLodTerrain::process(float delta) {
 		// If there isn't a LOD 0, there is nothing to load
 		return;
 	}
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (_gpu_renderer != nullptr) {
+		Ref<World3D> world = get_world_3d();
+		if (world.is_valid()) {
+			_gpu_renderer->update(*world.ptr(), get_global_transform(), is_visible_in_tree(), get_gpu_driven_style());
+		}
+	}
+#endif
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 #ifdef VOXEL_ENABLE_GPU
@@ -2064,9 +2089,14 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 
 	VoxelMesher::Output &mesh_data = ob.surfaces;
 
+	// Results produced for the other render path (meshing was in flight while the mode switched) are not usable as
+	// visuals. The remesh requested by the switch brings the right ones.
+	const bool gpu_mode = is_gpu_driven_rendering_active();
+	const bool visual_usable = ob.visual_was_required && ob.has_gpu_mesh == gpu_mode;
+
 	Ref<ArrayMesh> mesh;
 	Ref<ArrayMesh> shadow_occluder_mesh;
-	if (ob.visual_was_required && visual_expected) {
+	if (visual_usable && visual_expected && !gpu_mode) {
 		// TODO Candidate for temp allocator
 		StdVector<uint16_t> material_indices;
 		if (ob.has_mesh_resource) {
@@ -2155,7 +2185,19 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	}
 #endif
 
-	if (ob.visual_was_required && visual_expected) {
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (visual_usable && visual_expected && gpu_mode) {
+		if (!block->has_mesh()) {
+			block->visual_active = visual_active;
+			block->set_visible(visual_active);
+			block->set_parent_visible(is_visible());
+			block->set_transition_mask(transition_mask);
+		}
+		block->set_gpu_mesh(*_gpu_renderer, std::move(ob.gpu_mesh));
+	}
+#endif
+
+	if (visual_usable && visual_expected && !gpu_mode) {
 		bool assign_material_after_mesh = false;
 
 		// We consider a block having a "rendering" mesh as having loaded visuals.
@@ -2231,7 +2273,8 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	}
 
 	// TODO Remove this eventually, we no longer use separate transition mesh instances
-	if (!ob.has_mesh_resource) {
+	// (The GPU-driven path packs separate transition surfaces into the block's GPU mesh.)
+	if (!ob.has_mesh_resource && !ob.has_gpu_mesh && !gpu_mode) {
 		// Profiling has shown Godot takes as much time to build a transition mesh as the main mesh of a block, so
 		// because there are 6 transition meshes per block, we would spend about 80% of the time on these if we build
 		// them all. Which is counter-intuitive because transition meshes are tiny in comparison... (collision meshes
@@ -2822,6 +2865,103 @@ void VoxelLodTerrain::remesh_all_blocks() {
 			);
 		}
 	}
+}
+
+bool VoxelLodTerrain::is_gpu_driven_rendering_active() const {
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	return _gpu_renderer != nullptr;
+#else
+	return false;
+#endif
+}
+
+void VoxelLodTerrain::drop_all_visuals() {
+	for (unsigned int lod_index = 0; lod_index < _mesh_maps_per_lod.size(); ++lod_index) {
+		_mesh_maps_per_lod[lod_index].for_each_block([this](VoxelMeshBlockVLT &block) {
+			block.drop_visuals();
+			remove_shader_material_from_block(block, _shader_material_pool);
+		});
+		// drop_visuals cancels fading
+		_fading_blocks_per_lod[lod_index].clear();
+	}
+}
+
+void VoxelLodTerrain::set_render_mode(RenderMode mode) {
+	ERR_FAIL_INDEX(mode, 2);
+	if (mode == _render_mode) {
+		return;
+	}
+#ifndef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (mode == RENDER_MODE_GPU_DRIVEN) {
+		ZN_PRINT_ERROR("GPU-driven rendering is not available in this build (needs a module build with voxel_gpu)");
+		return;
+	}
+#endif
+	_render_mode = mode;
+
+	_update_data->wait_for_end_of_task();
+	_update_data->settings.gpu_driven_rendering = (mode == RENDER_MODE_GPU_DRIVEN);
+
+	// Nothing renders through both paths at once. Blocks come back as the remesh below completes. Results already in
+	// flight for the old path are discarded in apply_mesh_update.
+	drop_all_visuals();
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (mode == RENDER_MODE_GPU_DRIVEN) {
+		_gpu_renderer = memnew(VoxelGpuDrivenRenderer);
+	} else {
+		Ref<World3D> world = is_inside_tree() ? get_world_3d() : Ref<World3D>();
+		_gpu_renderer->detach(world.ptr());
+		_gpu_renderer->destroy();
+		_gpu_renderer = nullptr;
+	}
+#endif
+
+	remesh_all_blocks();
+	update_configuration_warnings();
+}
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+// The GPU-driven shader is a port of planet_v4.gdshader. Picking its parameters up from the terrain material keeps
+// both render paths tunable from the same inspector values. Missing parameters keep the shader defaults.
+VoxelGpuDrivenRenderer::Style VoxelLodTerrain::get_gpu_driven_style() const {
+	VoxelGpuDrivenRenderer::Style style;
+	Ref<ShaderMaterial> sm = _material;
+	if (sm.is_null()) {
+		return style;
+	}
+	const auto read = [&sm](const char *name, float &out) {
+		const Variant v = sm->get_shader_parameter(StringName(name));
+		if (v.get_type() == Variant::FLOAT || v.get_type() == Variant::INT) {
+			out = v;
+		}
+	};
+	read("u_planet_radius", style.planet_radius);
+	read("vibrance", style.vibrance);
+	read("slope_rock_start", style.slope_rock_start);
+	read("slope_rock_end", style.slope_rock_end);
+	read("snow_temperature", style.snow_temperature);
+	read("snow_blend", style.snow_blend);
+	read("gully_darkening", style.gully_darkening);
+	read("ridge_highlight", style.ridge_highlight);
+	read("dryness_tint", style.dryness_tint);
+	read("detail_normal_strength", style.detail_normal_strength);
+	read("detail_normal_scale", style.detail_normal_scale);
+	return style;
+}
+#endif
+
+VoxelLodTerrain::RenderMode VoxelLodTerrain::get_render_mode() const {
+	return _render_mode;
+}
+
+Dictionary VoxelLodTerrain::get_gpu_driven_statistics() const {
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	if (_gpu_renderer != nullptr) {
+		return _gpu_renderer->get_stats();
+	}
+#endif
+	return Dictionary();
 }
 
 bool VoxelLodTerrain::is_area_meshed(const Box3i &box_in_voxels, unsigned int lod_index) const {
@@ -4431,6 +4571,10 @@ void VoxelLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_streaming_system", "system"), &Self::set_streaming_system);
 	ClassDB::bind_method(D_METHOD("get_streaming_system"), &Self::get_streaming_system);
 
+	ClassDB::bind_method(D_METHOD("set_render_mode", "mode"), &Self::set_render_mode);
+	ClassDB::bind_method(D_METHOD("get_render_mode"), &Self::get_render_mode);
+	ClassDB::bind_method(D_METHOD("get_gpu_driven_statistics"), &Self::get_gpu_driven_statistics);
+
 	ClassDB::bind_method(D_METHOD("set_cache_generated_blocks", "enabled"), &Self::set_cache_generated_blocks);
 	ClassDB::bind_method(D_METHOD("get_cache_generated_blocks"), &Self::get_cache_generated_blocks);
 
@@ -4478,6 +4622,9 @@ void VoxelLodTerrain::_bind_methods() {
 	BIND_ENUM_CONSTANT(STREAMING_SYSTEM_LEGACY_OCTREE);
 	BIND_ENUM_CONSTANT(STREAMING_SYSTEM_CLIPBOX);
 
+	BIND_ENUM_CONSTANT(RENDER_MODE_TRADITIONAL);
+	BIND_ENUM_CONSTANT(RENDER_MODE_GPU_DRIVEN);
+
 	ADD_GROUP("Bounds", "");
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "view_distance"), "set_view_distance", "get_view_distance");
@@ -4509,6 +4656,11 @@ void VoxelLodTerrain::_bind_methods() {
 			),
 			"set_material",
 			"get_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::INT, "render_mode", PROPERTY_HINT_ENUM, "Traditional,GPU Driven"),
+			"set_render_mode",
+			"get_render_mode"
 	);
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING

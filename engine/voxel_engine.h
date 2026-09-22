@@ -1,6 +1,7 @@
 #ifndef VOXEL_ENGINE_H
 #define VOXEL_ENGINE_H
 
+#include "../gpu_driven/core/gpu_vertex_pack.h"
 #include "../meshers/voxel_mesher.h"
 #include "../util/containers/slot_map.h"
 #include "../util/containers/std_vector.h"
@@ -65,6 +66,9 @@ public:
 		bool has_mesh_resource;
 		// Tells if the meshing task was required to build a rendering mesh if possible.
 		bool visual_was_required;
+		// Set instead of `mesh` when the volume renders with the GPU-driven path
+		bool has_gpu_mesh = false;
+		gpu_driven::PackedMesh gpu_mesh;
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		// Can be null. Attached to meshing output so it is tracked more easily, because it is baked asynchronously
 		// starting from the mesh task, and it might complete earlier or later than the mesh.

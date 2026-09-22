@@ -11,6 +11,7 @@
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 #include "../engine/detail_rendering/render_detail_texture_task.h"
+#include "../meshers/surface_nets/voxel_mesher_surface_nets.h"
 #include "../meshers/transvoxel/transvoxel_cell_iterator.h"
 #include "../meshers/transvoxel/voxel_mesher_transvoxel.h"
 #endif
@@ -288,6 +289,130 @@ Ref<ArrayMesh> build_mesh(
 	}
 
 	return mesh;
+}
+
+namespace {
+
+gpu_driven::Custom0Kind get_custom0_kind(const Ref<VoxelMesher> &mesher) {
+#ifdef VOXEL_ENABLE_SMOOTH_MESHING
+	Ref<VoxelMesherTransvoxel> transvoxel;
+	if (zylann::godot::try_get_as(mesher, transvoxel)) {
+		return gpu_driven::CUSTOM0_TRANSVOXEL;
+	}
+	Ref<VoxelMesherSurfaceNets> surface_nets;
+	if (zylann::godot::try_get_as(mesher, surface_nets)) {
+		return gpu_driven::CUSTOM0_TRANSITION_TAG;
+	}
+#endif
+	return gpu_driven::CUSTOM0_NONE;
+}
+
+// Bit of a Cube side in shader transition mask order (-x +x -y +y -z +z)
+uint32_t get_transition_shader_bit(unsigned int side) {
+	switch (side) {
+		case Cube::SIDE_NEGATIVE_X:
+			return 1 << 0;
+		case Cube::SIDE_POSITIVE_X:
+			return 1 << 1;
+		case Cube::SIDE_NEGATIVE_Y:
+			return 1 << 2;
+		case Cube::SIDE_POSITIVE_Y:
+			return 1 << 3;
+		case Cube::SIDE_NEGATIVE_Z:
+			return 1 << 4;
+		case Cube::SIDE_POSITIVE_Z:
+			return 1 << 5;
+		default:
+			return 0;
+	}
+}
+
+void append_packed_surface(
+		gpu_driven::PackedMesh &out,
+		const Array &arrays,
+		gpu_driven::Custom0Kind custom0_kind,
+		uint32_t extra_flags
+) {
+	if (arrays.size() != Mesh::ARRAY_MAX) {
+		return;
+	}
+	const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
+	const PackedInt32Array indices = arrays[Mesh::ARRAY_INDEX];
+	const uint32_t vertex_count = positions.size();
+	if (vertex_count == 0 || indices.size() == 0) {
+		return;
+	}
+	const PackedVector3Array normals = arrays[Mesh::ARRAY_NORMAL];
+	const PackedFloat32Array custom0 = arrays[Mesh::ARRAY_CUSTOM0];
+	const PackedFloat32Array custom1 = arrays[Mesh::ARRAY_CUSTOM1];
+	const PackedByteArray custom2 = arrays[Mesh::ARRAY_CUSTOM2];
+
+#ifdef REAL_T_IS_DOUBLE
+	// Packed Vector3 arrays hold doubles, the packer takes floats
+	StdVector<float> positions_f(vertex_count * 3);
+	StdVector<float> normals_f(normals.size() * 3);
+	for (uint32_t i = 0; i < vertex_count; ++i) {
+		positions_f[i * 3 + 0] = positions[i].x;
+		positions_f[i * 3 + 1] = positions[i].y;
+		positions_f[i * 3 + 2] = positions[i].z;
+	}
+	for (int i = 0; i < normals.size(); ++i) {
+		normals_f[i * 3 + 0] = normals[i].x;
+		normals_f[i * 3 + 1] = normals[i].y;
+		normals_f[i * 3 + 2] = normals[i].z;
+	}
+	const float *positions_ptr = positions_f.data();
+	const float *normals_ptr = normals_f.data();
+#else
+	static_assert(sizeof(Vector3) == 3 * sizeof(float));
+	const float *positions_ptr = reinterpret_cast<const float *>(positions.ptr());
+	const float *normals_ptr = reinterpret_cast<const float *>(normals.ptr());
+#endif
+
+	gpu_driven::SurfaceView s;
+	s.positions = positions_ptr;
+	s.normals = static_cast<uint32_t>(normals.size()) == vertex_count ? normals_ptr : nullptr;
+	s.custom0 = static_cast<uint32_t>(custom0.size()) == vertex_count * 4 ? custom0.ptr() : nullptr;
+	if (custom1.size() > 0 && custom1.size() % vertex_count == 0 && custom1.size() / vertex_count <= 2) {
+		s.custom1 = reinterpret_cast<const uint32_t *>(custom1.ptr());
+		s.custom1_components = custom1.size() / vertex_count;
+	}
+	if (static_cast<uint32_t>(custom2.size()) == vertex_count * 4) {
+		s.custom2 = reinterpret_cast<const uint32_t *>(custom2.ptr());
+	}
+	s.vertex_count = vertex_count;
+	s.indices = indices.ptr();
+	s.index_count = indices.size();
+
+	gpu_driven::append_surface(out, s, custom0_kind, extra_flags);
+}
+
+} // namespace
+
+gpu_driven::PackedMesh pack_mesher_output_for_gpu(
+		const VoxelMesher::Output &output,
+		gpu_driven::Custom0Kind custom0_kind
+) {
+	ZN_PROFILE_SCOPE();
+	gpu_driven::PackedMesh packed;
+	if (output.primitive_type != Mesh::PRIMITIVE_TRIANGLES) {
+		ZN_PRINT_ERROR_ONCE("GPU-driven rendering only supports triangle meshes");
+		return packed;
+	}
+	for (const VoxelMesher::Output::Surface &surface : output.surfaces) {
+		append_packed_surface(packed, surface.arrays, custom0_kind, 0);
+	}
+	for (unsigned int side = 0; side < output.transition_surfaces.size(); ++side) {
+		const uint32_t extra_flags = get_transition_shader_bit(side) << 16;
+		for (const VoxelMesher::Output::Surface &surface : output.transition_surfaces[side]) {
+			append_packed_surface(packed, surface.arrays, custom0_kind, extra_flags);
+		}
+	}
+	gpu_driven::finalize(packed);
+	if (packed.clamped_materials > 0) {
+		ZN_PRINT_WARNING_ONCE("GPU-driven rendering supports material indices up to 15, higher ones are clamped");
+	}
+	return packed;
 }
 
 Ref<ArrayMesh> build_mesh(Array surface) {
@@ -578,7 +703,11 @@ void MeshBlockTask::build_mesh() {
 	}
 #endif
 
-	if (require_visual && VoxelEngine::get_singleton().is_threaded_graphics_resource_building_enabled()) {
+	if (require_visual && gpu_driven) {
+		_gpu_mesh = pack_mesher_output_for_gpu(_surfaces_output, get_custom0_kind(mesher));
+		_has_mesh_resource = false;
+
+	} else if (require_visual && VoxelEngine::get_singleton().is_threaded_graphics_resource_building_enabled()) {
 		// This can only run if the engine supports building meshes from multiple threads
 
 		_mesh = zylann::voxel::build_mesh(
@@ -640,6 +769,8 @@ void MeshBlockTask::apply_result() {
 			o.mesh_material_indices = std::move(_mesh_material_indices);
 			o.has_mesh_resource = _has_mesh_resource;
 			o.visual_was_required = require_visual;
+			o.has_gpu_mesh = _has_run && require_visual && gpu_driven;
+			o.gpu_mesh = std::move(_gpu_mesh);
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 			o.detail_textures = _detail_textures;
 #endif

@@ -91,6 +91,10 @@ def get_sources(env, is_editor_build):
         "far/core/*.cpp",
         "far/tasks/*.cpp",
 
+        # GPU-driven rendering: vertex packing and allocators (no Godot headers). The renderer itself is under
+        # `gpu_enabled` below.
+        "gpu_driven/core/*.cpp",
+
         "engine/*.cpp",
 
         "edition/floating_chunks.cpp",
@@ -285,6 +289,7 @@ def get_sources(env, is_editor_build):
         sources += [
             "engine/gpu/*.cpp",
             "generators/generate_block_gpu_task.cpp",
+            "gpu_driven/*.cpp",
         ]
     
     if basic_generators_enabled:

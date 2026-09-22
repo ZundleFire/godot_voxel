@@ -348,6 +348,7 @@ void send_mesh_requests(
 			task->detail_texture_use_gpu = settings.detail_textures_use_gpu;
 #endif
 			task->block_generation_use_gpu = settings.generator_use_gpu;
+			task->gpu_driven = settings.gpu_driven_rendering;
 			task->cancellation_token = mesh_to_update.cancellation_token;
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
