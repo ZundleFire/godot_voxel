@@ -46,6 +46,11 @@ layout(set = 0, binding = 1, std430) restrict writeonly buffer Commands {
 	uvec4 commands[];
 };
 
+// Chunks that survived culling, for statistics only
+layout(set = 0, binding = 2, std430) restrict buffer VisibleCounter {
+	uint visible_count;
+};
+
 layout(push_constant, std430) uniform Params {
 	// Terrain-local frustum planes, inside when dot(xyz, p) + w >= 0
 	vec4 planes[6];
@@ -76,6 +81,9 @@ void main() {
 	// Indices are pulled in the vertex shader, so the draw is non-indexed over the chunk's index range,
 	// and first_instance carries the chunk index to gl_InstanceIndex.
 	commands[i] = uvec4(c.info.z, visible ? 1u : 0u, c.info.y, i);
+	if (visible) {
+		atomicAdd(visible_count, 1u);
+	}
 }
 )";
 
@@ -163,10 +171,12 @@ layout(location = 2) out vec2 v_vegetation_roughness;
 layout(location = 3) out vec4 v_surface;
 layout(location = 4) out vec3 v_pos;
 layout(location = 5) out vec3 v_rel; // position relative to the camera, precise near it
+layout(location = 6) flat out uint v_chunk_flags;
 
 // Keep in sync with gpu_driven::PackedVertex
 const uint VERTEX_WORDS = 8u;
 const uint CHUNK_FLAG_WIDE_INDICES = 2u;
+const uint CHUNK_FLAG_FAR = 4u;
 
 vec3 read_vec3(uint i) {
 	return uintBitsToFloat(uvec3(vertex_words[i], vertex_words[i + 1u], vertex_words[i + 2u]));
@@ -198,6 +208,7 @@ void main() {
 
 	// Same logic as the Transvoxel/SurfaceNets default shaders: move vertices to their secondary position
 	// next to lower-resolution neighbors, and collapse transition geometry of inactive sides.
+	v_chunk_flags = c.info.w;
 	const uint transition_mask = (c.info.w >> 8u) & 0xffu;
 	const uint cell_border_mask = normal_flags & 63u;
 	const uint vertex_border_mask = (normal_flags >> 6u) & 63u;
@@ -244,8 +255,12 @@ void main() {
 	v_vegetation_roughness = vec2(vegetation, roughness);
 
 	// Surface data (erosion, ridge, moisture, temperature). Meshes without it read neutral values.
+	// Far sectors have none: their word carries baked ambient occlusion instead (see pack_far_mesh).
 	const uint surface_bits = vertex_words[base + 7u];
 	v_surface = surface_bits == 0u ? vec4(0.5) : unpackUnorm4x8(surface_bits);
+	if ((c.info.w & CHUNK_FLAG_FAR) != 0u) {
+		v_surface = vec4(float(vertex_words[base + 5u] >> 16u) / 65535.0, 0.5, 0.5, 0.5);
+	}
 }
 )";
 
@@ -256,6 +271,9 @@ layout(location = 2) in vec2 v_vegetation_roughness;
 layout(location = 3) in vec4 v_surface;
 layout(location = 4) in vec3 v_pos;
 layout(location = 5) in vec3 v_rel;
+layout(location = 6) flat in uint v_chunk_flags;
+
+const uint CHUNK_FLAG_FAR = 4u;
 
 layout(location = 0) out vec4 frag_color;
 
@@ -352,49 +370,61 @@ void main() {
 
 	vec3 albedo = v_albedo;
 	float roughness = v_vegetation_roughness.y;
-	const float vegetation = v_vegetation_roughness.x;
+	float vegetation = v_vegetation_roughness.x;
+	// Far sectors: palette colour times baked AO, no climate/erosion/rock/snow data to work with
+	const bool is_far = (v_chunk_flags & CHUNK_FLAG_FAR) != 0u;
+	if (is_far) {
+		albedo *= mix(1.0 - 0.75, 1.0, v_surface.r);
+		vegetation = 0.0;
+		roughness = 0.95;
+	}
 	const float erosion = v_surface.r;
 	const float ridge = v_surface.g * 2.0 - 1.0;
 	const float moisture = v_surface.b;
 	const float temperature = v_surface.a;
 
-	// Climate tinting: lush greens where wet, straw where dry, desaturated where cold
-	const vec3 lush = saturate_color(albedo * vec3(0.92, 1.08, 0.88), 1.12);
-	const vec3 dry = mix(albedo, vec3(0.52, 0.44, 0.18), dryness_tint);
-	const vec3 climate = mix(dry, lush, smoothstep(0.3, 0.7, moisture));
-	albedo = mix(albedo, climate, vegetation);
-	albedo = mix(albedo, saturate_color(albedo, 0.45), vegetation * (1.0 - smoothstep(0.12, 0.42, temperature)));
-
 	const float up_dot = dot(n, up);
+	float gully = 0.0;
+	float snow = 0.0;
+	float rock_blend = 0.0;
 
-	// Macro variation so large areas aren't one flat color: drier/yellower patches and brightness drift on
-	// vegetation, plus a fine grain everywhere
-	const float macro = value_noise(v_pos / 420.0);
-	const float meso = value_noise(v_pos / 65.0);
-	albedo = mix(albedo, albedo * vec3(1.22, 1.08, 0.62), vegetation * smoothstep(0.45, 0.85, macro) * 0.8);
-	albedo *= mix(0.82, 1.12, meso * 0.7 + macro * 0.3);
+	if (!is_far) {
+		// Climate tinting: lush greens where wet, straw where dry, desaturated where cold
+		const vec3 lush = saturate_color(albedo * vec3(0.92, 1.08, 0.88), 1.12);
+		const vec3 dry = mix(albedo, vec3(0.52, 0.44, 0.18), dryness_tint);
+		const vec3 climate = mix(dry, lush, smoothstep(0.3, 0.7, moisture));
+		albedo = mix(albedo, climate, vegetation);
+		albedo = mix(albedo, saturate_color(albedo, 0.45), vegetation * (1.0 - smoothstep(0.12, 0.42, temperature)));
 
-	// Erosion features: gullies read as damp sediment, ridges as bare sunlit rock
-	const float gully = clamp(max(-ridge, 0.0) + max(0.5 - erosion, 0.0) * 1.5, 0.0, 1.0);
-	albedo *= 1.0 - gully_darkening * gully;
-	albedo = mix(albedo, albedo * vec3(0.94, 0.98, 1.02), gully * moisture);
-	roughness = mix(roughness, 0.5, gully * moisture);
-	const float ridge_rock = ridge_highlight * max(ridge, 0.0);
+		// Macro variation so large areas aren't one flat color: drier/yellower patches and brightness drift on
+		// vegetation, plus a fine grain everywhere
+		const float macro = value_noise(v_pos / 420.0);
+		const float meso = value_noise(v_pos / 65.0);
+		albedo = mix(albedo, albedo * vec3(1.22, 1.08, 0.62), vegetation * smoothstep(0.45, 0.85, macro) * 0.8);
+		albedo *= mix(0.82, 1.12, meso * 0.7 + macro * 0.3);
 
-	// Rock: the slope threshold wanders with noise so cliffs don't end on a clean contour, and the rock itself gets
-	// altitude strata and tone variation
-	const float slope_jitter = (value_noise(v_pos / 140.0) - 0.5) * 0.16;
-	const float rock_blend = max(1.0 - smoothstep(slope_rock_end, slope_rock_start, up_dot + slope_jitter), ridge_rock);
-	const float strata = 0.5 + 0.5 * sin(altitude / 38.0 + meso * 5.0);
-	vec3 rock = mat_albedo(1u) * mix(0.78, 1.18, value_noise(v_pos / 23.0));
-	rock *= mix(vec3(1.0), vec3(1.12, 0.98, 0.84), strata * 0.6);
-	albedo = mix(albedo, rock * (1.0 + ridge_rock * 0.6), rock_blend);
-	roughness = mix(roughness, mat_roughness(1u), rock_blend);
+		// Erosion features: gullies read as damp sediment, ridges as bare sunlit rock
+		gully = clamp(max(-ridge, 0.0) + max(0.5 - erosion, 0.0) * 1.5, 0.0, 1.0);
+		albedo *= 1.0 - gully_darkening * gully;
+		albedo = mix(albedo, albedo * vec3(0.94, 0.98, 1.02), gully * moisture);
+		roughness = mix(roughness, 0.5, gully * moisture);
+		const float ridge_rock = ridge_highlight * max(ridge, 0.0);
 
-	const float snow = (1.0 - smoothstep(snow_temperature - snow_blend, snow_temperature + snow_blend, temperature))
-			* smoothstep(slope_rock_end, 1.0, up_dot) * step(0.0, altitude);
-	albedo = mix(albedo, mat_albedo(2u), snow);
-	roughness = mix(roughness, mat_roughness(2u), snow);
+		// Rock: the slope threshold wanders with noise so cliffs don't end on a clean contour, and the rock itself
+		// gets altitude strata and tone variation
+		const float slope_jitter = (value_noise(v_pos / 140.0) - 0.5) * 0.16;
+		rock_blend = max(1.0 - smoothstep(slope_rock_end, slope_rock_start, up_dot + slope_jitter), ridge_rock);
+		const float strata = 0.5 + 0.5 * sin(altitude / 38.0 + meso * 5.0);
+		vec3 rock = mat_albedo(1u) * mix(0.78, 1.18, value_noise(v_pos / 23.0));
+		rock *= mix(vec3(1.0), vec3(1.12, 0.98, 0.84), strata * 0.6);
+		albedo = mix(albedo, rock * (1.0 + ridge_rock * 0.6), rock_blend);
+		roughness = mix(roughness, mat_roughness(1u), rock_blend);
+
+		snow = (1.0 - smoothstep(snow_temperature - snow_blend, snow_temperature + snow_blend, temperature))
+				* smoothstep(slope_rock_end, 1.0, up_dot) * step(0.0, altitude);
+		albedo = mix(albedo, mat_albedo(2u), snow);
+		roughness = mix(roughness, mat_roughness(2u), snow);
+	}
 
 	albedo = saturate_color(albedo, vibrance);
 
@@ -529,8 +559,9 @@ constexpr uint32_t VERTEX_STRIDE = sizeof(gpu_driven::PackedVertex);
 constexpr uint32_t INITIAL_VERTEX_CAPACITY = 256 * 1024;
 // In words (two 16-bit indices each)
 constexpr uint32_t INITIAL_INDEX_CAPACITY = 1024 * 1024;
-// Chunk.info.w: bit 0 visible, bit 1 wide (32-bit) indices, bits 8-15 transition mask
+// Chunk.info.w: bit 0 visible, bit 1 wide (32-bit) indices, bit 2 far-field sector, bits 8-15 transition mask
 constexpr uint32_t CHUNK_FLAG_WIDE_INDICES = 2;
+constexpr uint32_t CHUNK_FLAG_FAR = 4;
 constexpr uint32_t INITIAL_CHUNK_CAPACITY = 1024;
 // Used when the scene has no directional light
 const Vector3 FALLBACK_SUN_DIRECTION = Vector3(0.3, 1.0, 0.2).normalized();
@@ -645,6 +676,7 @@ void VoxelGpuDrivenRenderer::_render_thread_free() {
 		free_rid_if_valid(*rd, _indirect_buffer);
 		free_rid_if_valid(*rd, _style_buffer);
 		free_rid_if_valid(*rd, _scene_buffer);
+		free_rid_if_valid(*rd, _visible_counter_buffer);
 		if (_radiance_uniform_set.is_valid() && rd->uniform_set_is_valid(_radiance_uniform_set)) {
 			rd->free_rid(_radiance_uniform_set);
 		}
@@ -754,6 +786,14 @@ void VoxelGpuDrivenRenderer::set_chunk_visible(uint32_t id, bool visible) {
 	push_op(std::move(op));
 }
 
+void VoxelGpuDrivenRenderer::set_chunk_far(uint32_t id, bool far) {
+	Op op;
+	op.type = Op::SET_FAR;
+	op.id = id;
+	op.far = far;
+	push_op(std::move(op));
+}
+
 void VoxelGpuDrivenRenderer::set_chunk_transition_mask(uint32_t id, uint8_t mask) {
 	Op op;
 	op.type = Op::SET_TRANSITION_MASK;
@@ -772,12 +812,15 @@ void VoxelGpuDrivenRenderer::remove_chunk(uint32_t id) {
 }
 
 Dictionary VoxelGpuDrivenRenderer::get_stats() const {
+	// Answered by the next render callback, so `visible_chunks` lags by a frame
+	_visible_count_requested = true;
 	MutexLock lock(_mutex);
 	Dictionary d;
 	d["initialized"] = _stats.initialized;
 	d["failed"] = _stats.failed;
 	d["chunks"] = _stats.chunk_count;
 	d["chunk_slots"] = _stats.chunk_slots;
+	d["visible_chunks"] = _stats.visible_chunks;
 	d["vertices"] = _stats.vertex_count;
 	d["index_words"] = _stats.index_count;
 	d["vertex_capacity"] = _stats.vertex_capacity;
@@ -829,6 +872,7 @@ bool VoxelGpuDrivenRenderer::_ensure_initialized() {
 	_index_buffer = rd->storage_buffer_create(INITIAL_INDEX_CAPACITY * 4);
 	_style_buffer = rd->uniform_buffer_create(sizeof(StyleUBO));
 	_scene_buffer = rd->uniform_buffer_create(sizeof(SceneUBO));
+	_visible_counter_buffer = rd->storage_buffer_create(sizeof(uint32_t));
 	_ensure_chunk_capacity(INITIAL_CHUNK_CAPACITY - 1);
 
 	_initialized = true;
@@ -989,6 +1033,10 @@ void VoxelGpuDrivenRenderer::_apply_ops() {
 				g.info[3] = (g.info[3] & 0xffu) | (uint32_t(op.transition_mask) << 8);
 				_mark_chunk_dirty(op.id);
 				break;
+			case Op::SET_FAR:
+				g.info[3] = (g.info[3] & ~CHUNK_FLAG_FAR) | (op.far ? CHUNK_FLAG_FAR : 0u);
+				_mark_chunk_dirty(op.id);
+				break;
 			case Op::REMOVE:
 				_free_chunk_geometry(op.id);
 				g.info[3] = 0;
@@ -1045,6 +1093,7 @@ bool VoxelGpuDrivenRenderer::_ensure_uniform_sets() {
 		Vector<RenderingDevice::Uniform> uniforms;
 		uniforms.push_back(make_storage_uniform(0, _chunk_buffer));
 		uniforms.push_back(make_storage_uniform(1, _indirect_buffer));
+		uniforms.push_back(make_storage_uniform(2, _visible_counter_buffer));
 		_cull_uniform_set = rd.uniform_set_create(uniforms, _cull_shader, 0);
 	}
 	return _render_uniform_set.is_valid() && _cull_uniform_set.is_valid();
@@ -1298,6 +1347,7 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 
 	// Cull
 	{
+		rd.buffer_clear(_visible_counter_buffer, 0, sizeof(uint32_t));
 		CullPushConstant pc;
 		extract_frustum_planes(mvp, pc.planes);
 		pc.chunk_count = _chunk_high_water;
@@ -1396,8 +1446,21 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 	rd.draw_list_draw_indirect(dl, false, _indirect_buffer, 0, _chunk_high_water, 16);
 	rd.draw_list_end();
 
-	MutexLock lock(_mutex);
-	++_stats.indirect_draws_total;
+	{
+		MutexLock lock(_mutex);
+		++_stats.indirect_draws_total;
+	}
+
+	// Reading back stalls the render thread, so only when the main thread asked for stats
+	if (_visible_count_requested.exchange(false)) {
+		const Vector<uint8_t> data = rd.buffer_get_data(_visible_counter_buffer, 0, sizeof(uint32_t));
+		if (data.size() == sizeof(uint32_t)) {
+			uint32_t visible = 0;
+			memcpy(&visible, data.ptr(), sizeof(visible));
+			MutexLock lock(_mutex);
+			_stats.visible_chunks = visible;
+		}
+	}
 }
 
 } // namespace zylann::voxel

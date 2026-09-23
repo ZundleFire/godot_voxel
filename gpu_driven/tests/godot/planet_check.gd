@@ -13,12 +13,15 @@ const PLANET_SHADER := "planet_vivid.gdshader"
 const MAX_SETTLE_FRAMES := 20000
 const MASK_W := 320
 const MASK_H := 180
+const TRADITIONAL := 0
+const GPU := 1
 
 var _out_dir := "."
 var _world: Node3D
 var _cam: Camera3D
 var _background: Image
 var _failures := 0
+var _viewer: Node
 
 
 func _init() -> void:
@@ -104,14 +107,19 @@ var _vista_height := 0.0
 var _vista_heading := Vector3.ZERO
 
 
+var _mesh_optimization := true
+var _edge_clamp_margin := 0.5
+var _lod_distance := 128.0
+
+
 func _make_terrain() -> Node:
 	var g := _make_generator()
 
 	var m: Object = ClassDB.instantiate("VoxelMesherTransvoxel")
 	m.texturing_mode = 1 # MIXEL4
 	m.surface_data_enabled = true
-	m.mesh_optimization_enabled = true
-	m.edge_clamp_margin = 0.5
+	m.mesh_optimization_enabled = _mesh_optimization
+	m.edge_clamp_margin = _edge_clamp_margin
 
 	var t: Node = ClassDB.instantiate("VoxelLodTerrain")
 	# Surface data (erosion/ridge/moisture/temperature) only reaches CUSTOM2 with DATA6 at 32 bits
@@ -121,12 +129,24 @@ func _make_terrain() -> Node:
 	t.generator = g
 	t.mesher = m
 	t.mesh_block_size = 32
-	t.view_distance = 80000
-	t.lod_count = 12
-	t.lod_distance = 128.0
+	t.view_distance = _view_distance
+	t.lod_count = _lod_count
+	if _far_enabled:
+		# Far field takes over past the near terrain's view distance (see far/ and far_check.gd)
+		t.far_enabled = true
+		t.far_planet_radius = RADIUS
+		t.far_first_lod = 6
+		t.far_lod_count = 6
+		t.far_ring_radius = 4
+		t.far_vertical_min = -3000.0
+		t.far_vertical_max = 4000.0
+		t.far_near_clip_radius = _far_near_clip
+		t.far_antialias = false
+		t.far_cache_enabled = false
+		t.far_max_uploads_per_frame = 64
+	t.lod_distance = _lod_distance
 	t.secondary_lod_distance = 256.0
 	t.generate_collisions = false
-	t.far_enabled = false
 	t.material = _make_material()
 	return t
 
@@ -194,10 +214,13 @@ func _make_scene(view: String) -> void:
 		_cam.rotation_degrees = Vector3(-15.0, 0.0, 0.0)
 	_cam.current = true
 
-	var viewer: Node = ClassDB.instantiate("VoxelViewer")
-	viewer.view_distance = 80000
-	viewer.requires_collisions = false
-	_cam.add_child(viewer)
+	# A real viewer node, positioned like the camera. The far field streams around this, not the camera.
+	_viewer = ClassDB.instantiate("VoxelViewer")
+	_viewer.view_distance = 80000
+	_viewer.requires_visuals = true
+	_viewer.requires_collisions = false
+	_world.add_child(_viewer)
+	_viewer.global_position = _cam.global_position
 
 
 func _settle(t: Node) -> int:
@@ -315,6 +338,241 @@ func _measure(frames: int) -> Dictionary:
 	}
 
 
+var _far_enabled := false
+var _far_near_clip := 0.0
+var _view_distance := 80000
+var _lod_count := 12
+
+
+func _make_far_material(t: Node) -> ShaderMaterial:
+	var sh := Shader.new()
+	sh.code = FileAccess.get_file_as_string(
+			ProjectSettings.globalize_path("res://").path_join("../../../far/shaders/far_terrain.gdshader"))
+	var sm := ShaderMaterial.new()
+	sm.shader = sh
+	var clip: float = t.get_far_statistics()["near_clip_radius"]
+	sm.set_shader_parameter("planet_radius", RADIUS)
+	sm.set_shader_parameter("near_fade_start", clip * 0.85)
+	sm.set_shader_parameter("near_fade_end", clip * 1.15)
+	sm.set_shader_parameter("fog_color", Color(0.62, 0.70, 0.80))
+	sm.set_shader_parameter("fog_start", 6000.0)
+	sm.set_shader_parameter("fog_end", 90000.0)
+	return sm
+
+
+# Why does the far field stream nothing here when far_check's project works? Vary one thing at a time.
+func _stage_far_diag() -> void:
+	var variants := [
+		{ "name": "block 16 (default)", "mesher": true, "format": true, "material": true, "block": 16 },
+		{ "name": "block 32 (scene)", "mesher": true, "format": true, "material": true, "block": 32 },
+		{ "name": "block 32, lod_count 7, view 4096", "mesher": true, "format": true, "material": true,
+				"block": 32, "lods": 7, "view": 4096 },
+		{ "name": "block 32, lod_count 12, view 80000", "mesher": true, "format": true, "material": true,
+				"block": 32, "lods": 12, "view": 80000 },
+		{ "name": "block 32 + lod_distance 128", "mesher": true, "format": true, "material": true,
+				"block": 32, "lod_distance": 128.0 },
+		{ "name": "block 32 + secondary_lod_distance 256", "mesher": true, "format": true, "material": true,
+				"block": 32, "secondary": 256.0 },
+	]
+	# Same construction the benchmark stage uses, to compare against the variants below
+	_far_enabled = true
+	_far_near_clip = -1.0
+	_view_distance = 1024
+	_lod_count = 4
+	var tt := _make_terrain()
+	_world.add_child(tt)
+	for i in 900:
+		await process_frame
+	var ss: Dictionary = tt.get_far_statistics()
+	print("  via _make_terrain -> resident %d, rendered %d, built %d, inflight %d" % [
+			ss.resident_sectors, ss.rendered_sectors, ss.sectors_built, ss.tasks_in_flight])
+	tt.queue_free()
+	for i in 10:
+		await process_frame
+
+	for v in variants:
+		var g := _make_generator()
+		var t: Node = ClassDB.instantiate("VoxelLodTerrain")
+		if v.format:
+			var fmt: Object = ClassDB.instantiate("VoxelFormat")
+			fmt.set_channel_depth(VoxelBuffer.CHANNEL_DATA6, VoxelBuffer.DEPTH_32_BIT)
+			t.format = fmt
+		t.generator = g
+		if v.mesher:
+			var m: Object = ClassDB.instantiate("VoxelMesherTransvoxel")
+			m.texturing_mode = 1
+			m.surface_data_enabled = true
+			t.mesher = m
+		if v.material:
+			t.material = _make_material()
+		t.mesh_block_size = v.get("block", 16)
+		t.view_distance = v.get("view", 1024)
+		t.lod_count = v.get("lods", 4)
+		if v.has("lod_distance"):
+			t.lod_distance = v.lod_distance
+		if v.has("secondary"):
+			t.secondary_lod_distance = v.secondary
+		t.generate_collisions = false
+		t.far_enabled = true
+		t.far_planet_radius = RADIUS
+		t.far_first_lod = 6
+		t.far_lod_count = 6
+		t.far_ring_radius = 4
+		t.far_vertical_min = -3000.0
+		t.far_vertical_max = 4000.0
+		t.far_near_clip_radius = -1.0
+		t.far_antialias = false
+		t.far_cache_enabled = false
+		t.far_max_uploads_per_frame = 64
+		_world.add_child(t)
+		for i in 900:
+			await process_frame
+		var s: Dictionary = t.get_far_statistics()
+		print("  %s -> resident %d, rendered %d, built %d, inflight %d, verts %d" % [v.name,
+				s.resident_sectors, s.rendered_sectors, s.sectors_built, s.tasks_in_flight, s.total_vertices])
+		t.queue_free()
+		for i in 10:
+			await process_frame
+
+
+# Traditional vs GPU-driven, with and without the far field, on the same view
+func _stage_compare_all() -> void:
+	var rows := []
+	var configs := [
+		{ "name": "near only, traditional", "mode": TRADITIONAL, "far": false, "view": 80000, "lods": 12 },
+		{ "name": "near only, gpu-driven", "mode": GPU, "far": false, "view": 80000, "lods": 12 },
+		{ "name": "near + far, traditional", "mode": TRADITIONAL, "far": true, "view": 4096, "lods": 7 },
+		{ "name": "near + far, gpu-driven", "mode": GPU, "far": true, "view": 4096, "lods": 7 },
+	]
+	for cfg in configs:
+		_far_enabled = cfg.far
+		_view_distance = cfg.view
+		_lod_count = cfg.lods
+		_far_near_clip = cfg.get("clip", 0.0)
+		var t := _make_terrain()
+		t.render_mode = cfg.mode
+		_world.add_child(t)
+		if cfg.far:
+			t.far_material = _make_far_material(t)
+		var frames := await _settle(t)
+		if cfg.far:
+			print("  far stats: ", t.get_far_statistics())
+		await _measure(90)
+		var m := await _measure(600)
+		var g: Dictionary = t.get_gpu_driven_statistics()
+		if cfg.mode == GPU:
+			# Without this a broken renderer just reports a very fast empty frame
+			_check(not g.is_empty() and g.get("initialized", false) and not g.get("failed", true),
+					"%s: gpu renderer running" % cfg.name)
+			_check(int(g.get("visible_chunks", 0)) > 0, "%s: chunks drawn (%d)" % [cfg.name, int(g.get("visible_chunks", 0))])
+		var far_stats: Dictionary = t.get_far_statistics() if cfg.far else {}
+		if cfg.far:
+			_check(int(far_stats.get("rendered_sectors", 0)) > 0,
+					"%s: far sectors built (%d)" % [cfg.name, int(far_stats.get("rendered_sectors", 0))])
+		var row := {
+			"name": cfg.name,
+			"frame_ms": m.frame_ms,
+			"render_cpu_ms": m.render_cpu_ms,
+			"render_gpu_ms": m.render_gpu_ms,
+			"scene_draw_calls": m.scene_draw_calls,
+			"scene_primitives": m.scene_primitives,
+			"mesh_blocks": t.debug_get_mesh_block_count(),
+			"settle_frames": frames,
+			"gpu_vram_mb": snappedf(float(g.get("vram_bytes", 0)) / 1048576.0, 0.1),
+			"gpu_visible_chunks": int(g.get("visible_chunks", 0)),
+			"far_sectors": int(far_stats.get("rendered_sectors", 0)),
+			"far_vertices": int(far_stats.get("total_vertices", 0)),
+		}
+		rows.append(row)
+		print("  ", row)
+		await _capture("compare_" + cfg.name.replace(" ", "_").replace(",", ""))
+		t.queue_free()
+		for i in 8:
+			await process_frame
+	print("RESULTS=", rows)
+
+
+# Hunts holes in the mesh itself. Magenta background, no fog and no sky, so any gap is unmistakable, sampled over
+# several headings. Reports both render paths for each mesher configuration.
+func _stage_cracks() -> void:
+	var configs := [
+		{ "name": "clamp 0.02, lod_distance 128 (scene)", "opt": true, "clamp": 0.02, "lod_distance": 128.0 },
+	]
+	var d := _find_vista_direction()
+	var north := _vista_heading
+	var ground := d * (RADIUS + _vista_height)
+
+	var we: WorldEnvironment = _world.get_child(1)
+	we.environment.background_mode = Environment.BG_COLOR
+	we.environment.background_color = Color(1, 0, 1)
+	we.environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	we.environment.ambient_light_color = Color(0.6, 0.6, 0.6)
+	we.environment.fog_enabled = false
+	we.environment.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+	_cam.position = ground + d * 900.0 - north * 2500.0
+	_cam.look_at(ground + north * 7000.0 - d * 300.0, d)
+	for i in 5:
+		await process_frame
+	_background = await _capture("cracks_background")
+
+	for cfg in configs:
+		_mesh_optimization = cfg.opt
+		_edge_clamp_margin = cfg.clamp
+		if cfg.has("lod_distance"):
+			_lod_distance = cfg.lod_distance
+		var t := _make_terrain()
+		_world.add_child(t)
+		await _settle(t)
+		var counts := { "traditional": 0, "gpu": 0 }
+		for mode in [TRADITIONAL, GPU]:
+			t.render_mode = mode
+			await _settle(t)
+			var total := 0
+			var base := _cam.rotation_degrees
+			for k in 4:
+				_cam.rotation_degrees = base + Vector3(0.0, k * 12.0 - 18.0, 0.0)
+				for i in 3:
+					await process_frame
+				var img := await _capture("cracks_%s_%d" % ["gpu" if mode == GPU else "trad", k])
+				total += _pinholes(img)
+			_cam.rotation_degrees = base
+			counts["gpu" if mode == GPU else "traditional"] = total
+		print("  %s: traditional %d, gpu %d (holes over 4 views)" % [cfg.name, counts.traditional, counts.gpu])
+		t.queue_free()
+		for i in 5:
+			await process_frame
+
+
+# Frustum culling: how many chunks survive as the camera turns away, and what it costs
+func _stage_cull(t: Node) -> void:
+	var base := _cam.rotation_degrees
+	var results := {}
+	for entry in [["ahead", 0.0], ["turned 90", 90.0], ["turned away", 180.0], ["pitched up", -1.0]]:
+		var label: String = entry[0]
+		if label == "pitched up":
+			_cam.rotation_degrees = base + Vector3(80.0, 0.0, 0.0)
+		else:
+			_cam.rotation_degrees = base + Vector3(0.0, float(entry[1]), 0.0)
+		for i in 5:
+			await process_frame
+		# get_gpu_driven_statistics asks the render thread, the answer lands a frame later
+		t.get_gpu_driven_statistics()
+		await process_frame
+		await process_frame
+		var g: Dictionary = t.get_gpu_driven_statistics()
+		var m := await _measure(120)
+		results[label] = { "visible": int(g.visible_chunks), "gpu_ms": m.render_gpu_ms }
+	_cam.rotation_degrees = base
+	print("  culling: ", results)
+	var total: int = int(t.get_gpu_driven_statistics().chunks)
+	_check(results["ahead"].visible > 0 and results["ahead"].visible < total,
+			"some chunks culled while looking at the terrain (%d of %d visible)" % [results["ahead"].visible, total])
+	_check(results["turned away"].visible < results["ahead"].visible / 4,
+			"turning away culls nearly everything (%d visible)" % results["turned away"].visible)
+	_check(results["turned away"].gpu_ms < results["ahead"].gpu_ms,
+			"culling saves GPU time (%.2f ms vs %.2f ms)" % [results["turned away"].gpu_ms, results["ahead"].gpu_ms])
+
+
 func _run() -> void:
 	var args: PackedStringArray = OS.get_cmdline_user_args()
 	var view: String = args[0] if args.size() > 0 else "surface"
@@ -322,8 +580,33 @@ func _run() -> void:
 		_out_dir = args[1]
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	Engine.max_fps = 0
-	_make_scene(view)
+	_make_scene("vista" if view == "cracks" else view)
 	print("planet view ", view)
+	if view == "cracks":
+		await _stage_cracks()
+		print("FAILURES=", _failures)
+		quit(1 if _failures > 0 else 0)
+		return
+	if view == "fardiag":
+		var dd := _find_vista_direction()
+		_viewer.global_position = dd * (RADIUS + _vista_height + 900.0)
+		_cam.position = _viewer.global_position
+		await _stage_far_diag()
+		quit(0)
+		return
+	if view == "compare":
+		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+		Engine.max_fps = 0
+		# Same viewpoint as the vista shots: standing on land, looking across it
+		var d := _find_vista_direction()
+		var ground := d * (RADIUS + _vista_height)
+		_cam.position = ground + d * 900.0 - _vista_heading * 2500.0
+		_cam.look_at(ground + _vista_heading * 7000.0 - d * 300.0, d)
+		_viewer.global_position = _cam.global_position
+		await _stage_compare_all()
+		print("FAILURES=", _failures)
+		quit(1 if _failures > 0 else 0)
+		return
 
 	for i in 5:
 		await process_frame
@@ -356,6 +639,7 @@ func _run() -> void:
 	_check(gpu_holes <= trad_holes, "no more cracks than traditional (gpu %d, traditional %d)" % [gpu_holes, trad_holes])
 	await _measure(60)
 	var gpu_bench := await _measure(600)
+	await _stage_cull(t)
 
 	print("  bench traditional: ", trad_bench)
 	print("  bench gpu_driven:  ", gpu_bench)

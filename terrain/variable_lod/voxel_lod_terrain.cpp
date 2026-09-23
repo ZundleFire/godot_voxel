@@ -196,10 +196,11 @@ VoxelLodTerrain::~VoxelLodTerrain() {
 
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
 	if (_gpu_renderer != nullptr) {
-		// Blocks release their chunks on destruction, so they must go before the renderer
+		// Blocks and far sectors release their chunks on destruction, so they must go before the renderer
 		for (unsigned int lod_index = 0; lod_index < _mesh_maps_per_lod.size(); ++lod_index) {
 			_mesh_maps_per_lod[lod_index].clear();
 		}
+		_far_renderer.destroy_all();
 		_gpu_renderer->destroy();
 		_gpu_renderer = nullptr;
 	}
@@ -2907,6 +2908,8 @@ void VoxelLodTerrain::set_render_mode(RenderMode mode) {
 	drop_all_visuals();
 
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// The far field renders through whichever path is active, so its sectors have to be rebuilt too
+	_far_renderer.destroy_all();
 	if (mode == RENDER_MODE_GPU_DRIVEN) {
 		_gpu_renderer = memnew(VoxelGpuDrivenRenderer);
 	} else {
@@ -2915,6 +2918,8 @@ void VoxelLodTerrain::set_render_mode(RenderMode mode) {
 		_gpu_renderer->destroy();
 		_gpu_renderer = nullptr;
 	}
+	_far_renderer.set_gpu_driven_renderer(_gpu_renderer);
+	_far_needs_restart = true;
 #endif
 
 	remesh_all_blocks();

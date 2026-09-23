@@ -16,6 +16,7 @@
 #include "core/gpu_range_allocator.h"
 #include "core/gpu_vertex_pack.h"
 
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -74,6 +75,8 @@ public:
 	// `origin` in terrain-local units, packed positions are relative to it
 	void set_chunk_mesh(uint32_t id, gpu_driven::PackedMesh &&mesh, Vector3 origin);
 	void set_chunk_visible(uint32_t id, bool visible);
+	// Far-field sectors shade from baked AO and a single material, without the Transvoxel seam and climate logic
+	void set_chunk_far(uint32_t id, bool far);
 	// Mask in shader order (-x +x -y +y -z +z), same as the `u_transition_mask` uniform
 	void set_chunk_transition_mask(uint32_t id, uint8_t mask);
 	void remove_chunk(uint32_t id);
@@ -85,9 +88,10 @@ public:
 
 private:
 	struct Op {
-		enum Type : uint8_t { SET_MESH, SET_VISIBLE, SET_TRANSITION_MASK, REMOVE };
+		enum Type : uint8_t { SET_MESH, SET_VISIBLE, SET_TRANSITION_MASK, SET_FAR, REMOVE };
 		Type type;
 		bool visible = false;
+		bool far = false;
 		uint8_t transition_mask = 0;
 		uint32_t id;
 		Vector3 origin;
@@ -157,6 +161,8 @@ private:
 		uint64_t index_capacity = 0;
 		uint64_t uploaded_bytes_total = 0;
 		uint32_t indirect_draws_total = 0;
+		// Chunks that passed frustum culling in the last render that was asked for stats
+		uint32_t visible_chunks = 0;
 		bool initialized = false;
 		bool failed = false;
 	};
@@ -175,6 +181,8 @@ private:
 	RID _indirect_buffer;
 	RID _style_buffer;
 	RID _scene_buffer;
+	RID _visible_counter_buffer;
+	mutable std::atomic_bool _visible_count_requested = false;
 	RID _radiance_sampler;
 	RID _radiance_uniform_set;
 	RID _radiance_uniform_set_texture;

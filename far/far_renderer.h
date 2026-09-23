@@ -1,6 +1,7 @@
 #ifndef VOXEL_FAR_RENDERER_H
 #define VOXEL_FAR_RENDERER_H
 
+#include "../gpu_driven/voxel_gpu_driven_renderer.h"
 #include "../util/godot/classes/array_mesh.h"
 #include "../util/godot/classes/material.h"
 #include "../util/godot/direct_mesh_instance.h"
@@ -31,6 +32,14 @@ public:
 
 	void set_world(World3D *world);
 	void set_material(Ref<Material> material);
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// When set, sectors go into the terrain's GPU-driven buffers (one indirect draw for near and far together)
+	// instead of getting a mesh instance each. Switching requires a far restart so sectors are rebuilt.
+	void set_gpu_driven_renderer(VoxelGpuDrivenRenderer *renderer) {
+		_gpu_renderer = renderer;
+	}
+#endif
 	void set_cast_shadows(bool enabled);
 	void set_render_layers_mask(int mask);
 	void set_visible(bool visible);
@@ -85,13 +94,24 @@ private:
 		// the sector is; on a planet that is not derivable from its grid coords.
 		Vector3 local_origin;
 		bool visible = true;
+		// Counted here rather than from the Mesh, which the GPU-driven path doesn't create
+		uint32_t vertex_count = 0;
+		uint32_t triangle_count = 0;
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+		uint32_t gpu_chunk = VoxelGpuDrivenRenderer::INVALID_CHUNK;
+#endif
 	};
 
 	Ref<ArrayMesh> build_mesh_resource(const FarMeshArrays &arrays);
+	void release_sector(SectorRender &sector);
 
 	std::unordered_map<SectorId, SectorRender, SectorIdHash> _sectors;
 
 	World3D *_world = nullptr;
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// Not owned. The terrain rebuilds the far field when this changes or the renderer goes away.
+	VoxelGpuDrivenRenderer *_gpu_renderer = nullptr;
+#endif
 	Ref<Material> _material;
 	bool _cast_shadows = false;
 	int _render_layers_mask = 1;
