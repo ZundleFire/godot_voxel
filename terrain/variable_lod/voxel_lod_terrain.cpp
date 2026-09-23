@@ -2952,6 +2952,36 @@ VoxelGpuDrivenRenderer::Style VoxelLodTerrain::get_gpu_driven_style() const {
 	read("dryness_tint", style.dryness_tint);
 	read("detail_normal_strength", style.detail_normal_strength);
 	read("detail_normal_scale", style.detail_normal_scale);
+	read("facet_shading", style.facet_shading);
+	read("light_bands", style.light_bands);
+	read("palette_snap", style.palette_snap);
+	read("facet_tint", style.facet_tint);
+
+	// Palette override, same parameter names as far/shaders/far_terrain.gdshader. Entries beyond what the
+	// material provides keep their defaults.
+	// A `vec3[8]` uniform comes back as a PackedVector3Array. An all-zero entry means "not set", matching how
+	// the twin shader falls back, since Godot cannot give uniform arrays defaults.
+	const Variant colors = sm->get_shader_parameter(StringName("material_colors"));
+	if (colors.get_type() == Variant::PACKED_VECTOR3_ARRAY) {
+		const PackedVector3Array a = colors;
+		for (int i = 0; i < a.size() && i < 8; ++i) {
+			const Vector3 c = a[i];
+			if (c != Vector3()) {
+				style.palette[i][0] = c.x;
+				style.palette[i][1] = c.y;
+				style.palette[i][2] = c.z;
+			}
+		}
+	}
+	const Variant roughness = sm->get_shader_parameter(StringName("material_roughness"));
+	if (roughness.get_type() == Variant::PACKED_FLOAT32_ARRAY) {
+		const PackedFloat32Array a = roughness;
+		for (int i = 0; i < a.size() && i < 8; ++i) {
+			if (a[i] != 0.f) {
+				style.palette[i][3] = a[i];
+			}
+		}
+	}
 	return style;
 }
 #endif

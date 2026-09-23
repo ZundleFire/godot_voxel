@@ -105,6 +105,9 @@ layout(set = 0, binding = 3, std140) uniform Style {
 	vec4 p0; // planet_radius (0 = flat, up is +Y), vibrance, slope_rock_start, slope_rock_end
 	vec4 p1; // snow_temperature, snow_blend, gully_darkening, ridge_highlight
 	vec4 p2; // dryness_tint, detail_normal_strength, detail_normal_scale, unused
+	// Low-poly styling, all 0 = the smooth look
+	vec4 p3; // facet shading, light bands, palette snap, facet tint
+	vec4 palette[8]; // material albedo in rgb, roughness in a
 } style;
 
 // Environment fog, same model as Godot's scene shader (minus aerial perspective, which needs the sky radiance map)
@@ -132,24 +135,21 @@ layout(set = 1, binding = 0) uniform sampler2D radiance_octmap;
 // Linear albedos in physically plausible ranges (grass ~0.1-0.2, rock ~0.25, snow ~0.85): dark enough that sunlit
 // faces don't wash out, saturated enough to read at distance. Keep in sync with
 // gpu_driven/tests/godot/planet_vivid.gdshader (the traditional-path twin used for A/B checks).
+// The palette comes from the material's `material_colors` / `material_roughness` (same convention as
+// far/shaders/far_terrain.gdshader); Style::palette holds the defaults otherwise. Authoring it is the main lever
+// on a low-poly look, since palette_snap leaves nothing but these colours.
+// Quantizes a climate/erosion driver so it shapes the terrain in flat steps rather than gradients. 4 steps at
+// full strength keeps biomes apart while reading as hard-edged regions.
+float flatten(float x, float amount) {
+	return amount > 0.0 ? mix(x, floor(x * 4.0 + 0.5) * 0.25, amount) : x;
+}
+
 vec3 mat_albedo(uint i) {
-	if (i == 0u) { return vec3(0.075, 0.20, 0.045); }
-	if (i == 1u) { return vec3(0.27, 0.245, 0.215); }
-	if (i == 2u) { return vec3(0.82, 0.86, 0.92); }
-	if (i == 3u) { return vec3(0.56, 0.44, 0.24); }
-	if (i == 4u) { return vec3(0.21, 0.13, 0.065); }
-	if (i == 5u) { return vec3(0.05, 0.14, 0.065); }
-	// Kept bright on purpose while there is no water over the seabed (see planet_v4.gdshader)
-	if (i == 6u) { return vec3(0.20, 0.30, 0.36); }
-	return vec3(1.0, 0.0, 1.0);
+	return style.palette[min(i, 7u)].rgb;
 }
 
 float mat_roughness(uint i) {
-	if (i == 2u) { return 0.42; }
-	if (i == 1u) { return 0.72; }
-	if (i == 3u) { return 0.78; }
-	if (i == 6u) { return 0.62; }
-	return 0.88;
+	return style.palette[min(i, 7u)].a;
 }
 )";
 
@@ -172,6 +172,7 @@ layout(location = 3) out vec4 v_surface;
 layout(location = 4) out vec3 v_pos;
 layout(location = 5) out vec3 v_rel; // position relative to the camera, precise near it
 layout(location = 6) flat out uint v_chunk_flags;
+layout(location = 7) flat out uint v_dominant_material; // for palette snapping
 
 // Keep in sync with gpu_driven::PackedVertex
 const uint VERTEX_WORDS = 8u;
@@ -241,14 +242,20 @@ void main() {
 	vec3 albedo = vec3(0.5);
 	float roughness = 0.88;
 	float vegetation = 0.0;
+	v_dominant_material = idx[0];
 	if (wsum > 0.0) {
 		albedo = vec3(0.0);
 		roughness = 0.0;
+		float best_weight = -1.0;
 		for (int k = 0; k < 4; ++k) {
 			const float wk = w[k] / wsum;
 			albedo += mat_albedo(idx[k]) * wk;
 			roughness += mat_roughness(idx[k]) * wk;
 			vegetation += (idx[k] == 0u || idx[k] == 5u) ? wk : 0.0;
+			if (wk > best_weight) {
+				best_weight = wk;
+				v_dominant_material = idx[k];
+			}
 		}
 	}
 	v_albedo = albedo;
@@ -272,6 +279,7 @@ layout(location = 3) in vec4 v_surface;
 layout(location = 4) in vec3 v_pos;
 layout(location = 5) in vec3 v_rel;
 layout(location = 6) flat in uint v_chunk_flags;
+layout(location = 7) flat in uint v_dominant_material;
 
 const uint CHUNK_FLAG_FAR = 4u;
 
@@ -363,8 +371,21 @@ void main() {
 	const float dryness_tint = style.p2.x;
 	const float detail_normal_strength = style.p2.y;
 	const float detail_normal_scale = style.p2.z;
+	const float facet_shading = style.p3.x;
+	const float light_bands = style.p3.y;
+	const float palette_snap = style.p3.z;
+	const float facet_tint = style.p3.w;
 
-	const vec3 n = normalize(v_normal);
+	vec3 n = normalize(v_normal);
+	// Geometric normal of the triangle. Derived from the camera-relative position: v_pos is planet-scale, and
+	// float32 derivatives of it are too coarse to give a usable normal.
+	vec3 face = normalize(cross(dFdx(v_rel), dFdy(v_rel)));
+	face *= sign(dot(face, n));
+	if (facet_shading > 0.0) {
+		// One normal for the whole triangle. Slope-driven rock and snow then break on triangle edges too,
+		// which is what makes the facets read as intentional rather than as shading error.
+		n = normalize(mix(n, face, facet_shading));
+	}
 	const vec3 up = planet_radius > 0.0 ? normalize(v_pos) : vec3(0.0, 1.0, 0.0);
 	const float altitude = planet_radius > 0.0 ? length(v_pos) - planet_radius : v_pos.y;
 
@@ -378,15 +399,29 @@ void main() {
 		vegetation = 0.0;
 		roughness = 0.95;
 	}
-	const float erosion = v_surface.r;
-	const float ridge = v_surface.g * 2.0 - 1.0;
-	const float moisture = v_surface.b;
-	const float temperature = v_surface.a;
+	float erosion = v_surface.r;
+	float ridge = v_surface.g * 2.0 - 1.0;
+	float moisture = v_surface.b;
+	float temperature = v_surface.a;
 
 	const float up_dot = dot(n, up);
 	float gully = 0.0;
 	float snow = 0.0;
 	float rock_blend = 0.0;
+
+	// Flat per-triangle palette colour. Snapping the shaded albedo to the nearest entry instead would speckle,
+	// because the noise below pushes neighbouring fragments across palette boundaries. `var` fades that noise out
+	// as the snap comes in, so the facets stay flat; rock and snow are applied after and survive.
+	const float var = 1.0 - palette_snap;
+	albedo = mix(albedo, mat_albedo(v_dominant_material), palette_snap);
+
+	// Climate and erosion keep shaping the terrain under the snap, but in steps rather than gradients: biomes
+	// stay distinguishable and read as flat regions with hard edges instead of washes.
+	erosion = flatten(erosion, palette_snap);
+	ridge = flatten(ridge, palette_snap);
+	moisture = flatten(moisture, palette_snap);
+	temperature = flatten(temperature, palette_snap);
+	vegetation = flatten(vegetation, palette_snap);
 
 	if (!is_far) {
 		// Climate tinting: lush greens where wet, straw where dry, desaturated where cold
@@ -400,8 +435,8 @@ void main() {
 		// vegetation, plus a fine grain everywhere
 		const float macro = value_noise(v_pos / 420.0);
 		const float meso = value_noise(v_pos / 65.0);
-		albedo = mix(albedo, albedo * vec3(1.22, 1.08, 0.62), vegetation * smoothstep(0.45, 0.85, macro) * 0.8);
-		albedo *= mix(0.82, 1.12, meso * 0.7 + macro * 0.3);
+		albedo = mix(albedo, albedo * vec3(1.22, 1.08, 0.62), var * vegetation * smoothstep(0.45, 0.85, macro) * 0.8);
+		albedo *= mix(1.0, mix(0.82, 1.12, meso * 0.7 + macro * 0.3), var);
 
 		// Erosion features: gullies read as damp sediment, ridges as bare sunlit rock
 		gully = clamp(max(-ridge, 0.0) + max(0.5 - erosion, 0.0) * 1.5, 0.0, 1.0);
@@ -412,11 +447,11 @@ void main() {
 
 		// Rock: the slope threshold wanders with noise so cliffs don't end on a clean contour, and the rock itself
 		// gets altitude strata and tone variation
-		const float slope_jitter = (value_noise(v_pos / 140.0) - 0.5) * 0.16;
+		const float slope_jitter = (value_noise(v_pos / 140.0) - 0.5) * 0.16 * var;
 		rock_blend = max(1.0 - smoothstep(slope_rock_end, slope_rock_start, up_dot + slope_jitter), ridge_rock);
 		const float strata = 0.5 + 0.5 * sin(altitude / 38.0 + meso * 5.0);
-		vec3 rock = mat_albedo(1u) * mix(0.78, 1.18, value_noise(v_pos / 23.0));
-		rock *= mix(vec3(1.0), vec3(1.12, 0.98, 0.84), strata * 0.6);
+		vec3 rock = mat_albedo(1u) * mix(1.0, mix(0.78, 1.18, value_noise(v_pos / 23.0)), var);
+		rock *= mix(vec3(1.0), vec3(1.12, 0.98, 0.84), strata * 0.6 * var);
 		albedo = mix(albedo, rock * (1.0 + ridge_rock * 0.6), rock_blend);
 		roughness = mix(roughness, mat_roughness(1u), rock_blend);
 
@@ -424,6 +459,11 @@ void main() {
 				* smoothstep(slope_rock_end, 1.0, up_dot) * step(0.0, altitude);
 		albedo = mix(albedo, mat_albedo(2u), snow);
 		roughness = mix(roughness, mat_roughness(2u), snow);
+	}
+
+	if (facet_tint > 0.0) {
+		// Keyed on the face normal: constant across a triangle, and coplanar neighbours keep one tone
+		albedo *= 1.0 + facet_tint * (hash13(floor(face * 91.0)) - 0.5);
 	}
 
 	albedo = saturate_color(albedo, vibrance);
@@ -475,8 +515,11 @@ void main() {
 			const float ndh = max(dot(nd, h), 0.0);
 			// Burley diffuse. Godot's light energy carries a PI that cancels the 1/PI.
 			const float fd90_minus_1 = 2.0 * ldh * ldh * roughness - 0.5;
-			const float diffuse = (1.0 + fd90_minus_1 * schlick_fresnel(ndv)) *
+			float diffuse = (1.0 + fd90_minus_1 * schlick_fresnel(ndv)) *
 					(1.0 + fd90_minus_1 * schlick_fresnel(ndl)) * ndl;
+			if (light_bands >= 2.0) {
+				diffuse = ceil(clamp(diffuse, 0.0, 1.0) * light_bands) / light_bands;
+			}
 			float spec = 0.0;
 			if (f0 > 0.0) {
 				const float a = roughness * roughness;
@@ -531,8 +574,10 @@ struct StyleUBO {
 	float p0[4];
 	float p1[4];
 	float p2[4];
+	float p3[4];
+	float palette[8][4];
 };
-static_assert(sizeof(StyleUBO) == 48, "Must match shader");
+static_assert(sizeof(StyleUBO) == 192, "Must match shader");
 
 struct SceneUBO {
 	float fog_color_density[4];
@@ -1314,11 +1359,14 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 	_upload_dirty_chunks();
 
 	if (_uploaded_style_version != style_version) {
-		const StyleUBO ubo = {
+		StyleUBO ubo = {
 			{ style.planet_radius, style.vibrance, style.slope_rock_start, style.slope_rock_end },
 			{ style.snow_temperature, style.snow_blend, style.gully_darkening, style.ridge_highlight },
 			{ style.dryness_tint, style.detail_normal_strength, style.detail_normal_scale, 0.f },
+			{ style.facet_shading, style.light_bands, style.palette_snap, style.facet_tint },
 		};
+		static_assert(sizeof(ubo.palette) == sizeof(style.palette));
+		memcpy(ubo.palette, style.palette, sizeof(style.palette));
 		RenderingServer::get_singleton()->get_rendering_device()->buffer_update(
 				_style_buffer, 0, sizeof(ubo), &ubo
 		);

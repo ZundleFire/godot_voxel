@@ -26,7 +26,14 @@ uniform float dryness_tint : hint_range(0.0, 1.0) = 0.6;
 uniform float detail_normal_strength : hint_range(0.0, 3.0) = 0.0;
 uniform float detail_normal_scale = 6.0;
 
+// Low-poly styling, all 0 = the smooth look. light_bands exists only on the GPU-driven path: banding the
+// diffuse term here needs a light() function, which would replace Godot's whole lighting model.
+uniform float facet_shading : hint_range(0.0, 1.0) = 0.0;
+uniform float palette_snap : hint_range(0.0, 1.0) = 0.0;
+uniform float facet_tint : hint_range(0.0, 1.0) = 0.0;
+
 varying vec3 v_albedo;
+varying flat int v_dominant_material; // for palette snapping
 varying vec2 v_vegetation_roughness;
 varying vec4 v_surface;
 varying vec3 v_normal_world;
@@ -37,23 +44,33 @@ vec4 decode_8bit_vec4(float v) {
 	return vec4(float(i & 0xffu), float((i >> 8u) & 0xffu), float((i >> 16u) & 0xffu), float((i >> 24u) & 0xffu));
 }
 
+// grass, rock, snow, sand, dirt, moss, ocean floor (bright until water exists), unused.
+// Authoring these is the main lever on the low-poly look, since palette_snap leaves nothing else.
+// Uniform arrays cannot have defaults in Godot, and unset ones read as zero, so an all-zero entry falls back
+// to the default. A material wanting pure black must use something just above zero.
+const vec3 DEFAULT_COLORS[8] = {
+	vec3(0.075, 0.20, 0.045), vec3(0.27, 0.245, 0.215), vec3(0.82, 0.86, 0.92), vec3(0.56, 0.44, 0.24),
+	vec3(0.21, 0.13, 0.065), vec3(0.05, 0.14, 0.065), vec3(0.20, 0.30, 0.36), vec3(1.0, 0.0, 1.0)
+};
+const float DEFAULT_ROUGHNESS[8] = { 0.88, 0.72, 0.42, 0.78, 0.88, 0.88, 0.62, 0.88 };
+uniform vec3 material_colors[8];
+uniform float material_roughness[8];
+
+// Quantizes a climate/erosion driver so it shapes the terrain in flat steps rather than gradients. 4 steps at
+// full strength keeps biomes apart while reading as hard-edged regions.
+float flatten(float x, float amount) {
+	return amount > 0.0 ? mix(x, floor(x * 4.0 + 0.5) * 0.25, amount) : x;
+}
+
 vec3 mat_albedo(int i) {
-	if (i == 0) return vec3(0.075, 0.20, 0.045); // grass
-	if (i == 1) return vec3(0.27, 0.245, 0.215); // rock
-	if (i == 2) return vec3(0.82, 0.86, 0.92); // snow
-	if (i == 3) return vec3(0.56, 0.44, 0.24); // sand
-	if (i == 4) return vec3(0.21, 0.13, 0.065); // dirt
-	if (i == 5) return vec3(0.05, 0.14, 0.065); // moss
-	if (i == 6) return vec3(0.20, 0.30, 0.36); // ocean floor (bright until water exists)
-	return vec3(1.0, 0.0, 1.0);
+	int k = min(i, 7);
+	vec3 c = material_colors[k];
+	return dot(c, c) == 0.0 ? DEFAULT_COLORS[k] : c;
 }
 
 float mat_roughness(int i) {
-	if (i == 2) return 0.42;
-	if (i == 1) return 0.72;
-	if (i == 3) return 0.78;
-	if (i == 6) return 0.62;
-	return 0.88;
+	int k = min(i, 7);
+	return material_roughness[k] == 0.0 ? DEFAULT_ROUGHNESS[k] : material_roughness[k];
 }
 
 float luma(vec3 c) {
@@ -121,15 +138,21 @@ void vertex() {
 	vec3 albedo = vec3(0.5);
 	float roughness = 0.88;
 	float vegetation = 0.0;
+	v_dominant_material = int(idx[0]);
 	if (wsum > 0.0) {
 		albedo = vec3(0.0);
 		roughness = 0.0;
+		float best_weight = -1.0;
 		for (int k = 0; k < 4; ++k) {
 			int mi = int(idx[k]);
 			float wk = w[k] / wsum;
 			albedo += mat_albedo(mi) * wk;
 			roughness += mat_roughness(mi) * wk;
 			vegetation += (mi == 0 || mi == 5) ? wk : 0.0;
+			if (wk > best_weight) {
+				best_weight = wk;
+				v_dominant_material = mi;
+			}
 		}
 	}
 	v_albedo = albedo;
@@ -139,14 +162,28 @@ void vertex() {
 
 void fragment() {
 	vec3 n_world = normalize(v_normal_world);
+	// From view-space VERTEX, not v_pos_world: planet-scale float32 derivatives are too coarse to be usable
+	vec3 face = normalize((INV_VIEW_MATRIX * vec4(cross(dFdx(VERTEX), dFdy(VERTEX)), 0.0)).xyz);
+	face *= sign(dot(face, n_world));
+	if (facet_shading > 0.0) {
+		n_world = normalize(mix(n_world, face, facet_shading));
+	}
 	vec3 albedo = v_albedo;
 	float roughness = v_vegetation_roughness.y;
 	float vegetation = v_vegetation_roughness.x;
 
-	float erosion = v_surface.r;
-	float ridge = v_surface.g * 2.0 - 1.0;
-	float moisture = v_surface.b;
-	float temperature = v_surface.a;
+	// Flat per-triangle palette colour. `var` fades out the noise below so the facets stay flat; snapping the
+	// shaded albedo to the nearest entry instead would speckle where noise crosses palette boundaries.
+	float var = 1.0 - palette_snap;
+	albedo = mix(albedo, mat_albedo(v_dominant_material), palette_snap);
+
+	// Climate and erosion keep shaping the terrain under the snap, but in steps rather than gradients: biomes
+	// stay distinguishable and read as flat regions with hard edges instead of washes.
+	float erosion = flatten(v_surface.r, palette_snap);
+	float ridge = flatten(v_surface.g * 2.0 - 1.0, palette_snap);
+	float moisture = flatten(v_surface.b, palette_snap);
+	float temperature = flatten(v_surface.a, palette_snap);
+	vegetation = flatten(vegetation, palette_snap);
 
 	vec3 lush = saturate_color(albedo * vec3(0.92, 1.08, 0.88), 1.12);
 	vec3 dry = mix(albedo, vec3(0.52, 0.44, 0.18), dryness_tint);
@@ -160,8 +197,8 @@ void fragment() {
 
 	float macro = value_noise(v_pos_world / 420.0);
 	float meso = value_noise(v_pos_world / 65.0);
-	albedo = mix(albedo, albedo * vec3(1.22, 1.08, 0.62), vegetation * smoothstep(0.45, 0.85, macro) * 0.8);
-	albedo *= mix(0.82, 1.12, meso * 0.7 + macro * 0.3);
+	albedo = mix(albedo, albedo * vec3(1.22, 1.08, 0.62), var * vegetation * smoothstep(0.45, 0.85, macro) * 0.8);
+	albedo *= mix(1.0, mix(0.82, 1.12, meso * 0.7 + macro * 0.3), var);
 
 	float gully = clamp(max(-ridge, 0.0) + max(0.5 - erosion, 0.0) * 1.5, 0.0, 1.0);
 	albedo *= 1.0 - gully_darkening * gully;
@@ -169,11 +206,11 @@ void fragment() {
 	roughness = mix(roughness, 0.5, gully * moisture);
 	float ridge_rock = ridge_highlight * max(ridge, 0.0);
 
-	float slope_jitter = (value_noise(v_pos_world / 140.0) - 0.5) * 0.16;
+	float slope_jitter = (value_noise(v_pos_world / 140.0) - 0.5) * 0.16 * var;
 	float rock_blend = max(1.0 - smoothstep(slope_rock_end, slope_rock_start, up_dot + slope_jitter), ridge_rock);
 	float strata = 0.5 + 0.5 * sin(altitude / 38.0 + meso * 5.0);
-	vec3 rock = mat_albedo(1) * mix(0.78, 1.18, value_noise(v_pos_world / 23.0));
-	rock *= mix(vec3(1.0), vec3(1.12, 0.98, 0.84), strata * 0.6);
+	vec3 rock = mat_albedo(1) * mix(1.0, mix(0.78, 1.18, value_noise(v_pos_world / 23.0)), var);
+	rock *= mix(vec3(1.0), vec3(1.12, 0.98, 0.84), strata * 0.6 * var);
 	albedo = mix(albedo, rock * (1.0 + ridge_rock * 0.6), rock_blend);
 	roughness = mix(roughness, mat_roughness(1), rock_blend);
 
@@ -181,6 +218,10 @@ void fragment() {
 			* smoothstep(slope_rock_end, 1.0, up_dot) * step(0.0, altitude);
 	albedo = mix(albedo, mat_albedo(2), snow);
 	roughness = mix(roughness, mat_roughness(2), snow);
+
+	if (facet_tint > 0.0) {
+		albedo *= 1.0 + facet_tint * (hash13(floor(face * 91.0)) - 0.5);
+	}
 
 	albedo = saturate_color(albedo, vibrance);
 

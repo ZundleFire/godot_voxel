@@ -17,6 +17,7 @@ const TRADITIONAL := 0
 const GPU := 1
 
 var _out_dir := "."
+var _lowpoly_filter := "" # third argument: render only this preset (plus "off"), for quick look iteration
 var _world: Node3D
 var _cam: Camera3D
 var _background: Image
@@ -34,13 +35,13 @@ func _check(cond: bool, what: String) -> void:
 		_failures += 1
 
 
-func _make_material() -> ShaderMaterial:
+func _make_material(lowpoly: Dictionary = {}) -> ShaderMaterial:
 	var sh := Shader.new()
 	sh.code = FileAccess.get_file_as_string(ProjectSettings.globalize_path("res://").path_join(PLANET_SHADER))
 	var sm := ShaderMaterial.new()
 	sm.shader = sh
 	sm.set_shader_parameter("u_planet_radius", RADIUS)
-	sm.set_shader_parameter("vibrance", 1.38)
+	sm.set_shader_parameter("vibrance", lowpoly.get("vibrance", 1.38))
 	sm.set_shader_parameter("slope_rock_start", 0.6)
 	sm.set_shader_parameter("slope_rock_end", 0.38)
 	sm.set_shader_parameter("snow_temperature", 0.22)
@@ -48,6 +49,10 @@ func _make_material() -> ShaderMaterial:
 	sm.set_shader_parameter("gully_darkening", 0.605)
 	sm.set_shader_parameter("ridge_highlight", 0.534)
 	sm.set_shader_parameter("dryness_tint", 0.281)
+	for p in ["facet_shading", "light_bands", "palette_snap", "facet_tint"]:
+		sm.set_shader_parameter(p, lowpoly.get(p, 0.0))
+	if lowpoly.has("material_colors"):
+		sm.set_shader_parameter("material_colors", lowpoly["material_colors"])
 	return sm
 
 
@@ -182,7 +187,9 @@ func _make_scene(view: String) -> void:
 		# Sun from the side and slightly ahead: long shading across the relief
 		var sun_dir := (d * sin(deg_to_rad(32.0)) + (east * 0.85 + north * 0.5).normalized() * cos(deg_to_rad(32.0)))
 		sun.basis = Basis.looking_at(-sun_dir.normalized(), d)
-		sun.light_energy = 1.3
+		# Strong sun against modest cool ambient. With ambient at full sky energy the shadowed faces wash out to
+		# mid grey and the facets stop reading, which is most of what separates this from the reference art.
+		sun.light_energy = 1.7
 		sun.light_color = Color(1.0, 0.96, 0.88)
 		e.background_mode = Environment.BG_SKY
 		# The sky's up is world +Y, the planet's up here is `d`
@@ -194,12 +201,18 @@ func _make_scene(view: String) -> void:
 		psky.ground_bottom_color = psky.sky_horizon_color
 		e.sky.sky_material = psky
 		e.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-		e.ambient_light_energy = 1.0
+		# With AMBIENT_SOURCE_SKY, ambient_light_energy does nothing until sky_contribution drops below 1: Godot
+		# mixes the sky radiance in by that factor, and the GPU shader mirrors it. Dimming ambient this way is
+		# what lets the facets read instead of washing out to flat mid-grey.
+		e.ambient_light_energy = 0.9
+		e.ambient_light_color = Color(0.42, 0.52, 0.72)
+		e.ambient_light_sky_contribution = 0.3
+		e.tonemap_exposure = 0.95
 		e.tonemap_mode = Environment.TONE_MAPPER_ACES
-		e.tonemap_exposure = 1.1
 		e.fog_enabled = true
 		e.fog_light_color = Color(0.62, 0.72, 0.86)
-		e.fog_density = 0.000012
+		# Aerial haze is a big part of the low-poly reference look: it separates ridgelines into depth layers
+		e.fog_density = 0.000018
 		e.fog_sun_scatter = 0.1
 		e.fog_sky_affect = 0.0
 		var ground := d * (RADIUS + _vista_height)
@@ -275,6 +288,21 @@ func _iou(a: PackedByteArray, b: PackedByteArray) -> float:
 		inter += a[i] & b[i]
 		uni += a[i] | b[i]
 	return 1.0 if uni == 0 else float(inter) / uni
+
+
+func _diff_ratio(a: Image, b: Image) -> float:
+	var x := a.duplicate() as Image
+	var y := b.duplicate() as Image
+	x.resize(MASK_W, MASK_H, Image.INTERPOLATE_NEAREST)
+	y.resize(MASK_W, MASK_H, Image.INTERPOLATE_NEAREST)
+	var n := 0
+	for py in MASK_H:
+		for px in MASK_W:
+			var c := x.get_pixel(px, py)
+			var d := y.get_pixel(px, py)
+			if abs(c.r - d.r) + abs(c.g - d.g) + abs(c.b - d.b) > 0.05:
+				n += 1
+	return float(n) / float(MASK_W * MASK_H)
 
 
 func _coverage(m: PackedByteArray) -> float:
@@ -573,15 +601,87 @@ func _stage_cull(t: Node) -> void:
 			"culling saves GPU time (%.2f ms vs %.2f ms)" % [results["turned away"].gpu_ms, results["ahead"].gpu_ms])
 
 
+# Renders the same vista through a few low-poly presets, on both paths, for side-by-side comparison.
+# The parameters live on the material, so the GPU renderer picks them up through get_gpu_driven_style().
+var _lowpoly_presets := {
+	"off": {},
+	"facets": { "facet_shading": 1.0 },
+	"facets_tint": { "facet_shading": 1.0, "facet_tint": 0.22 },
+	"flat_palette": { "facet_shading": 1.0, "palette_snap": 0.85, "facet_tint": 0.22 },
+	"toon": { "facet_shading": 1.0, "palette_snap": 0.85, "facet_tint": 0.22, "light_bands": 4.0 },
+	# Snapped palette colours read washed out, so push saturation back up: vibrance applies after the snap
+	"toon_vivid": { "facet_shading": 1.0, "palette_snap": 0.85, "facet_tint": 0.22, "light_bands": 4.0,
+			"vibrance": 1.85 },
+	# The look from the reference art: flat facets, smooth (not banded) lighting, cool grey-blue rock against
+	# saturated greens, and every biome still on its own palette entry. Colours are linear, not sRGB.
+	"reference": { "facet_shading": 1.0, "palette_snap": 1.0, "facet_tint": 0.12, "vibrance": 1.05,
+			"material_colors": PackedVector3Array([
+				Vector3(0.09, 0.22, 0.06), # grass
+				Vector3(0.22, 0.24, 0.29), # rock, cool grey-blue: the defining colour of the references
+				Vector3(0.80, 0.84, 0.92), # snow
+				Vector3(0.52, 0.44, 0.26), # sand
+				Vector3(0.16, 0.11, 0.07), # dirt
+				Vector3(0.05, 0.17, 0.08), # moss
+				Vector3(0.16, 0.28, 0.33), # ocean floor
+				Vector3(1.0, 0.0, 1.0),
+			]) },
+}
+
+
+func _stage_lowpoly() -> void:
+	# Near terrain only: the far field shades through far_terrain.gdshader on the traditional path, which has
+	# none of these parameters, so a near+far shot would compare two different shaders.
+	_far_enabled = false
+	_view_distance = 8192
+	_lod_count = 8
+	for mode in [TRADITIONAL, GPU]:
+		var t := _make_terrain()
+		t.render_mode = mode
+		_world.add_child(t)
+		await _settle(t)
+		var label := "traditional" if mode == TRADITIONAL else "gpu"
+		var plain: Image = null
+		for name in _lowpoly_presets:
+			if _lowpoly_filter != "" and name != "off" and name != _lowpoly_filter:
+				continue
+			# A fresh material each time: blocks hold pooled copies, and set_material ignores the same instance,
+			# so changing parameters in place would never reach them. The GPU path reads the material directly.
+			t.material = _make_material(_lowpoly_presets[name])
+			for i in 6:
+				await process_frame
+			var img := await _capture("lowpoly_%s_%s" % [name, label])
+			var cov := _coverage(_mask(img))
+			_check(cov > 0.1, "%s %s: terrain still drawn (coverage %.3f)" % [label, name, cov])
+			# Catches parameters that never reach the shader: every preset must change the image
+			if plain == null:
+				plain = img
+			else:
+				var d := _diff_ratio(plain, img)
+				_check(d > 0.05, "%s %s: changes the image (%.1f%% of pixels)" % [label, name, d * 100.0])
+			print("  %s %s: %s" % [label, name, await _measure(240)])
+		t.queue_free()
+		await process_frame
+
+
 func _run() -> void:
 	var args: PackedStringArray = OS.get_cmdline_user_args()
 	var view: String = args[0] if args.size() > 0 else "surface"
 	if args.size() > 1:
 		_out_dir = args[1]
+	if args.size() > 2:
+		_lowpoly_filter = args[2]
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	Engine.max_fps = 0
-	_make_scene("vista" if view == "cracks" else view)
+	_make_scene("vista" if view == "cracks" or view == "lowpoly" else view)
 	print("planet view ", view)
+	if view == "lowpoly":
+		for i in 5:
+			await process_frame
+		_background = await _capture("lowpoly_background")
+		await _stage_lowpoly()
+		print("FAILURES=", _failures)
+		quit(1 if _failures > 0 else 0)
+		return
 	if view == "cracks":
 		await _stage_cracks()
 		print("FAILURES=", _failures)

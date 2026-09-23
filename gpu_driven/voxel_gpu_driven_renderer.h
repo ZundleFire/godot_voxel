@@ -55,6 +55,23 @@ public:
 		float dryness_tint = 0.6f;
 		float detail_normal_strength = 0.f;
 		float detail_normal_scale = 6.f;
+		// Low-poly styling. All zero is the smooth look, so existing materials are unaffected.
+		float facet_shading = 0.f; // 0: smooth normals, 1: one normal per triangle
+		float light_bands = 0.f; // 0: continuous, >= 2: quantize diffuse into that many steps
+		float palette_snap = 0.f; // 0: blended materials, 1: flat per-triangle palette color
+		float facet_tint = 0.f; // random per-triangle brightness, keeps flat facets readable
+		// Material palette: albedo rgb + roughness, one row per material index. The terrain material can
+		// override it through `material_colors` / `material_roughness`, like far_terrain.gdshader does.
+		float palette[8][4] = {
+			{ 0.075f, 0.20f, 0.045f, 0.88f }, // grass
+			{ 0.27f, 0.245f, 0.215f, 0.72f }, // rock
+			{ 0.82f, 0.86f, 0.92f, 0.42f }, // snow
+			{ 0.56f, 0.44f, 0.24f, 0.78f }, // sand
+			{ 0.21f, 0.13f, 0.065f, 0.88f }, // dirt
+			{ 0.05f, 0.14f, 0.065f, 0.88f }, // moss
+			{ 0.20f, 0.30f, 0.36f, 0.62f }, // ocean floor, bright until water exists
+			{ 1.f, 0.f, 1.f, 0.88f }, // unused
+		};
 
 		bool operator==(const Style &o) const {
 			return memcmp(this, &o, sizeof(Style)) == 0;
