@@ -157,7 +157,8 @@ uint8_t *VoxelMemoryPool::allocate(size_t size) {
 				ZN_ASSERT(capacity >= size);
 #endif
 				block = (uint8_t *)ZN_ALLOC(capacity * sizeof(uint8_t));
-				_total_memory += size;
+				// The whole bucket is allocated, and clear_unused_blocks subtracts it that way
+				_total_memory += capacity;
 			}
 		}
 #ifdef DEBUG_ENABLED

@@ -10,6 +10,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "core/object/worker_thread_pool.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_globals.h"
@@ -49,11 +50,14 @@ layout(set = 0, binding = 1, std430) restrict writeonly buffer Commands {
 // Chunks that survived culling, for statistics only
 layout(set = 0, binding = 2, std430) restrict buffer VisibleCounter {
 	uint visible_count;
+	uint visible_triangles;
 };
 
 layout(push_constant, std430) uniform Params {
 	// Terrain-local frustum planes, inside when dot(xyz, p) + w >= 0
 	vec4 planes[6];
+	// Terrain-local camera position, and the radius of a sphere at the planet center that is solid everywhere (0 = off)
+	vec4 horizon;
 	uint chunk_count;
 	uint pad0;
 	uint pad1;
@@ -78,11 +82,28 @@ void main() {
 			}
 		}
 	}
+	// Horizon: a point is hidden when the line from the camera to it crosses the occluder sphere. The set of hidden
+	// points is convex, so a box is hidden exactly when its 8 corners are. A bounding-sphere test was too loose to cull
+	// anything from orbit, where chunks are 8-16 km wide.
+	const vec3 cam = params.horizon.xyz;
+	// Squared distance to the horizon; <= 0 means the camera is inside the occluder
+	const float vh = dot(cam, cam) - params.horizon.w * params.horizon.w;
+	if (visible && params.horizon.w > 0.0 && vh > 0.0) {
+		bool all_hidden = true;
+		for (int k = 0; k < 8 && all_hidden; ++k) {
+			const vec3 corner = mix(c.aabb_min.xyz, c.aabb_max.xyz, vec3(k & 1, (k >> 1) & 1, (k >> 2) & 1));
+			const vec3 to_corner = corner - cam;
+			const float along = -dot(to_corner, cam);
+			all_hidden = along > vh && along * along > vh * dot(to_corner, to_corner);
+		}
+		visible = !all_hidden;
+	}
 	// Indices are pulled in the vertex shader, so the draw is non-indexed over the chunk's index range,
 	// and first_instance carries the chunk index to gl_InstanceIndex.
 	commands[i] = uvec4(c.info.z, visible ? 1u : 0u, c.info.y, i);
 	if (visible) {
 		atomicAdd(visible_count, 1u);
+		atomicAdd(visible_triangles, c.info.z / 3u);
 	}
 }
 )";
@@ -595,10 +616,15 @@ static_assert(sizeof(SceneUBO) == 160, "Must match shader");
 
 struct CullPushConstant {
 	float planes[6][4];
+	float horizon[4];
 	uint32_t chunk_count;
 	uint32_t pad[3];
 };
-static_assert(sizeof(CullPushConstant) == 112, "Must match shader");
+static_assert(sizeof(CullPushConstant) == 128, "Must match shader");
+// Horizon culling occluder, as a fraction of planet_radius. Must stay below the deepest terrain: V4 bottoms out around
+// radius - 2.4 km, 0.9 is 4 km down on a 40 km planet. ponytail: fixed ratio, derive it from the generator's relief
+// bound if a planet ever digs deeper than 10% of its radius.
+constexpr float HORIZON_OCCLUDER_RATIO = 0.9f;
 
 constexpr uint32_t VERTEX_STRIDE = sizeof(gpu_driven::PackedVertex);
 constexpr uint32_t INITIAL_VERTEX_CAPACITY = 256 * 1024;
@@ -635,21 +661,6 @@ Vector<uint8_t> compile_stage(RenderingDevice &rd, RenderingDevice::ShaderStage 
 	return spirv;
 }
 
-RID create_shader(RenderingDevice &rd, const Vector<RenderingDevice::ShaderStage> &stages, const Vector<String> &sources,
-		const String &name) {
-	Vector<RenderingDevice::ShaderStageSPIRVData> spirv_stages;
-	for (int i = 0; i < stages.size(); ++i) {
-		RenderingDevice::ShaderStageSPIRVData data;
-		data.shader_stage = stages[i];
-		data.spirv = compile_stage(rd, stages[i], sources[i]);
-		if (data.spirv.is_empty()) {
-			return RID();
-		}
-		spirv_stages.push_back(data);
-	}
-	return rd.shader_create_from_spirv(spirv_stages, name);
-}
-
 RenderingDevice::Uniform make_storage_uniform(int binding, RID buffer) {
 	RenderingDevice::Uniform u;
 	u.uniform_type = RenderingDevice::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -683,9 +694,77 @@ void extract_frustum_planes(const Projection &m, float out[6][4]) {
 	}
 }
 
+// GLSL to SPIR-V takes ~60 ms, which used to stall the first frame on the render thread. The result only depends on
+// the source, so it is compiled once per process on a worker thread, started as soon as a renderer is created.
+struct SpirvCache {
+	Mutex mutex;
+	WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
+	bool done = false;
+	Vector<uint8_t> cull, vertex, fragment;
+};
+SpirvCache g_spirv;
+
+void compile_spirv_task(void *) {
+	RenderingDevice &rd = *RenderingServer::get_singleton()->get_rendering_device();
+	g_spirv.cull = compile_stage(rd, RenderingDevice::SHADER_STAGE_COMPUTE, header_glsl(CULL_SHADER_GLSL));
+	g_spirv.vertex = compile_stage(rd, RenderingDevice::SHADER_STAGE_VERTEX, render_header_glsl(VERTEX_SHADER_GLSL));
+	g_spirv.fragment = compile_stage(rd, RenderingDevice::SHADER_STAGE_FRAGMENT, render_header_glsl(FRAGMENT_SHADER_GLSL));
+}
+
+void start_spirv_compile() {
+	MutexLock lock(g_spirv.mutex);
+	if (g_spirv.done || g_spirv.task != WorkerThreadPool::INVALID_TASK_ID ||
+			RenderingServer::get_singleton()->get_rendering_device() == nullptr) {
+		return;
+	}
+	g_spirv.task = WorkerThreadPool::get_singleton()->add_native_task(
+			compile_spirv_task, nullptr, true, "VoxelGpuDrivenRenderer shaders");
+}
+
+// Render thread. False while the worker is still compiling.
+bool is_spirv_ready() {
+	bool not_started = false;
+	{
+		MutexLock lock(g_spirv.mutex);
+		if (g_spirv.done) {
+			return true;
+		}
+		if (g_spirv.task != WorkerThreadPool::INVALID_TASK_ID) {
+			if (!WorkerThreadPool::get_singleton()->is_task_completed(g_spirv.task)) {
+				return false;
+			}
+			WorkerThreadPool::get_singleton()->wait_for_task_completion(g_spirv.task);
+			g_spirv.task = WorkerThreadPool::INVALID_TASK_ID;
+			g_spirv.done = true;
+			return true;
+		}
+		not_started = true;
+	}
+	if (not_started) {
+		start_spirv_compile();
+	}
+	return false;
+}
+
+RID create_shader_from_spirv(RenderingDevice &rd, const Vector<RenderingDevice::ShaderStage> &stages,
+		const Vector<Vector<uint8_t>> &spirv, const String &name) {
+	Vector<RenderingDevice::ShaderStageSPIRVData> spirv_stages;
+	for (int i = 0; i < stages.size(); ++i) {
+		if (spirv[i].is_empty()) {
+			return RID();
+		}
+		RenderingDevice::ShaderStageSPIRVData data;
+		data.shader_stage = stages[i];
+		data.spirv = spirv[i];
+		spirv_stages.push_back(data);
+	}
+	return rd.shader_create_from_spirv(spirv_stages, name);
+}
+
 } // namespace
 
 VoxelGpuDrivenRenderer::VoxelGpuDrivenRenderer() {
+	start_spirv_compile();
 	RenderingServer &rs = *RenderingServer::get_singleton();
 	_effect = rs.compositor_effect_create();
 	rs.compositor_effect_set_callback(_effect, RenderingServer::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE,
@@ -857,7 +936,7 @@ void VoxelGpuDrivenRenderer::remove_chunk(uint32_t id) {
 }
 
 Dictionary VoxelGpuDrivenRenderer::get_stats() const {
-	// Answered by the next render callback, so `visible_chunks` lags by a frame
+	// Answered by an async readback, so `visible_chunks` lags by a few frames
 	_visible_count_requested = true;
 	MutexLock lock(_mutex);
 	Dictionary d;
@@ -866,6 +945,7 @@ Dictionary VoxelGpuDrivenRenderer::get_stats() const {
 	d["chunks"] = _stats.chunk_count;
 	d["chunk_slots"] = _stats.chunk_slots;
 	d["visible_chunks"] = _stats.visible_chunks;
+	d["visible_triangles"] = _stats.visible_triangles;
 	d["vertices"] = _stats.vertex_count;
 	d["index_words"] = _stats.index_count;
 	d["vertex_capacity"] = _stats.vertex_capacity;
@@ -898,11 +978,15 @@ bool VoxelGpuDrivenRenderer::_ensure_initialized() {
 		return false;
 	}
 
-	_cull_shader = create_shader(*rd, { RenderingDevice::SHADER_STAGE_COMPUTE }, { header_glsl(CULL_SHADER_GLSL) },
+	if (!is_spirv_ready()) {
+		// Pending chunk ops wait in the queue, nothing is drawn until then
+		return false;
+	}
+	_cull_shader = create_shader_from_spirv(*rd, { RenderingDevice::SHADER_STAGE_COMPUTE }, { g_spirv.cull },
 			"VoxelGpuDrivenCull");
-	_render_shader = create_shader(*rd, { RenderingDevice::SHADER_STAGE_VERTEX, RenderingDevice::SHADER_STAGE_FRAGMENT },
-			{ render_header_glsl(VERTEX_SHADER_GLSL), render_header_glsl(FRAGMENT_SHADER_GLSL) },
-			"VoxelGpuDrivenRender");
+	_render_shader = create_shader_from_spirv(*rd,
+			{ RenderingDevice::SHADER_STAGE_VERTEX, RenderingDevice::SHADER_STAGE_FRAGMENT },
+			{ g_spirv.vertex, g_spirv.fragment }, "VoxelGpuDrivenRender");
 	if (_cull_shader.is_null() || _render_shader.is_null()) {
 		_init_failed = true;
 		MutexLock lock(_mutex);
@@ -917,7 +1001,7 @@ bool VoxelGpuDrivenRenderer::_ensure_initialized() {
 	_index_buffer = rd->storage_buffer_create(INITIAL_INDEX_CAPACITY * 4);
 	_style_buffer = rd->uniform_buffer_create(sizeof(StyleUBO));
 	_scene_buffer = rd->uniform_buffer_create(sizeof(SceneUBO));
-	_visible_counter_buffer = rd->storage_buffer_create(sizeof(uint32_t));
+	_visible_counter_buffer = rd->storage_buffer_create(2 * sizeof(uint32_t));
 	_ensure_chunk_capacity(INITIAL_CHUNK_CAPACITY - 1);
 
 	_initialized = true;
@@ -1395,9 +1479,15 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 
 	// Cull
 	{
-		rd.buffer_clear(_visible_counter_buffer, 0, sizeof(uint32_t));
+		rd.buffer_clear(_visible_counter_buffer, 0, 2 * sizeof(uint32_t));
 		CullPushConstant pc;
 		extract_frustum_planes(mvp, pc.planes);
+		// Planet center is the terrain origin
+		const Vector3 cam_local = terrain_transform.affine_inverse().xform(scene_data->get_cam_transform().origin);
+		pc.horizon[0] = cam_local.x;
+		pc.horizon[1] = cam_local.y;
+		pc.horizon[2] = cam_local.z;
+		pc.horizon[3] = style.planet_radius > 0.f ? style.planet_radius * HORIZON_OCCLUDER_RATIO : 0.f;
 		pc.chunk_count = _chunk_high_water;
 		pc.pad[0] = pc.pad[1] = pc.pad[2] = 0;
 
@@ -1499,15 +1589,22 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 		++_stats.indirect_draws_total;
 	}
 
-	// Reading back stalls the render thread, so only when the main thread asked for stats
-	if (_visible_count_requested.exchange(false)) {
-		const Vector<uint8_t> data = rd.buffer_get_data(_visible_counter_buffer, 0, sizeof(uint32_t));
-		if (data.size() == sizeof(uint32_t)) {
-			uint32_t visible = 0;
-			memcpy(&visible, data.ptr(), sizeof(visible));
-			MutexLock lock(_mutex);
-			_stats.visible_chunks = visible;
-		}
+	// Async: a synchronous buffer_get_data waits for the GPU and halved the frame rate of anything polling stats
+	if (!_visible_readback_in_flight && _visible_count_requested.exchange(false)) {
+		_visible_readback_in_flight = rd.buffer_get_data_async(_visible_counter_buffer,
+				callable_mp(this, &VoxelGpuDrivenRenderer::_on_visible_count_read), 0, 2 * sizeof(uint32_t)) == OK;
+	}
+}
+
+// Render thread, a few frames after the request
+void VoxelGpuDrivenRenderer::_on_visible_count_read(const Vector<uint8_t> &data) {
+	_visible_readback_in_flight = false;
+	if (data.size() == 2 * sizeof(uint32_t)) {
+		uint32_t counts[2];
+		memcpy(counts, data.ptr(), sizeof(counts));
+		MutexLock lock(_mutex);
+		_stats.visible_chunks = counts[0];
+		_stats.visible_triangles = counts[1];
 	}
 }
 

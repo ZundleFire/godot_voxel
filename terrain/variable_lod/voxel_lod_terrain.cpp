@@ -2922,7 +2922,22 @@ void VoxelLodTerrain::set_render_mode(RenderMode mode) {
 	_far_needs_restart = true;
 #endif
 
-	remesh_all_blocks();
+	// Unlike remesh_all_blocks, hidden blocks are remeshed too: their visuals were dropped, and the LOD system still
+	// counts them as loaded, so it would show them empty until a lazy remesh landed.
+	const unsigned int lod_count = get_lod_count();
+	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+		VoxelLodTerrainUpdateData::Lod &lod = _update_data->state.lods[lod_index];
+		for (auto it = lod.mesh_map_state.map.begin(); it != lod.mesh_map_state.map.end(); ++it) {
+			VoxelLodTerrainUpdateData::MeshBlockState &block = it->second;
+			if (block.state == VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT) {
+				continue;
+			}
+			block.state = VoxelLodTerrainUpdateData::MESH_UPDATE_NOT_SENT;
+			block.update_list_index = lod.mesh_blocks_pending_update.size();
+			lod.mesh_blocks_pending_update.push_back(VoxelLodTerrainUpdateData::MeshToUpdate{
+					it->first, TaskCancellationToken(), block.mesh_viewers.get() > 0 });
+		}
+	}
 	update_configuration_warnings();
 }
 

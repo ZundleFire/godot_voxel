@@ -5,6 +5,7 @@
 #include "../streams/load_all_blocks_data_task.h"
 #include "../streams/load_block_data_task.h"
 #include "../streams/save_block_data_task.h"
+#include "../storage/voxel_memory_pool.h"
 #include "../util/godot/classes/display_server.h"
 #include "../util/godot/classes/os.h"
 #include "../util/godot/classes/project_settings.h"
@@ -372,6 +373,21 @@ void VoxelEngine::process() {
 #ifdef VOXEL_ENABLE_GPU
 	ZN_PROFILE_PLOT("Pending GPU tasks", int64_t(_gpu_task_runner.get_pending_task_count()));
 #endif
+
+	// The memory pool keeps every buffer it ever handed out, and loading peaks far above what stays live: a 40 km planet
+	// seen from orbit left ~100-140 MB of free generation buffers in the pool with 0 bytes in use. Once no work has been
+	// queued for a couple of seconds, give that back. ponytail: frame count, not time; trims later at high frame rates.
+	const bool busy = _general_thread_pool.get_debug_remaining_tasks() > 0 ||
+			(_use_separate_generation_pool && _generation_thread_pool.get_debug_remaining_tasks() > 0) ||
+			_debug_generate_block_task_count > 0 || MeshBlockTask::debug_get_running_count() > 0 ||
+			_time_spread_task_runner.get_pending_count() > 0 || _progressive_task_runner.get_pending_count() > 0;
+	if (busy) {
+		_idle_frames = 0;
+		_memory_pool_trimmed = false;
+	} else if (!_memory_pool_trimmed && ++_idle_frames >= 120) {
+		VoxelMemoryPool::get_singleton().clear_unused_blocks();
+		_memory_pool_trimmed = true;
+	}
 }
 
 void VoxelEngine::sync_viewers_task_priority_data() {

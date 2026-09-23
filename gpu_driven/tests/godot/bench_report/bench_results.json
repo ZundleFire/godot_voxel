@@ -1,0 +1,202 @@
+[
+ {
+  "adapter": "NVIDIA GeForce GTX 750 Ti",
+  "gpu_renderer": {},
+  "load": {
+   "first_block_s": 0.04,
+   "load_avg_fps": 160.2,
+   "load_frames": 124,
+   "load_hitches_over_33ms": 0,
+   "load_s": 0.77,
+   "load_worst_frame_at_s": 0.32,
+   "load_worst_frame_ms": 21.8,
+   "mesh_blocks": 120,
+   "settled": true
+  },
+  "mem_after": {
+   "buffer_mb": 22.1,
+   "static_mb": 95.7,
+   "static_peak_mb": 305.2,
+   "video_mb": 46.6,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 6.8,
+   "voxel_used_mb": 0.0
+  },
+  "mem_before": {
+   "buffer_mb": 11.3,
+   "static_mb": 49.8,
+   "static_peak_mb": 53.3,
+   "video_mb": 35.8,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 0.0,
+   "voxel_used_mb": 0.0
+  },
+  "path": "traditional",
+  "steady": {
+   "avg_fps": 292.1,
+   "draw_calls": 88,
+   "frame_ms": 3.424,
+   "frame_ms_p50": 3.419,
+   "frame_ms_p99": 3.882,
+   "low1_fps": 255.7,
+   "primitives": 135062,
+   "render_cpu_ms": 0.113,
+   "render_gpu_ms": 3.006
+  },
+  "view": "orbit",
+  "process_s": 4.3
+ },
+ {
+  "adapter": "NVIDIA GeForce GTX 750 Ti",
+  "gpu_renderer": {
+   "chunks": 120,
+   "vertices": 211262,
+   "visible_chunks": 88,
+   "visible_triangles": 135062,
+   "vram_mb": 12.1
+  },
+  "load": {
+   "first_block_s": 0.04,
+   "load_avg_fps": 214.1,
+   "load_frames": 142,
+   "load_hitches_over_33ms": 0,
+   "load_s": 0.66,
+   "load_worst_frame_at_s": 0.02,
+   "load_worst_frame_ms": 18.1,
+   "mesh_blocks": 120,
+   "settled": true
+  },
+  "mem_after": {
+   "buffer_mb": 23.4,
+   "static_mb": 92.7,
+   "static_peak_mb": 261.1,
+   "video_mb": 48.7,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 7.6,
+   "voxel_used_mb": 0.0
+  },
+  "mem_before": {
+   "buffer_mb": 11.3,
+   "static_mb": 49.8,
+   "static_peak_mb": 53.3,
+   "video_mb": 35.8,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 0.0,
+   "voxel_used_mb": 0.0
+  },
+  "path": "gpu",
+  "steady": {
+   "avg_fps": 534.6,
+   "draw_calls": 0,
+   "frame_ms": 1.871,
+   "frame_ms_p50": 1.863,
+   "frame_ms_p99": 2.228,
+   "low1_fps": 443.5,
+   "primitives": 0,
+   "render_cpu_ms": 0.052,
+   "render_gpu_ms": 1.468
+  },
+  "view": "orbit",
+  "process_s": 3.0
+ },
+ {
+  "adapter": "NVIDIA GeForce GTX 750 Ti",
+  "gpu_renderer": {},
+  "load": {
+   "first_block_s": 0.03,
+   "load_avg_fps": 257.6,
+   "load_frames": 1815,
+   "load_hitches_over_33ms": 0,
+   "load_s": 7.05,
+   "load_worst_frame_at_s": 0.02,
+   "load_worst_frame_ms": 16.8,
+   "mesh_blocks": 1270,
+   "settled": true
+  },
+  "mem_after": {
+   "buffer_mb": 98.8,
+   "static_mb": 108.4,
+   "static_peak_mb": 188.8,
+   "video_mb": 123.6,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 6.4,
+   "voxel_used_mb": 0.0
+  },
+  "mem_before": {
+   "buffer_mb": 11.3,
+   "static_mb": 49.8,
+   "static_peak_mb": 53.3,
+   "video_mb": 35.8,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 0.0,
+   "voxel_used_mb": 0.0
+  },
+  "path": "traditional",
+  "steady": {
+   "avg_fps": 239.7,
+   "draw_calls": 265,
+   "frame_ms": 4.173,
+   "frame_ms_p50": 4.192,
+   "frame_ms_p99": 4.583,
+   "low1_fps": 216.8,
+   "primitives": 364269,
+   "render_cpu_ms": 0.265,
+   "render_gpu_ms": 3.752
+  },
+  "view": "surface",
+  "process_s": 11.0
+ },
+ {
+  "adapter": "NVIDIA GeForce GTX 750 Ti",
+  "gpu_renderer": {
+   "chunks": 1270,
+   "vertices": 1695734,
+   "visible_chunks": 257,
+   "visible_triangles": 349334,
+   "vram_mb": 80.2
+  },
+  "load": {
+   "first_block_s": 0.03,
+   "load_avg_fps": 312.2,
+   "load_frames": 2179,
+   "load_hitches_over_33ms": 0,
+   "load_s": 6.98,
+   "load_worst_frame_at_s": 0.02,
+   "load_worst_frame_ms": 17.7,
+   "mesh_blocks": 1270,
+   "settled": true
+  },
+  "mem_after": {
+   "buffer_mb": 91.5,
+   "static_mb": 89.1,
+   "static_peak_mb": 167.3,
+   "video_mb": 117.2,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 5.8,
+   "voxel_used_mb": 0.0
+  },
+  "mem_before": {
+   "buffer_mb": 11.3,
+   "static_mb": 49.8,
+   "static_peak_mb": 53.3,
+   "video_mb": 35.8,
+   "voxel_blocks": 0,
+   "voxel_pool_mb": 0.0,
+   "voxel_used_mb": 0.0
+  },
+  "path": "gpu",
+  "steady": {
+   "avg_fps": 323.8,
+   "draw_calls": 0,
+   "frame_ms": 3.089,
+   "frame_ms_p50": 3.102,
+   "frame_ms_p99": 3.505,
+   "low1_fps": 283.1,
+   "primitives": 0,
+   "render_cpu_ms": 0.058,
+   "render_gpu_ms": 2.671
+  },
+  "view": "surface",
+  "process_s": 10.2
+ }
+]

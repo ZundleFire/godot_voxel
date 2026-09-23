@@ -149,6 +149,7 @@ private:
 	bool _ensure_uniform_sets();
 	RID _get_render_pipeline(int64_t framebuffer_format, int samples);
 	RID _get_radiance_uniform_set(RID radiance);
+	void _on_visible_count_read(const Vector<uint8_t> &data);
 
 	// Main thread state
 	RID _effect;
@@ -180,6 +181,7 @@ private:
 		uint32_t indirect_draws_total = 0;
 		// Chunks that passed frustum culling in the last render that was asked for stats
 		uint32_t visible_chunks = 0;
+		uint32_t visible_triangles = 0;
 		bool initialized = false;
 		bool failed = false;
 	};
@@ -200,6 +202,8 @@ private:
 	RID _scene_buffer;
 	RID _visible_counter_buffer;
 	mutable std::atomic_bool _visible_count_requested = false;
+	// Render thread: one async readback at a time, so polling stats every frame queues nothing extra
+	bool _visible_readback_in_flight = false;
 	RID _radiance_sampler;
 	RID _radiance_uniform_set;
 	RID _radiance_uniform_set_texture;

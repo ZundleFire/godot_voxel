@@ -17,6 +17,7 @@ const TRADITIONAL := 0
 const GPU := 1
 
 var _out_dir := "."
+var _view := "surface"
 var _lowpoly_filter := "" # third argument: render only this preset (plus "off"), for quick look iteration
 var _world: Node3D
 var _cam: Camera3D
@@ -583,22 +584,26 @@ func _stage_cull(t: Node) -> void:
 			_cam.rotation_degrees = base + Vector3(0.0, float(entry[1]), 0.0)
 		for i in 5:
 			await process_frame
-		# get_gpu_driven_statistics asks the render thread, the answer lands a frame later
+		# get_gpu_driven_statistics starts an async readback, the answer lands a few frames later
 		t.get_gpu_driven_statistics()
-		await process_frame
-		await process_frame
+		for i in 8:
+			await process_frame
 		var g: Dictionary = t.get_gpu_driven_statistics()
 		var m := await _measure(120)
 		results[label] = { "visible": int(g.visible_chunks), "gpu_ms": m.render_gpu_ms }
 	_cam.rotation_degrees = base
 	print("  culling: ", results)
 	var total: int = int(t.get_gpu_driven_statistics().chunks)
-	_check(results["ahead"].visible > 0 and results["ahead"].visible < total,
-			"some chunks culled while looking at the terrain (%d of %d visible)" % [results["ahead"].visible, total])
-	_check(results["turned away"].visible < results["ahead"].visible / 4,
-			"turning away culls nearly everything (%d visible)" % results["turned away"].visible)
-	_check(results["turned away"].gpu_ms < results["ahead"].gpu_ms,
-			"culling saves GPU time (%.2f ms vs %.2f ms)" % [results["turned away"].gpu_ms, results["ahead"].gpu_ms])
+	# From orbit the whole planet is in frame, so frustum culling rightly keeps everything
+	var some_culled: bool = _view == "orbit" or results["ahead"].visible < total
+	_check(results["ahead"].visible > 0 and some_culled,
+			"chunks drawn looking at the terrain (%d of %d visible)" % [results["ahead"].visible, total])
+	# On the surface, turning around still faces terrain; only looking at the sky leaves nothing to draw
+	var away: String = "turned away" if _view == "orbit" else "pitched up"
+	_check(results[away].visible < results["ahead"].visible / 4,
+			"%s culls nearly everything (%d visible)" % [away, results[away].visible])
+	_check(results[away].gpu_ms < results["ahead"].gpu_ms,
+			"culling saves GPU time (%.2f ms vs %.2f ms)" % [results[away].gpu_ms, results["ahead"].gpu_ms])
 
 
 # Renders the same vista through a few low-poly presets, on both paths, for side-by-side comparison.
@@ -666,6 +671,7 @@ func _stage_lowpoly() -> void:
 func _run() -> void:
 	var args: PackedStringArray = OS.get_cmdline_user_args()
 	var view: String = args[0] if args.size() > 0 else "surface"
+	_view = view
 	if args.size() > 1:
 		_out_dir = args[1]
 	if args.size() > 2:

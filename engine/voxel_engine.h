@@ -366,6 +366,9 @@ private:
 	// For tasks that can only run on the main thread and be spread out over frames
 	TimeSpreadTaskRunner _time_spread_task_runner;
 	unsigned int _main_thread_time_budget_usec = DEFAULT_MAIN_THREAD_BUDGET_USEC;
+	// Frames without voxel work, for giving the memory pool's load peak back (see process())
+	unsigned int _idle_frames = 0;
+	bool _memory_pool_trimmed = true;
 	ProgressiveTaskRunner _progressive_task_runner;
 
 	FileLocker _file_locker;
