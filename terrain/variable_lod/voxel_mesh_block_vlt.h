@@ -78,7 +78,7 @@ public:
 
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
 	// GPU-driven blocks have no Mesh to read back, so the instancer's copy of the surface (vertex, normal, index,
-	// custom1 only) lives here. Without it, reassigning the instancer library found nothing to spawn on.
+	// custom1, custom2 only) lives here. Without it, reassigning the instancer library found nothing to spawn on.
 	Array instancer_surface;
 
 	// Replaces the mesh instance path when the terrain renders with VoxelGpuDrivenRenderer.

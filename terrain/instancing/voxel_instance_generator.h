@@ -158,6 +158,18 @@ public:
 	void set_voxel_material_filter_threshold(const float p_threshold);
 	float get_voxel_material_filter_threshold() const;
 
+	// Surface data filter: keeps instances whose interpolated surface data (mesh CUSTOM2, 4 unorm bytes per vertex as
+	// written by VoxelMesherTransvoxel.surface_data_enabled; B = moisture, A = temperature by EdenPlanetGenerator
+	// convention) falls in the ranges, with a soft random falloff at the edges. Lets items follow climate.
+	void set_surface_filter_enabled(bool enabled);
+	bool is_surface_filter_enabled() const;
+	void set_temperature_range(Vector2 range);
+	Vector2 get_temperature_range() const;
+	void set_moisture_range(Vector2 range);
+	Vector2 get_moisture_range() const;
+	void set_surface_filter_falloff(float falloff);
+	float get_surface_filter_falloff() const;
+
 	void set_snap_to_generator_sdf_enabled(bool enabled);
 	bool get_snap_to_generator_sdf_enabled() const;
 
@@ -217,6 +229,11 @@ private:
 	bool _voxel_material_filter_enabled = false;
 	uint32_t _voxel_material_filter_mask = 1;
 	float _voxel_material_filter_threshold = 0.5f;
+
+	bool _surface_filter_enabled = false;
+	Vector2 _temperature_range = Vector2(0.f, 1.f);
+	Vector2 _moisture_range = Vector2(0.f, 1.f);
+	float _surface_filter_falloff = 0.05f;
 
 	struct GeneratorSDFSnapSettings {
 		bool enabled = false;

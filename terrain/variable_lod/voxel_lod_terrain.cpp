@@ -2212,6 +2212,7 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 			kept[Mesh::ARRAY_NORMAL] = src[Mesh::ARRAY_NORMAL];
 			kept[Mesh::ARRAY_INDEX] = src[Mesh::ARRAY_INDEX];
 			kept[Mesh::ARRAY_CUSTOM1] = src[Mesh::ARRAY_CUSTOM1];
+			kept[Mesh::ARRAY_CUSTOM2] = src[Mesh::ARRAY_CUSTOM2]; // surface data, for climate filters
 			block->instancer_surface = kept;
 		}
 	}

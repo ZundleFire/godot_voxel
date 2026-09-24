@@ -515,10 +515,13 @@ void generate_random_points_from_triangles(
 	// This is roughly the size of one voxel's triangle
 	// const float unit_area = 0.5f * squared(block_size / 32.f);
 
-	float area_accumulator = 0.f;
 	// Here density means "instances per space unit squared".
 	// So inverse density means "units squared per instance"
 	const float inv_density = 1.f / density;
+	// Random start (stochastic rounding): from 0, the remainder below one instance was dropped at the end of every
+	// block, so any layer with less than ~1 instance per block (sparse boulders, dead trees) almost never spawned.
+	// Now the expected count is density * area at any density.
+	float area_accumulator = pcg.randf() * inv_density;
 
 	for (int triangle_index = 0; triangle_index < triangle_count; ++triangle_index) {
 		const uint32_t ii = triangle_index * 3;
@@ -767,6 +770,8 @@ struct MeshData {
 	Span<const Vector3> normals;
 	Span<const TexAttrib> texture_data;
 	Span<const int32_t> indices;
+	// CUSTOM2 surface data, one packed RGBA8 per vertex (empty when not requested or absent)
+	Span<const uint32_t> surface_data;
 
 	inline bool is_empty() const {
 		return indices.size() == 0;
@@ -777,7 +782,8 @@ MeshData parse_arrays(
 		const Array &surface_arrays,
 		const int32_t vertex_range_end,
 		const int32_t index_range_end,
-		const bool use_tex_attribs
+		const bool use_tex_attribs,
+		const bool use_surface_data
 ) {
 	if (vertex_range_end == 0) {
 		return {};
@@ -826,7 +832,82 @@ MeshData parse_arrays(
 		mesh_indices = mesh_indices.sub(0, index_range_end);
 	}
 
-	return { vertices, normals, tex_attribs, mesh_indices };
+	Span<const uint32_t> surface_data;
+	if (use_surface_data && surface_arrays.size() > Mesh::ARRAY_CUSTOM2 &&
+		surface_arrays[Mesh::ARRAY_CUSTOM2].get_type() == Variant::PACKED_BYTE_ARRAY) {
+		const PackedByteArray src = surface_arrays[Mesh::ARRAY_CUSTOM2];
+		if (src.size() / 4 >= static_cast<int>(vertices.size())) {
+			surface_data = Span<const uint32_t>(reinterpret_cast<const uint32_t *>(src.ptr()), vertices.size());
+		}
+	}
+
+	return { vertices, normals, tex_attribs, mesh_indices, surface_data };
+}
+
+// Climate channels of the packed surface data, 0..1 (see VoxelInstanceGenerator::set_surface_filter_enabled)
+inline void unpack_climate(const uint32_t packed, float &moisture, float &temperature) {
+	moisture = float((packed >> 16) & 0xff) / 255.f;
+	temperature = float((packed >> 24) & 0xff) / 255.f;
+}
+
+// Soft range test: 1 inside, falling to 0 over `falloff` outside
+inline float range_weight(const float v, const Vector2 range, const float falloff) {
+	if (v < range.x) {
+		return falloff > 0.f ? math::max(1.f - (range.x - v) / falloff, 0.f) : 0.f;
+	}
+	if (v > range.y) {
+		return falloff > 0.f ? math::max(1.f - (v - range.y) / falloff, 0.f) : 0.f;
+	}
+	return 1.f;
+}
+
+// Removes instances whose climate falls outside the ranges. Same index/barycentric conventions as
+// filter_instances_by_voxel_materials; the surface data is interpolated over the spawning triangle.
+void filter_instances_by_surface_data(
+		StdVector<Vector3f> &instance_positions,
+		StdVector<Vector3f> &instance_normals,
+		StdVector<float> &instance_barycentrics,
+		StdVector<uint32_t> &instance_indices,
+		Span<const int32_t> mesh_indices,
+		Span<const uint32_t> surface_data,
+		const Vector2 temperature_range,
+		const Vector2 moisture_range,
+		const float falloff,
+		const VoxelInstanceGenerator::EmitMode emit_mode,
+		RandomPCG &rng
+) {
+	ZN_PROFILE_SCOPE();
+	const bool per_vertex = emit_mode == VoxelInstanceGenerator::EMIT_FROM_VERTICES;
+	for (unsigned int instance_index = 0; instance_index < instance_positions.size();) {
+		float moisture = 0.f;
+		float temperature = 0.f;
+		const uint32_t ii = instance_indices[instance_index];
+		if (per_vertex) {
+			unpack_climate(surface_data[ii], moisture, temperature);
+		} else {
+			for (unsigned int k = 0; k < 3; ++k) {
+				float m, t;
+				unpack_climate(surface_data[mesh_indices[ii + k]], m, t);
+				const float b = instance_barycentrics[instance_index * 3 + k];
+				moisture += m * b;
+				temperature += t * b;
+			}
+		}
+		const float keep =
+				range_weight(temperature, temperature_range, falloff) * range_weight(moisture, moisture_range, falloff);
+		if (keep >= 1.f || (keep > 0.f && rng.randf() < keep)) {
+			instance_index += 1;
+		} else {
+			unordered_remove(instance_positions, instance_index);
+			unordered_remove(instance_normals, instance_index);
+			unordered_remove(instance_indices, instance_index);
+			if (!per_vertex) {
+				unordered_remove(instance_barycentrics, instance_index * 3 + 2);
+				unordered_remove(instance_barycentrics, instance_index * 3 + 1);
+				unordered_remove(instance_barycentrics, instance_index * 3 + 0);
+			}
+		}
+	}
 }
 
 void filter_instances_by_octant(
@@ -975,9 +1056,16 @@ void VoxelInstanceGenerator::generate_transforms(
 		return;
 	}
 
-	const MeshData mesh =
-			parse_arrays(surface_arrays, vertex_range_end, index_range_end, _voxel_material_filter_enabled);
+	const MeshData mesh = parse_arrays(
+			surface_arrays, vertex_range_end, index_range_end, _voxel_material_filter_enabled, _surface_filter_enabled
+	);
 	if (mesh.is_empty()) {
+		return;
+	}
+	// Without surface data (mesher option off) the filter can't run; spawn nothing rather than ignore the climate
+	const bool surface_filter_enabled = _surface_filter_enabled;
+	if (surface_filter_enabled && mesh.surface_data.size() == 0) {
+		ZN_PRINT_WARNING_ONCE("Surface filter enabled but the mesh has no surface data (CUSTOM2)");
 		return;
 	}
 
@@ -1017,8 +1105,8 @@ void VoxelInstanceGenerator::generate_transforms(
 	const bool voxel_material_filter_enabled = _voxel_material_filter_enabled;
 	const uint32_t voxel_material_filter_mask = _voxel_material_filter_mask;
 
-	const bool index_cache_used = voxel_material_filter_enabled;
-	const bool barycentrics_used = voxel_material_filter_enabled && _emit_mode != EMIT_FROM_VERTICES;
+	const bool index_cache_used = voxel_material_filter_enabled || surface_filter_enabled;
+	const bool barycentrics_used = index_cache_used && _emit_mode != EMIT_FROM_VERTICES;
 
 	// Do an early check to see if there is any material that we can potentially find
 	if (voxel_material_filter_enabled) {
@@ -1120,6 +1208,23 @@ void VoxelInstanceGenerator::generate_transforms(
 				barycentrics_used ? &barycentrics : nullptr,
 				block_size,
 				octant_mask
+		);
+	}
+
+	// Before the material filter, which consumes the index cache
+	if (surface_filter_enabled) {
+		filter_instances_by_surface_data(
+				vertex_cache,
+				normal_cache,
+				barycentrics,
+				index_cache,
+				mesh.indices,
+				mesh.surface_data,
+				_temperature_range,
+				_moisture_range,
+				_surface_filter_falloff,
+				_emit_mode,
+				pcg1
 		);
 	}
 
@@ -1851,6 +1956,57 @@ float VoxelInstanceGenerator::get_voxel_material_filter_threshold() const {
 	return _voxel_material_filter_threshold;
 }
 
+void VoxelInstanceGenerator::set_surface_filter_enabled(bool enabled) {
+	if (enabled == _surface_filter_enabled) {
+		return;
+	}
+	_surface_filter_enabled = enabled;
+	emit_changed();
+}
+
+bool VoxelInstanceGenerator::is_surface_filter_enabled() const {
+	return _surface_filter_enabled;
+}
+
+void VoxelInstanceGenerator::set_temperature_range(Vector2 range) {
+	range = Vector2(math::clamp(range.x, 0.f, 1.f), math::clamp(range.y, 0.f, 1.f));
+	if (range == _temperature_range) {
+		return;
+	}
+	_temperature_range = range;
+	emit_changed();
+}
+
+Vector2 VoxelInstanceGenerator::get_temperature_range() const {
+	return _temperature_range;
+}
+
+void VoxelInstanceGenerator::set_moisture_range(Vector2 range) {
+	range = Vector2(math::clamp(range.x, 0.f, 1.f), math::clamp(range.y, 0.f, 1.f));
+	if (range == _moisture_range) {
+		return;
+	}
+	_moisture_range = range;
+	emit_changed();
+}
+
+Vector2 VoxelInstanceGenerator::get_moisture_range() const {
+	return _moisture_range;
+}
+
+void VoxelInstanceGenerator::set_surface_filter_falloff(float falloff) {
+	falloff = math::clamp(falloff, 0.f, 1.f);
+	if (falloff == _surface_filter_falloff) {
+		return;
+	}
+	_surface_filter_falloff = falloff;
+	emit_changed();
+}
+
+float VoxelInstanceGenerator::get_surface_filter_falloff() const {
+	return _surface_filter_falloff;
+}
+
 void VoxelInstanceGenerator::set_snap_to_generator_sdf_enabled(bool enabled) {
 	if (_gen_sdf_snap_settings.enabled == enabled) {
 		return;
@@ -2272,6 +2428,27 @@ void VoxelInstanceGenerator::_bind_methods() {
 			PropertyInfo(Variant::FLOAT, "voxel_texture_filter_threshold", PROPERTY_HINT_RANGE, "0.0, 1.0, 0.01"),
 			"set_voxel_texture_filter_threshold",
 			"get_voxel_texture_filter_threshold"
+	);
+
+	ClassDB::bind_method(D_METHOD("set_surface_filter_enabled", "enabled"), &Self::set_surface_filter_enabled);
+	ClassDB::bind_method(D_METHOD("is_surface_filter_enabled"), &Self::is_surface_filter_enabled);
+	ClassDB::bind_method(D_METHOD("set_temperature_range", "range"), &Self::set_temperature_range);
+	ClassDB::bind_method(D_METHOD("get_temperature_range"), &Self::get_temperature_range);
+	ClassDB::bind_method(D_METHOD("set_moisture_range", "range"), &Self::set_moisture_range);
+	ClassDB::bind_method(D_METHOD("get_moisture_range"), &Self::get_moisture_range);
+	ClassDB::bind_method(D_METHOD("set_surface_filter_falloff", "falloff"), &Self::set_surface_filter_falloff);
+	ClassDB::bind_method(D_METHOD("get_surface_filter_falloff"), &Self::get_surface_filter_falloff);
+
+	ADD_GROUP("Surface data filtering", "");
+	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "surface_filter_enabled"), "set_surface_filter_enabled", "is_surface_filter_enabled"
+	);
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "temperature_range"), "set_temperature_range", "get_temperature_range");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "moisture_range"), "set_moisture_range", "get_moisture_range");
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "surface_filter_falloff", PROPERTY_HINT_RANGE, "0.0, 1.0, 0.01"),
+			"set_surface_filter_falloff",
+			"get_surface_filter_falloff"
 	);
 
 	ADD_GROUP("Snap to generator SDF", "snap_to_generator_sdf_");

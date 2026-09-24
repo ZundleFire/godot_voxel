@@ -37,6 +37,9 @@ private:
 	// having deleted all the nodes, which means this plugin will be left with a dangling pointer when it's time to
 	// turn off the node's debug drawing feature...
 	ObjectID _instancer_object_id = ObjectID();
+	// Off by default: selecting an instancer used to draw every block, and deselection isn't reliably reported, so
+	// the boxes stayed on screen
+	bool _show_block_boxes = false;
 	VoxelInstancerStatView *_stat_view = nullptr;
 };
 

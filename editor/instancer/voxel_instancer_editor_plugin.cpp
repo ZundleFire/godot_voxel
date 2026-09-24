@@ -18,6 +18,7 @@ namespace zylann::voxel {
 namespace {
 enum MenuItemID { //
 	MENU_SHOW_STATS,
+	MENU_SHOW_BLOCK_BOXES,
 	MENU_ABOUT
 };
 }
@@ -36,6 +37,10 @@ void VoxelInstancerEditorPlugin::init() {
 			const int i = menu_button->get_popup()->get_item_index(MENU_SHOW_STATS);
 			popup->set_item_as_checkable(i, true);
 			popup->set_item_checked(i, false);
+		}
+		{
+			popup->add_check_item(ZN_TTR("Show block boxes"), MENU_SHOW_BLOCK_BOXES);
+			popup->set_item_checked(popup->get_item_index(MENU_SHOW_BLOCK_BOXES), _show_block_boxes);
 		}
 		{
 			popup->add_separator();
@@ -76,7 +81,7 @@ void VoxelInstancerEditorPlugin::_zn_edit(Object *p_object) {
 	}
 	VoxelInstancer *instancer = Object::cast_to<VoxelInstancer>(p_object);
 	ERR_FAIL_COND(instancer == nullptr);
-	instancer->debug_set_draw_enabled(true);
+	instancer->debug_set_draw_enabled(_show_block_boxes);
 	instancer->debug_set_draw_flag(VoxelInstancer::DEBUG_DRAW_ALL_BLOCKS, true);
 	_instancer_object_id = instancer->get_instance_id();
 	if (_stat_view != nullptr) {
@@ -112,6 +117,15 @@ void VoxelInstancerEditorPlugin::_on_menu_item_selected(int id) {
 			const bool active = toggle_stat_view();
 			const int i = _menu_button->get_popup()->get_item_index(id);
 			_menu_button->get_popup()->set_item_checked(i, active);
+		} break;
+
+		case MENU_SHOW_BLOCK_BOXES: {
+			_show_block_boxes = !_show_block_boxes;
+			_menu_button->get_popup()->set_item_checked(_menu_button->get_popup()->get_item_index(id), _show_block_boxes);
+			VoxelInstancer *instancer = get_instancer();
+			if (instancer != nullptr) {
+				instancer->debug_set_draw_enabled(_show_block_boxes);
+			}
 		} break;
 
 		case MENU_ABOUT:
