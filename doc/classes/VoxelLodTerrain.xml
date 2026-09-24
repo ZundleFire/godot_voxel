@@ -288,6 +288,10 @@
 		<member name="generate_collisions" type="bool" setter="set_generate_collisions" getter="get_generate_collisions" default="true">
 			If enabled, chunked colliders will be generated from meshes.
 		</member>
+		<member name="gpu_driven_material" type="ShaderMaterial" setter="set_gpu_driven_material" getter="get_gpu_driven_material">
+			Material used instead of [member material] when the render mode is GPU Driven. Leave empty to use [member material] there too.
+			The GPU-driven renderer compiles the material's spatial shader itself: [code]vertex()[/code] and [code]fragment()[/code] run with the same inputs as the traditional path (Transvoxel [code]CUSTOM0[/code], material indices and weights in [code]CUSTOM1[/code], surface data in [code]CUSTOM2[/code], [code]u_transition_mask[/code] per chunk), and the outputs are lit with the first directional light, the environment's ambient and sky reflections, and fog. [code]light()[/code] is ignored, there are no shadows, and shaders using screen, depth or normal-roughness textures, instance uniforms or global texture uniforms can't run there: the terrain then falls back to its built-in shading and shows a configuration warning. Use this slot to give that path a compatible variant.
+		</member>
 		<member name="lod_count" type="int" setter="set_lod_count" getter="get_lod_count" default="4">
 			How many LOD levels to use. This should be tuned alongside [member lod_distance]: if you want to see very far, you need more LOD levels. This allows blocks to become larger the further away they are, to keep their numbers to an acceptable amount. In contrast, too few LOD levels means regions far away will have to use too many small blocks, which can affect performance.
 		</member>

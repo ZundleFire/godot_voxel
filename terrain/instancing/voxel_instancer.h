@@ -411,6 +411,9 @@ private:
 		// Indices in the vector correspond to index of the instance in multimesh.
 		StdVector<VoxelInstancerRigidBody *> bodies;
 		StdVector<SceneInstance> scene_instances;
+		// CPU copy of the multimesh transforms, kept for items with distance colliders: reading them back from the
+		// MultiMesh stalls on the GPU for milliseconds. Cleared when instances get removed (then read back once).
+		StdVector<Transform3f> collider_transforms;
 	};
 
 	struct Layer {

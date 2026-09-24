@@ -9,6 +9,7 @@
 #include "edition/voxel_tool_lod_terrain.h"
 #include "edition/voxel_tool_terrain.h"
 #include "engine/voxel_engine_gd.h"
+#include "gpu_driven/voxel_gpu_driven_material.h"
 #include "generators/graph/node_type_db.h"
 #include "generators/graph/voxel_generator_graph.h"
 #include "generators/multipass/voxel_generator_multipass_cb.h"
@@ -604,6 +605,9 @@ void uninitialize_voxel_module(ModuleInitializationLevel p_level) {
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		VoxelMesherTransvoxel::free_static_resources();
 		VoxelMesherSurfaceNets::free_static_resources();
+#endif
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+		gpu_driven::free_material_compiler();
 #endif
 		VoxelStringNames::destroy_singleton();
 		pg::NodeTypeDB::destroy_singleton();

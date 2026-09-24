@@ -296,6 +296,7 @@ void VoxelLodTerrain::set_material(Ref<Material> p_material) {
 			});
 		}
 	}
+	update_configuration_warnings();
 }
 
 unsigned int VoxelLodTerrain::get_data_block_size() const {
@@ -1327,7 +1328,6 @@ Vector3 VoxelLodTerrain::get_local_viewer_pos() const {
 			}
 	);
 
-	const Transform3D world_to_local = get_global_transform().affine_inverse();
 #ifdef TOOLS_ENABLED
 	// The octree (and far field) follow a single position, the last viewer above. In the editor that was whichever
 	// scene VoxelViewer registered last, not the editor camera, so no detail (and no LOD0 instances such as grass)
@@ -1340,6 +1340,7 @@ Vector3 VoxelLodTerrain::get_local_viewer_pos() const {
 	}
 #endif
 
+	const Transform3D world_to_local = get_global_transform().affine_inverse();
 	pos = world_to_local.xform(pos);
 	return pos;
 }
@@ -1365,6 +1366,12 @@ void VoxelLodTerrain::process(float delta) {
 		Ref<World3D> world = get_world_3d();
 		if (world.is_valid()) {
 			_gpu_renderer->update(*world.ptr(), get_global_transform(), is_visible_in_tree(), get_gpu_driven_style());
+		}
+		_gpu_renderer->set_material(_gpu_driven_material.is_valid() ? _gpu_driven_material : Ref<ShaderMaterial>(_material));
+		const String error = _gpu_renderer->get_material_error();
+		if (error != _gpu_driven_material_error) {
+			_gpu_driven_material_error = error;
+			update_configuration_warnings();
 		}
 	}
 #endif
@@ -2192,13 +2199,6 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		block->set_collision_enabled(collision_active);
 	}
 
-#ifdef DEV_ENABLED
-	if (mesh.is_valid() && !ob.visual_was_required) {
-		ZN_PRINT_ERROR("Got a rendering mesh yet no visual was required?");
-	}
-#endif
-
-#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
 #if defined(VOXEL_ENABLE_INSTANCER) && defined(VOXEL_ENABLE_GPU_DRIVEN_RENDERING)
 	// Keep what the instance generator reads for get_mesh_block_surface(): there is no Mesh to read back in this mode.
 	// Refreshed on every remesh, only on LODs the instancer spawns on. The packed arrays are shared with the mesher
@@ -2218,6 +2218,13 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	}
 #endif
 
+#ifdef DEV_ENABLED
+	if (mesh.is_valid() && !ob.visual_was_required) {
+		ZN_PRINT_ERROR("Got a rendering mesh yet no visual was required?");
+	}
+#endif
+
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
 	if (visual_usable && visual_expected && gpu_mode) {
 		if (!block->has_mesh()) {
 			block->visual_active = visual_active;
@@ -2778,6 +2785,11 @@ Array VoxelLodTerrain::get_mesh_block_surface(
 		const VoxelMeshBlockVLT *block = mesh_map.get_block(block_pos);
 		if (block != nullptr) {
 			mesh = block->get_mesh();
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+			if (mesh.is_null()) {
+				return block->instancer_surface;
+			}
+#endif
 		}
 	}
 
@@ -2785,11 +2797,6 @@ Array VoxelLodTerrain::get_mesh_block_surface(
 		return mesh->surface_get_arrays(0);
 	}
 
-#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
-			if (mesh.is_null()) {
-				return block->instancer_surface;
-			}
-#endif
 	return Array();
 }
 
@@ -2982,7 +2989,7 @@ void VoxelLodTerrain::set_render_mode(RenderMode mode) {
 // both render paths tunable from the same inspector values. Missing parameters keep the shader defaults.
 VoxelGpuDrivenRenderer::Style VoxelLodTerrain::get_gpu_driven_style() const {
 	VoxelGpuDrivenRenderer::Style style;
-	Ref<ShaderMaterial> sm = _material;
+	Ref<ShaderMaterial> sm = _gpu_driven_material.is_valid() ? _gpu_driven_material : Ref<ShaderMaterial>(_material);
 	if (sm.is_null()) {
 		return style;
 	}
@@ -3039,6 +3046,15 @@ VoxelGpuDrivenRenderer::Style VoxelLodTerrain::get_gpu_driven_style() const {
 
 VoxelLodTerrain::RenderMode VoxelLodTerrain::get_render_mode() const {
 	return _render_mode;
+}
+
+void VoxelLodTerrain::set_gpu_driven_material(Ref<ShaderMaterial> material) {
+	// Picked up by the renderer on the next process
+	_gpu_driven_material = material;
+}
+
+Ref<ShaderMaterial> VoxelLodTerrain::get_gpu_driven_material() const {
+	return _gpu_driven_material;
 }
 
 Dictionary VoxelLodTerrain::get_gpu_driven_statistics() const {
@@ -3295,6 +3311,14 @@ void VoxelLodTerrain::get_configuration_warnings(PackedStringArray &warnings) co
 	Ref<ShaderMaterial> shader_material = _material;
 	if (shader_material.is_valid() && shader_material->get_shader().is_null()) {
 		warnings.append(ZN_TTR("The assigned {0} has no shader").format(varray(ShaderMaterial::get_class_static())));
+	}
+	// EDEN FORK: the GPU-driven renderer compiles the material's shader for itself; one it can't run falls back to the
+	// built-in shading, which would otherwise look like the shader silently having no effect.
+	if (_render_mode == RENDER_MODE_GPU_DRIVEN && !_gpu_driven_material_error.is_empty()) {
+		warnings.append(String("GPU Driven rendering can't use this terrain's shader and draws with its built-in shading "
+							   "instead: {0}. Assign a compatible `gpu_driven_material`, or switch render_mode to "
+							   "Traditional.")
+								.format(varray(_gpu_driven_material_error)));
 	}
 
 #ifdef VOXEL_ENABLE_GPU
@@ -4659,6 +4683,8 @@ void VoxelLodTerrain::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_render_mode", "mode"), &Self::set_render_mode);
 	ClassDB::bind_method(D_METHOD("get_render_mode"), &Self::get_render_mode);
+	ClassDB::bind_method(D_METHOD("set_gpu_driven_material", "material"), &Self::set_gpu_driven_material);
+	ClassDB::bind_method(D_METHOD("get_gpu_driven_material"), &Self::get_gpu_driven_material);
 	ClassDB::bind_method(D_METHOD("get_gpu_driven_statistics"), &Self::get_gpu_driven_statistics);
 
 	ClassDB::bind_method(D_METHOD("set_cache_generated_blocks", "enabled"), &Self::set_cache_generated_blocks);
@@ -4747,6 +4773,12 @@ void VoxelLodTerrain::_bind_methods() {
 			PropertyInfo(Variant::INT, "render_mode", PROPERTY_HINT_ENUM, "Traditional,GPU Driven"),
 			"set_render_mode",
 			"get_render_mode"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::OBJECT, "gpu_driven_material", PROPERTY_HINT_RESOURCE_TYPE,
+					ShaderMaterial::get_class_static()),
+			"set_gpu_driven_material",
+			"get_gpu_driven_material"
 	);
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING

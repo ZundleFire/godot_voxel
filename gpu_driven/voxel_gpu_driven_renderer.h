@@ -12,18 +12,28 @@
 #include "core/variant/dictionary.h"
 #include "core/variant/typed_array.h"
 #include "scene/resources/compositor.h"
+#include "scene/resources/shader.h"
+
+#include "core/object/worker_thread_pool.h"
 
 #include "core/gpu_range_allocator.h"
 #include "core/gpu_vertex_pack.h"
 
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 class RenderData;
+class ShaderMaterial;
 class World3D;
 
 namespace zylann::voxel {
+
+namespace gpu_driven {
+struct MaterialProgram;
+class MaterialUniforms;
+} // namespace gpu_driven
 
 // GPU-driven renderer used by VoxelLodTerrain's RENDER_MODE_GPU_DRIVEN.
 // Chunk geometry lives in RenderingDevice storage "mega-buffers". Every frame a compute shader frustum-culls chunks
@@ -34,10 +44,12 @@ namespace zylann::voxel {
 // Threading: public methods are main-thread only. They queue commands consumed on the render thread, which owns every
 // RenderingDevice resource.
 //
-// Shading is a built-in port of planet_v4.gdshader (parameters taken from the terrain material), lit like Godot's
-// scene shader: the render's first directional light, the environment's ambient (sky radiance included), sky
-// reflections and fog. Limitations vs the traditional path: no custom ShaderMaterial code, shadows, GI, volumetric
-// fog or fog aerial perspective, single view (no XR), Camera3D-level compositors override the scenario one.
+// Shading: the terrain's ShaderMaterial runs as is, compiled for this renderer (see voxel_gpu_driven_material.h).
+// Until it has compiled, or if it can't run here, a built-in port of planet_v4.gdshader is used instead (parameters
+// taken from the material). Both are lit like Godot's scene shader: the render's first directional light, the
+// environment's ambient (sky radiance included), sky reflections and fog. Limitations vs the traditional path: no
+// light() functions, shadows, GI, volumetric fog or fog aerial perspective, single view (no XR), Camera3D-level
+// compositors override the scenario one.
 class VoxelGpuDrivenRenderer : public Object {
 public:
 	static constexpr uint32_t INVALID_CHUNK = 0xffffffffu;
@@ -84,6 +96,11 @@ public:
 
 	// Call every frame. Keeps the effect registered in whichever compositor the scenario currently uses.
 	void update(World3D &world, const Transform3D &terrain_transform, bool visible, const Style &style);
+	// Call every frame, cheap when nothing changed. The shader compiles in the background; the built-in shading is
+	// used meanwhile, and when it is null or can't run here (see get_material_error).
+	void set_material(const Ref<ShaderMaterial> &material);
+	// Why the current material's shader isn't used, empty if it is (or has no shader)
+	String get_material_error() const;
 	// Unregisters the effect (e.g. terrain left the tree), and removes our fallback compositor from `world` if we
 	// installed it there. `update` re-registers it.
 	void detach(World3D *world);
@@ -151,6 +168,20 @@ private:
 	RID _get_render_pipeline(int64_t framebuffer_format, int samples);
 	RID _get_radiance_uniform_set(RID radiance);
 	void _on_visible_count_read(const Vector<uint8_t> &data);
+	// Render thread: brings the material shader, its uniform sets and parameters up to date. False to use the
+	// built-in shading this frame.
+	bool _update_material();
+	RID _get_material_pipeline(int64_t framebuffer_format, int samples);
+	void _free_material_resources();
+
+	struct MaterialCompileJob {
+		String code;
+		String path;
+		std::shared_ptr<gpu_driven::MaterialProgram> program;
+		String error;
+		WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
+	};
+	static void _compile_material_task(void *job);
 
 	// Main thread state
 	RID _effect;
@@ -161,6 +192,12 @@ private:
 	TypedArray<RID> _injected_user_effects;
 	std::vector<uint32_t> _free_ids;
 	uint32_t _next_id = 0;
+	// Material shader: source of the program in use or being compiled, and the compile in flight
+	Ref<Shader> _material_shader;
+	String _material_code;
+	std::unique_ptr<MaterialCompileJob> _material_job;
+	std::shared_ptr<gpu_driven::MaterialProgram> _material_program_main;
+	HashMap<StringName, Variant> _material_params_main;
 
 	// Shared, guarded by _mutex
 	mutable Mutex _mutex;
@@ -169,6 +206,13 @@ private:
 	bool _visible = true;
 	Style _style;
 	uint32_t _style_version = 1;
+	// Material shader handed to the render thread. Null: built-in shading.
+	std::shared_ptr<gpu_driven::MaterialProgram> _material_program;
+	uint32_t _material_program_version = 0;
+	HashMap<StringName, Variant> _material_params;
+	HashMap<StringName, HashMap<int, RID>> _material_default_textures;
+	uint32_t _material_params_version = 0;
+	String _material_error;
 
 	// Stats written on the render thread, read on the main thread (guarded by _mutex)
 	struct Stats {
@@ -226,6 +270,16 @@ private:
 	std::vector<ChunkGPU> _chunks_gpu;
 	uint32_t _dirty_min = 0xffffffffu;
 	uint32_t _dirty_max = 0;
+	// Material shader (render thread)
+	std::shared_ptr<gpu_driven::MaterialProgram> _active_material_program;
+	uint32_t _active_material_program_version = 0;
+	uint32_t _uploaded_material_params_version = 0;
+	HashMap<StringName, Variant> _active_material_params;
+	HashMap<StringName, HashMap<int, RID>> _active_material_default_textures;
+	RID _material_shader_rd;
+	HashMap<int64_t, RID> _material_pipelines;
+	RID _material_set0;
+	gpu_driven::MaterialUniforms *_material_uniforms = nullptr;
 };
 
 } // namespace zylann::voxel

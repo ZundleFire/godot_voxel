@@ -2,7 +2,12 @@
 
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
 
+#include "voxel_gpu_driven_material.h"
+
 #include "scene/resources/3d/world_3d.h"
+#include "scene/resources/material.h"
+#include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_scene_data_rd.h"
 #include "scene/resources/compositor.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
@@ -615,8 +620,24 @@ struct SceneUBO {
 	float ibl[4];
 	float radiance_params[4];
 	float camera_frac[4];
+	// Material shaders only (the built-in shaders declare the block without these)
+	float view_matrix[16];
+	float inv_view_matrix[16];
+	float projection_matrix[16];
+	float inv_projection_matrix[16];
+	float terrain_matrix[16];
+	float terrain_to_view[16];
+	float time_viewport[4];
 };
-static_assert(sizeof(SceneUBO) == 160, "Must match shader");
+static_assert(sizeof(SceneUBO) == 160 + 6 * 64 + 16, "Must match shaders");
+
+void store_matrix(const Projection &p, float out[16]) {
+	for (int c = 0; c < 4; ++c) {
+		for (int r = 0; r < 4; ++r) {
+			out[c * 4 + r] = p.columns[c][r];
+		}
+	}
+}
 
 struct CullPushConstant {
 	float planes[6][4];
@@ -780,6 +801,11 @@ VoxelGpuDrivenRenderer::VoxelGpuDrivenRenderer() {
 VoxelGpuDrivenRenderer::~VoxelGpuDrivenRenderer() {}
 
 void VoxelGpuDrivenRenderer::destroy() {
+	if (_material_job != nullptr) {
+		// The job writes into itself only, but it must not outlive the object that owns it
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(_material_job->task);
+		_material_job.reset();
+	}
 	detach(nullptr);
 	_own_compositor.unref();
 	RenderingServer &rs = *RenderingServer::get_singleton();
@@ -792,6 +818,7 @@ void VoxelGpuDrivenRenderer::destroy() {
 void VoxelGpuDrivenRenderer::_render_thread_free() {
 	RenderingDevice *rd = RenderingServer::get_singleton()->get_rendering_device();
 	if (rd != nullptr) {
+		_free_material_resources();
 		for (KeyValue<int64_t, RID> &kv : _render_pipelines) {
 			free_rid_if_valid(*rd, kv.value);
 		}
@@ -886,6 +913,98 @@ void VoxelGpuDrivenRenderer::detach(World3D *world) {
 	}
 }
 
+void VoxelGpuDrivenRenderer::_compile_material_task(void *p_job) {
+	MaterialCompileJob &job = *static_cast<MaterialCompileJob *>(p_job);
+	job.program = gpu_driven::compile_material_program(job.code, job.path, job.error);
+}
+
+namespace {
+
+bool same_parameters(const HashMap<StringName, Variant> &a, const HashMap<StringName, Variant> &b) {
+	if (a.size() != b.size()) {
+		return false;
+	}
+	for (const KeyValue<StringName, Variant> &kv : a) {
+		const Variant *other = b.getptr(kv.key);
+		if (other == nullptr || *other != kv.value) {
+			return false;
+		}
+	}
+	return true;
+}
+
+} // namespace
+
+void VoxelGpuDrivenRenderer::set_material(const Ref<ShaderMaterial> &material) {
+	const Ref<Shader> shader = material.is_valid() ? material->get_shader() : Ref<Shader>();
+	// ponytail: compares the source, so edits to an #included file only apply once the shader itself changes or the
+	// scene reloads. Hook Shader's `changed` signal if that bites.
+	const String code = shader.is_valid() ? shader->get_code() : String();
+
+	// Collect a finished compile, unless the shader changed while it ran (a new one starts below)
+	if (_material_job != nullptr && WorkerThreadPool::get_singleton()->is_task_completed(_material_job->task)) {
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(_material_job->task);
+		if (_material_job->code == code && shader == _material_shader) {
+			_material_program_main = _material_job->program;
+			_material_params_main.clear();
+			if (_material_program_main == nullptr) {
+				ERR_PRINT(String("GPU-driven terrain can't use {0}, falling back to the built-in shading: {1}")
+								  .format(varray(shader->get_path(), _material_job->error)));
+			}
+			{
+				MutexLock lock(_mutex);
+				_material_program = _material_program_main;
+				++_material_program_version;
+				_material_error = _material_job->error;
+			}
+			// Same reason as in update(): nothing went through the RenderingServer, request a redraw
+			RenderingServer::get_singleton()->compositor_effect_set_enabled(_effect, true);
+		}
+		_material_job.reset();
+	}
+
+	if (_material_job == nullptr && (shader != _material_shader || code != _material_code)) {
+		_material_shader = shader;
+		_material_code = code;
+		_material_program_main.reset();
+		{
+			// Built-in shading until the new shader has compiled
+			MutexLock lock(_mutex);
+			_material_program.reset();
+			++_material_program_version;
+			_material_error = String();
+		}
+		if (!code.is_empty()) {
+			_material_job = std::make_unique<MaterialCompileJob>();
+			_material_job->code = code;
+			_material_job->path = shader->get_path();
+			_material_job->task = WorkerThreadPool::get_singleton()->add_native_task(
+					_compile_material_task, _material_job.get(), true, "VoxelGpuDrivenRenderer material");
+		}
+	}
+
+	if (_material_program_main != nullptr && material.is_valid()) {
+		HashMap<StringName, Variant> params;
+		HashMap<StringName, HashMap<int, RID>> default_textures;
+		gpu_driven::get_material_parameters(**material, *_material_program_main, params, default_textures);
+		if (!same_parameters(params, _material_params_main) || _material_params_version == 0) {
+			_material_params_main = params;
+			{
+				MutexLock lock(_mutex);
+				_material_params = std::move(params);
+				_material_default_textures = std::move(default_textures);
+				++_material_params_version;
+			}
+			RenderingServer::get_singleton()->compositor_effect_set_enabled(_effect, true);
+		}
+	}
+}
+
+String VoxelGpuDrivenRenderer::get_material_error() const {
+	MutexLock lock(_mutex);
+	return _material_error;
+}
+
 uint32_t VoxelGpuDrivenRenderer::create_chunk() {
 	if (!_free_ids.empty()) {
 		const uint32_t id = _free_ids.back();
@@ -965,6 +1084,9 @@ Dictionary VoxelGpuDrivenRenderer::get_stats() const {
 	d["uploaded_bytes_total"] = _stats.uploaded_bytes_total;
 	d["indirect_draws_total"] = _stats.indirect_draws_total;
 	d["pending_ops"] = static_cast<int64_t>(_pending_ops.size());
+	// Whether the terrain's own shader is drawing (see set_material)
+	d["material_shader"] = _material_program != nullptr;
+	d["material_error"] = _material_error;
 	return d;
 }
 
@@ -1334,6 +1456,124 @@ RID VoxelGpuDrivenRenderer::_get_radiance_uniform_set(RID radiance) {
 	return _radiance_uniform_set;
 }
 
+void VoxelGpuDrivenRenderer::_free_material_resources() {
+	RenderingDevice &rd = *RenderingServer::get_singleton()->get_rendering_device();
+	if (_material_uniforms != nullptr) {
+		// Frees its uniform set and buffers
+		memdelete(_material_uniforms);
+		_material_uniforms = nullptr;
+	}
+	for (KeyValue<int64_t, RID> &kv : _material_pipelines) {
+		free_rid_if_valid(rd, kv.value);
+	}
+	_material_pipelines.clear();
+	if (_material_set0.is_valid() && rd.uniform_set_is_valid(_material_set0)) {
+		rd.free_rid(_material_set0);
+	}
+	_material_set0 = RID();
+	free_rid_if_valid(rd, _material_shader_rd);
+}
+
+bool VoxelGpuDrivenRenderer::_update_material() {
+	RenderingDevice &rd = *RenderingServer::get_singleton()->get_rendering_device();
+
+	std::shared_ptr<gpu_driven::MaterialProgram> program;
+	bool program_changed = false;
+	bool params_changed = false;
+	{
+		MutexLock lock(_mutex);
+		if (_material_program_version != _active_material_program_version) {
+			program = _material_program;
+			_active_material_program_version = _material_program_version;
+			program_changed = true;
+		}
+		if (_material_params_version != _uploaded_material_params_version || program_changed) {
+			_active_material_params = _material_params;
+			_active_material_default_textures = _material_default_textures;
+			_uploaded_material_params_version = _material_params_version;
+			params_changed = true;
+		}
+	}
+
+	if (program_changed) {
+		_free_material_resources();
+		_active_material_program = program;
+		if (program != nullptr) {
+			_material_shader_rd = create_shader_from_spirv(rd,
+					{ RenderingDevice::SHADER_STAGE_VERTEX, RenderingDevice::SHADER_STAGE_FRAGMENT },
+					{ program->vertex_spirv, program->fragment_spirv }, "VoxelGpuDrivenMaterial");
+			if (_material_shader_rd.is_null()) {
+				_active_material_program.reset();
+			} else {
+				_material_uniforms = memnew(gpu_driven::MaterialUniforms);
+			}
+		}
+	}
+	if (_active_material_program == nullptr) {
+		return false;
+	}
+	const gpu_driven::MaterialProgram &p = *_active_material_program;
+
+	if (_material_set0.is_null() || !rd.uniform_set_is_valid(_material_set0)) {
+		Vector<RenderingDevice::Uniform> uniforms;
+		uniforms.push_back(make_storage_uniform(0, _vertex_buffer));
+		uniforms.push_back(make_storage_uniform(2, _chunk_buffer));
+		RenderingDevice::Uniform scene_uniform;
+		scene_uniform.uniform_type = RenderingDevice::UNIFORM_TYPE_UNIFORM_BUFFER;
+		scene_uniform.binding = 4;
+		scene_uniform.append_id(_scene_buffer);
+		uniforms.push_back(scene_uniform);
+		RendererRD::MaterialStorage &ms = *RendererRD::MaterialStorage::get_singleton();
+		ms.samplers_rd_get_default().append_uniforms(uniforms, gpu_driven::SAMPLERS_BINDING_FIRST_INDEX);
+		uniforms.push_back(
+				make_storage_uniform(gpu_driven::GLOBAL_UNIFORMS_BINDING, ms.global_shader_uniforms_get_storage_buffer())
+		);
+		// Bindings the shader doesn't use are ignored
+		_material_set0 = rd.uniform_set_create(uniforms, _material_shader_rd, 0);
+		if (_material_set0.is_null()) {
+			return false;
+		}
+	}
+
+	const bool needs_material_set = p.ubo_size > 0 || !p.texture_uniforms.is_empty();
+	if (needs_material_set) {
+		// A freed texture invalidates the set: rebuild it, and re-resolve textures while at it
+		const bool set_lost =
+				_material_uniforms->uniform_set.is_null() || !rd.uniform_set_is_valid(_material_uniforms->uniform_set);
+		if (params_changed || set_lost) {
+			_material_uniforms->update_parameters_uniform_set(_active_material_params, params_changed, true, p.uniforms,
+					p.uniform_offsets.ptr(), p.texture_uniforms, _active_material_default_textures, p.ubo_size,
+					_material_uniforms->uniform_set, _material_shader_rd, gpu_driven::MATERIAL_UNIFORM_SET, true, true);
+		}
+		if (_material_uniforms->uniform_set.is_null()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+RID VoxelGpuDrivenRenderer::_get_material_pipeline(int64_t framebuffer_format, int samples) {
+	if (RID *existing = _material_pipelines.getptr(framebuffer_format)) {
+		return *existing;
+	}
+	RenderingDevice &rd = *RenderingServer::get_singleton()->get_rendering_device();
+
+	RenderingDevice::PipelineRasterizationState raster;
+	raster.cull_mode = static_cast<RenderingDevice::PolygonCullMode>(_active_material_program->cull_mode);
+	RenderingDevice::PipelineMultisampleState multisample;
+	multisample.sample_count = static_cast<RenderingDevice::TextureSamples>(samples);
+	RenderingDevice::PipelineDepthStencilState depth;
+	depth.enable_depth_test = true;
+	depth.enable_depth_write = true;
+	depth.depth_compare_operator = RenderingDevice::COMPARE_OP_GREATER_OR_EQUAL;
+
+	const RID pipeline = rd.render_pipeline_create(_material_shader_rd, framebuffer_format, RenderingDevice::INVALID_ID,
+			RenderingDevice::RENDER_PRIMITIVE_TRIANGLES, raster, multisample, depth,
+			RenderingDevice::PipelineColorBlendState::create_disabled(1));
+	_material_pipelines.insert(framebuffer_format, pipeline);
+	return pipeline;
+}
+
 namespace {
 
 struct SceneLighting {
@@ -1607,7 +1847,10 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 		return;
 	}
 	const RID framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(1, color, depth_tex);
-	const RID pipeline = _get_render_pipeline(rd.framebuffer_get_format(framebuffer), rb->get_texture_samples());
+	const bool use_material = _update_material();
+	const RID pipeline = use_material
+			? _get_material_pipeline(rd.framebuffer_get_format(framebuffer), rb->get_texture_samples())
+			: _get_render_pipeline(rd.framebuffer_get_format(framebuffer), rb->get_texture_samples());
 	if (pipeline.is_null()) {
 		return;
 	}
@@ -1653,7 +1896,7 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 		const Transform3D &t = terrain_transform;
 		// Terrain-local directions to sky space: to world with the terrain basis, then into the sky's orientation
 		const Basis rx = lighting.sky_orientation.inverse() * t.basis;
-		const SceneUBO scene = {
+		SceneUBO scene = {
 			{ lighting.fog_color.r, lighting.fog_color.g, lighting.fog_color.b, lighting.fog_density },
 			{ lighting.fog ? 1.f : 0.f, lighting.fog_depth_mode ? 1.f : 0.f, lighting.fog_sun_scatter,
 					lighting.fog_height_density },
@@ -1668,6 +1911,20 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 			{ lighting.radiance_border, 0.f, 0.f, 0.f },
 			{ float(camera_frac.x), float(camera_frac.y), float(camera_frac.z), 0.f },
 		};
+		// What material shaders see as VIEW_MATRIX, MODEL_MATRIX (times the chunk origin), TIME...
+		const Projection projection = scene_data->get_cam_projection();
+		store_matrix(Projection(view), scene.view_matrix);
+		store_matrix(Projection(scene_data->get_cam_transform()), scene.inv_view_matrix);
+		store_matrix(projection, scene.projection_matrix);
+		store_matrix(projection.inverse(), scene.inv_projection_matrix);
+		store_matrix(Projection(t), scene.terrain_matrix);
+		store_matrix(Projection(Transform3D(view.basis * t.basis, Vector3())), scene.terrain_to_view);
+		const RenderSceneDataRD *scene_data_rd = Object::cast_to<RenderSceneDataRD>(scene_data);
+		const Size2i internal_size = rb->get_internal_size();
+		scene.time_viewport[0] = scene_data_rd != nullptr ? scene_data_rd->time : 0.f;
+		scene.time_viewport[1] = internal_size.x;
+		scene.time_viewport[2] = internal_size.y;
+		scene.time_viewport[3] = 0.f;
 		rd.buffer_update(_scene_buffer, 0, sizeof(scene), &scene);
 	}
 
@@ -1678,8 +1935,12 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 
 	RenderingDevice::DrawListID dl = rd.draw_list_begin(framebuffer);
 	rd.draw_list_bind_render_pipeline(dl, pipeline);
-	rd.draw_list_bind_uniform_set(dl, _render_uniform_set, 0);
+	rd.draw_list_bind_uniform_set(dl, use_material ? _material_set0 : _render_uniform_set, 0);
+	// Same layout in both shaders
 	rd.draw_list_bind_uniform_set(dl, radiance_set, 1);
+	if (use_material && _material_uniforms->uniform_set.is_valid()) {
+		rd.draw_list_bind_uniform_set(dl, _material_uniforms->uniform_set, gpu_driven::MATERIAL_UNIFORM_SET);
+	}
 	rd.draw_list_set_push_constant(dl, &pc, sizeof(pc));
 	rd.draw_list_bind_index_array(dl, _index_array);
 	rd.draw_list_draw_indirect(dl, true, _indirect_buffer, 0, _draw_count, INDIRECT_COMMAND_SIZE);

@@ -230,6 +230,11 @@ public:
 	void set_render_mode(RenderMode mode);
 	RenderMode get_render_mode() const;
 
+	// Material the GPU-driven render mode draws with instead of `material`, when set. For shaders that need a
+	// variant for that path (see VoxelGpuDrivenRenderer's limitations).
+	void set_gpu_driven_material(Ref<ShaderMaterial> material);
+	Ref<ShaderMaterial> get_gpu_driven_material() const;
+
 	// Memory and upload counters of the GPU-driven path. Empty in traditional mode.
 	Dictionary get_gpu_driven_statistics() const;
 
@@ -469,6 +474,9 @@ private:
 	FixedArray<VoxelMeshMap<VoxelMeshBlockVLT>, constants::MAX_LOD> _mesh_maps_per_lod;
 
 	RenderMode _render_mode = RENDER_MODE_TRADITIONAL;
+	Ref<ShaderMaterial> _gpu_driven_material;
+	// Last GPU-driven material error shown in the configuration warnings
+	String _gpu_driven_material_error;
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
 	// Only exists in RENDER_MODE_GPU_DRIVEN. Mesh blocks hold raw pointers to it, so they must release their chunks
 	// (drop_visuals or destruction) before it is destroyed.

@@ -495,9 +495,15 @@ void VoxelInstancer::update_mesh_from_mesh_lod(
 	} else {
 		Ref<MultiMesh> multimesh = block.multimesh_instance.get_multimesh();
 		if (multimesh.is_valid()) {
-			block.multimesh_instance.set_visible(instancer_is_visible);
-			ZN_PROFILE_SCOPE();
-			multimesh->set_mesh(settings.mesh_lods[block.current_mesh_lod]);
+			const Ref<Mesh> &mesh = settings.mesh_lods[block.current_mesh_lod];
+			// A mesh LOD without surfaces means "nothing at this distance" (e.g. rings of far-only items): hide the
+			// block. Swapping a big MultiMesh's mesh costs milliseconds, so only do it when it actually differs.
+			const bool empty = mesh.is_null() || mesh->get_surface_count() == 0;
+			block.multimesh_instance.set_visible(instancer_is_visible && !empty);
+			if (!empty && multimesh->get_mesh() != mesh) {
+				ZN_PROFILE_SCOPE();
+				multimesh->set_mesh(mesh);
+			}
 		}
 	}
 }
@@ -828,6 +834,11 @@ void VoxelInstancer::update_visibility() {
 					const bool hide_beyond_max_lod = item->get_hide_beyond_max_lod();
 					if (hide_beyond_max_lod) {
 						visible_with_lod = block.current_mesh_lod < settings.mesh_lod_count;
+					}
+					if (visible_with_lod && block.current_mesh_lod < settings.mesh_lod_count) {
+						// Empty mesh LODs hide the block (see update_mesh_from_mesh_lod)
+						const Ref<Mesh> &mesh = settings.mesh_lods[block.current_mesh_lod];
+						visible_with_lod = mesh.is_valid() && mesh->get_surface_count() > 0;
 					}
 				}
 			}
@@ -1668,13 +1679,29 @@ void VoxelInstancer::update_multimesh_block_from_transforms(
 		// TODO If we could use custom AABBs, we would not need this reordering
 		if (settings.mesh_lod_count > 0) {
 			if (block.current_mesh_lod < settings.mesh_lod_count) {
-				multimesh->set_mesh(settings.mesh_lods[block.current_mesh_lod]);
+				// Skip empty mesh LODs (they only hide the block, see update_mesh_from_mesh_lod): setting the real mesh
+				// later would trigger that readback
+				unsigned int mesh_lod = block.current_mesh_lod;
+				while (mesh_lod + 1 < settings.mesh_lod_count &&
+					   (settings.mesh_lods[mesh_lod].is_null() || settings.mesh_lods[mesh_lod]->get_surface_count() == 0)) {
+					++mesh_lod;
+				}
+				multimesh->set_mesh(settings.mesh_lods[mesh_lod]);
 			}
 		}
 
 		// TODO Waiting for Godot to expose the method on the resource object
 		// multimesh->set_as_bulk_array(bulk_array);
 		RenderingServer::get_singleton()->multimesh_set_buffer(multimesh->get_rid(), bulk_array);
+
+		if (item.get_collision_distance() > 0.f && settings.collision_shapes.size() > 0) {
+			block.collider_transforms.resize(transforms.size());
+			for (unsigned int i = 0; i < transforms.size(); ++i) {
+				block.collider_transforms[i] = transforms[i];
+			}
+		} else {
+			block.collider_transforms.clear();
+		}
 
 		if (!block.multimesh_instance.is_valid()) {
 			block.multimesh_instance.create();
@@ -2253,6 +2280,10 @@ void VoxelInstancer::get_instance_positions_local(
 void VoxelInstancer::get_instance_transforms_local(const Block &block, StdVector<Transform3f> &dst) {
 	ZN_PROFILE_SCOPE();
 
+	if (!block.collider_transforms.empty()) {
+		dst = block.collider_transforms;
+		return;
+	}
 	Ref<MultiMesh> multimesh = block.multimesh_instance.get_multimesh();
 	ZN_ASSERT_RETURN(multimesh.is_valid());
 	const unsigned int instance_count = zylann::godot::get_visible_instance_count(**multimesh);
@@ -2394,6 +2425,7 @@ void VoxelInstancer::remove_multimesh_instances_by_index(
 	if (instance_count < initial_instance_count) {
 		// According to the docs, set_instance_count() resets the array so we only hide them instead
 		multimesh->set_visible_instance_count(instance_count);
+		block.collider_transforms.clear(); // instances were removed
 
 		if (block.bodies.size() > 0) {
 			block.bodies.resize(instance_count);
@@ -2678,6 +2710,7 @@ void VoxelInstancer::remove_floating_multimesh_instances(
 	if (instance_count < initial_instance_count) {
 		// According to the docs, set_instance_count() resets the array so we only hide them instead
 		multimesh->set_visible_instance_count(instance_count);
+		block.collider_transforms.clear(); // instances were removed
 
 		if (block.bodies.size() > 0) {
 			block.bodies.resize(instance_count);
@@ -2947,6 +2980,7 @@ void VoxelInstancer::on_body_removed(
 		const Transform3D last_trans = multimesh->get_instance_transform(visible_count);
 		multimesh->set_instance_transform(instance_index, last_trans);
 		multimesh->set_visible_instance_count(visible_count);
+		block.collider_transforms.clear(); // instances were removed
 	}
 
 	// Unregister the body
