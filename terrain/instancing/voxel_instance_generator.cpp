@@ -786,8 +786,9 @@ MeshData parse_arrays(
 		return {};
 	}
 
-	if (surface_arrays.size() < ArrayMesh::ARRAY_VERTEX && surface_arrays.size() < ArrayMesh::ARRAY_NORMAL &&
-		surface_arrays.size() < ArrayMesh::ARRAY_INDEX) {
+	// Must hold every array read below. This used `<` joined by `&&`, and `size() < ARRAY_VERTEX` (0) is never true,
+	// so an empty Array (a GPU-driven block has no Mesh to read back) got indexed: FATAL out of bounds.
+	if (surface_arrays.size() <= ArrayMesh::ARRAY_INDEX) {
 		return {};
 	}
 

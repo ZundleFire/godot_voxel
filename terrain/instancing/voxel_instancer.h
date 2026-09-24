@@ -61,6 +61,8 @@ class VoxelInstancer : public Node3D, public IInstanceLibraryItemListener {
 	GDCLASS(VoxelInstancer, Node3D)
 public:
 	static const int MAX_LOD = 8;
+	// Main-thread time per frame for applying finished instance generation (at least one block always goes through)
+	static const uint64_t TASK_RESULTS_BUDGET_MICROSECONDS = 2000;
 
 	// I didn't want this enum to be here on the C++ side, because it prevents forward-declaring the class it is in.
 	// However Godot is forcing me to.
@@ -121,6 +123,11 @@ public:
 			const int32_t index_range_end
 	);
 	void on_mesh_block_exit(const Vector3i render_grid_position, const unsigned int lod_index);
+
+	// Whether any library item spawns on this LOD. Lets GPU-driven terrains keep surfaces only where needed.
+	inline bool has_layers_at_lod(const unsigned int lod_index) const {
+		return lod_index < _lods.size() && !_lods[lod_index].layers.empty();
+	}
 	void on_area_edited(Box3i p_voxel_box);
 	void on_body_removed(Vector3i data_block_position, unsigned int render_block_index, unsigned int instance_index);
 	void on_scene_instance_removed(

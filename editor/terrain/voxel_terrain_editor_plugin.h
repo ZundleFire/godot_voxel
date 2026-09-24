@@ -36,6 +36,7 @@ protected:
 
 private:
 	void init();
+	void update_editor_camera(Camera3D *p_camera);
 	void set_voxel_node(VoxelNode *node);
 	void generate_menu_items(MenuButton *menu_button, bool is_lod_terrain);
 
@@ -62,7 +63,9 @@ private:
 	ViewerID _editor_viewer_id;
 	bool _editor_viewer_enabled = true;
 	Vector3 _editor_camera_last_position;
-	bool _editor_viewer_follows_camera = false;
+	// On by default: a still viewer sits at the origin, which on a planet is the core, so no surface detail (nor
+	// LOD0 instances like grass) ever streamed near the editor camera. Still toggleable from the terrain menu.
+	bool _editor_viewer_follows_camera = true;
 
 	MenuButton *_menu_button = nullptr;
 	VoxelAboutWindow *_about_window = nullptr;

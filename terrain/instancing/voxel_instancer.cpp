@@ -268,7 +268,15 @@ void VoxelInstancer::process_task_results() {
 	const int mesh_block_size_base = (1 << _parent_mesh_block_size_po2);
 	const int render_to_data_factor = mesh_block_size_base / data_block_size_base;
 
-	for (InstanceLoadingTaskOutput &output : results) {
+	// Applying a result builds and uploads that block's MultiMesh on the main thread. Dense layers (grass) finish many
+	// blocks at once while the camera moves, and applying them all in one frame hitched; spread them over frames.
+	const uint64_t time_up_time = Time::get_singleton()->get_ticks_usec() + TASK_RESULTS_BUDGET_MICROSECONDS;
+	unsigned int result_index = 0;
+	for (; result_index < results.size(); ++result_index) {
+		if (result_index > 0 && Time::get_singleton()->get_ticks_usec() > time_up_time) {
+			break;
+		}
+		InstanceLoadingTaskOutput &output = results[result_index];
 		auto layer_it = _layers.find(output.layer_id);
 		if (layer_it == _layers.end()) {
 			// Layer was removed since?
@@ -334,6 +342,21 @@ void VoxelInstancer::process_task_results() {
 				fb.layer_id = output.layer_id;
 				_fading_in_blocks.push_back(fb);
 			}
+		}
+	}
+
+	if (result_index < results.size()) {
+		// Out of budget: requeue the rest ahead of newer results
+		MutexLock mlock(_loading_results->mutex);
+		StdVector<InstanceLoadingTaskOutput> &src = _loading_results->results;
+		const size_t remaining = results.size() - result_index;
+		const size_t newer = src.size();
+		src.resize(newer + remaining);
+		for (size_t i = newer; i > 0; --i) {
+			src[i - 1 + remaining] = std::move(src[i - 1]);
+		}
+		for (size_t i = 0; i < remaining; ++i) {
+			src[i] = std::move(results[result_index + i]);
 		}
 	}
 
@@ -1831,6 +1854,10 @@ void VoxelInstancer::create_render_blocks(
 	const unsigned int data_block_size = 1 << _parent_data_block_size_po2;
 
 	Lod &lod = _lods[lod_index];
+	if (lod.layers.empty()) {
+		// Nothing spawns on this LOD: don't queue a task (it also kept this block's surface arrays alive until it ran)
+		return;
+	}
 
 	// Create empty blocks in pending state
 	for (auto layer_it = lod.layers.begin(); layer_it != lod.layers.end(); ++layer_it) {

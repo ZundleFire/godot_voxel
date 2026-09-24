@@ -1328,6 +1328,18 @@ Vector3 VoxelLodTerrain::get_local_viewer_pos() const {
 	);
 
 	const Transform3D world_to_local = get_global_transform().affine_inverse();
+#ifdef TOOLS_ENABLED
+	// The octree (and far field) follow a single position, the last viewer above. In the editor that was whichever
+	// scene VoxelViewer registered last, not the editor camera, so no detail (and no LOD0 instances such as grass)
+	// streamed where you look. The editor camera info is kept current by VoxelTerrainEditorPlugin every frame.
+	if (Engine::get_singleton()->is_editor_hint()) {
+		const Vector3 editor_camera = godot::VoxelEngine::get_singleton()->get_editor_camera_position();
+		if (editor_camera != Vector3()) {
+			pos = editor_camera;
+		}
+	}
+#endif
+
 	pos = world_to_local.xform(pos);
 	return pos;
 }
@@ -2187,6 +2199,24 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 #endif
 
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+#if defined(VOXEL_ENABLE_INSTANCER) && defined(VOXEL_ENABLE_GPU_DRIVEN_RENDERING)
+	// Keep what the instance generator reads for get_mesh_block_surface(): there is no Mesh to read back in this mode.
+	// Refreshed on every remesh, only on LODs the instancer spawns on. The packed arrays are shared with the mesher
+	// output, not copied.
+	if (gpu_mode && _instancer != nullptr && _instancer->has_layers_at_lod(ob.lod) && ob.surfaces.surfaces.size() > 0) {
+		const Array &src = ob.surfaces.surfaces[0].arrays;
+		if (src.size() == Mesh::ARRAY_MAX) {
+			Array kept;
+			kept.resize(Mesh::ARRAY_MAX);
+			kept[Mesh::ARRAY_VERTEX] = src[Mesh::ARRAY_VERTEX];
+			kept[Mesh::ARRAY_NORMAL] = src[Mesh::ARRAY_NORMAL];
+			kept[Mesh::ARRAY_INDEX] = src[Mesh::ARRAY_INDEX];
+			kept[Mesh::ARRAY_CUSTOM1] = src[Mesh::ARRAY_CUSTOM1];
+			block->instancer_surface = kept;
+		}
+	}
+#endif
+
 	if (visual_usable && visual_expected && gpu_mode) {
 		if (!block->has_mesh()) {
 			block->visual_active = visual_active;
@@ -2754,6 +2784,11 @@ Array VoxelLodTerrain::get_mesh_block_surface(
 		return mesh->surface_get_arrays(0);
 	}
 
+#ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+			if (mesh.is_null()) {
+				return block->instancer_surface;
+			}
+#endif
 	return Array();
 }
 

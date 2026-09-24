@@ -77,6 +77,10 @@ public:
 	bool has_mesh() const;
 
 #ifdef VOXEL_ENABLE_GPU_DRIVEN_RENDERING
+	// GPU-driven blocks have no Mesh to read back, so the instancer's copy of the surface (vertex, normal, index,
+	// custom1 only) lives here. Without it, reassigning the instancer library found nothing to spawn on.
+	Array instancer_surface;
+
 	// Replaces the mesh instance path when the terrain renders with VoxelGpuDrivenRenderer.
 	void set_gpu_mesh(VoxelGpuDrivenRenderer &renderer, gpu_driven::PackedMesh &&mesh);
 	inline bool has_gpu_mesh() const {

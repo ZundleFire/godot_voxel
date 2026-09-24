@@ -11,6 +11,7 @@
 #include "../../util/godot/classes/menu_button.h"
 #include "../../util/godot/classes/node.h"
 #include "../../util/godot/classes/popup_menu.h"
+#include "../../util/godot/classes/sub_viewport.h"
 #include "../../util/godot/core/keyboard.h"
 #include "../../util/godot/core/string.h"
 #include "../about_window.h"
@@ -117,6 +118,8 @@ void VoxelTerrainEditorPlugin::_notification(int p_what) {
 			}
 			_inspector_plugin.instantiate();
 			add_inspector_plugin(_inspector_plugin);
+			// Always process: the editor camera must be tracked whatever node is selected (see PROCESS)
+			set_process(true);
 			break;
 
 		case NOTIFICATION_EXIT_TREE:
@@ -129,9 +132,22 @@ void VoxelTerrainEditorPlugin::_notification(int p_what) {
 			VoxelAboutWindow::destroy_singleton();
 			break;
 
-		case NOTIFICATION_PROCESS:
-			_task_indicator->update_stats();
-			break;
+		case NOTIFICATION_PROCESS: {
+			if (_task_indicator->is_visible()) {
+				_task_indicator->update_stats();
+			}
+			// _zn_forward_3d_gui_input only runs while a voxel node is selected and the mouse is over the viewport.
+			// Relying on it alone left the editor viewer (LOD0 streaming) and the camera cache (VoxelInstancer mesh
+			// LOD distances) stuck wherever they last were -- initially the origin -- so selecting any other node,
+			// e.g. a VoxelInstancer to tweak it, stopped terrain detail and instances from following the camera.
+			SubViewport *viewport = EditorInterface::get_singleton()->get_editor_viewport_3d(0);
+			if (viewport != nullptr) {
+				Camera3D *camera = viewport->get_camera_3d();
+				if (camera != nullptr) {
+					update_editor_camera(camera);
+				}
+			}
+		} break;
 	}
 }
 
@@ -156,7 +172,7 @@ void VoxelTerrainEditorPlugin::set_voxel_node(VoxelNode *node) {
 void VoxelTerrainEditorPlugin::_zn_make_visible(bool visible) {
 	_menu_button->set_visible(visible);
 	_task_indicator->set_visible(visible);
-	set_process(visible);
+	// Processing stays on regardless (camera tracking, see NOTIFICATION_PROCESS)
 
 	// TODO There are deselection problems I cannot fix cleanly!
 
@@ -169,6 +185,11 @@ EditorPlugin::AfterGUIInput VoxelTerrainEditorPlugin::_zn_forward_3d_gui_input(
 		Camera3D *p_camera,
 		const Ref<InputEvent> &p_event
 ) {
+	update_editor_camera(p_camera);
+	return EditorPlugin::AFTER_GUI_INPUT_PASS;
+}
+
+void VoxelTerrainEditorPlugin::update_editor_camera(Camera3D *p_camera) {
 	if (_editor_viewer_enabled) {
 		// Will be clamped by terrain max view distance
 		VoxelEngine::Viewer::Distances vd;
@@ -188,8 +209,6 @@ EditorPlugin::AfterGUIInput VoxelTerrainEditorPlugin::_zn_forward_3d_gui_input(
 				_editor_camera_last_position, get_forward(p_camera->get_global_transform())
 		);
 	}
-
-	return EditorPlugin::AFTER_GUI_INPUT_PASS;
 }
 
 void VoxelTerrainEditorPlugin::_on_menu_item_selected(int id) {
