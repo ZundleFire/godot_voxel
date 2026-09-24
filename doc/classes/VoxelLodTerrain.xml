@@ -339,7 +339,7 @@
 		<member name="streaming_system" type="int" setter="set_streaming_system" getter="get_streaming_system" enum="VoxelLodTerrain.StreamingSystem" default="0">
 			Selects the underlying algorithm used to determine when to load and unload chunks around viewers as they move around.
 		</member>
-		<member name="threaded_update_enabled" type="bool" setter="set_threaded_update_enabled" getter="is_threaded_update_enabled" default="false">
+		<member name="threaded_update_enabled" type="bool" setter="set_threaded_update_enabled" getter="is_threaded_update_enabled" default="true">
 			When enabled, this node will run a large part of its update cycle in a separate thread. Otherwise, it will run on the main thread.
 		</member>
 		<member name="use_gpu_generation" type="bool" setter="set_generator_use_gpu" getter="get_generator_use_gpu" default="false">

@@ -144,6 +144,7 @@ private:
 	void _free_chunk_geometry(uint32_t id);
 	void _ensure_chunk_capacity(uint32_t id);
 	bool _grow_buffer(RID &buffer, uint32_t old_size, uint32_t new_size, bool indirect);
+	bool _grow_index_buffer(uint32_t old_count, uint32_t new_count);
 	void _mark_chunk_dirty(uint32_t id);
 	void _upload_dirty_chunks();
 	bool _ensure_uniform_sets();
@@ -196,8 +197,15 @@ private:
 	HashMap<int64_t, RID> _render_pipelines;
 	RID _vertex_buffer;
 	RID _index_buffer;
+	RID _index_array;
 	RID _chunk_buffer;
 	RID _indirect_buffer;
+	// Chunk slots near to far, see the cull shader
+	RID _order_buffer;
+	std::vector<std::pair<float, uint32_t>> _order_keys;
+	std::vector<uint32_t> _order;
+	// Chunks listed in _order this frame: the cull dispatch and the indirect draw cover only these
+	uint32_t _draw_count = 0;
 	RID _style_buffer;
 	RID _scene_buffer;
 	RID _visible_counter_buffer;

@@ -19,6 +19,8 @@
 #include "servers/rendering/storage/render_data.h"
 #include "servers/rendering/storage/render_scene_data.h"
 
+#include <algorithm>
+#include <cfloat>
 #include <cstring>
 
 namespace zylann::voxel {
@@ -42,15 +44,21 @@ layout(set = 0, binding = 0, std430) restrict readonly buffer Chunks {
 	Chunk chunks[];
 };
 
-// Non-indexed VkDrawIndirectCommand: vertex_count, instance_count, first_vertex, first_instance
+// VkDrawIndexedIndirectCommand, 5 words each: index_count, instance_count, first_index, vertex_offset, first_instance
 layout(set = 0, binding = 1, std430) restrict writeonly buffer Commands {
-	uvec4 commands[];
+	uint commands[];
 };
 
 // Chunks that survived culling, for statistics only
 layout(set = 0, binding = 2, std430) restrict buffer VisibleCounter {
 	uint visible_count;
 	uint visible_triangles;
+};
+
+// Chunk slots sorted near to far on the CPU each frame. Commands are written in this order so the draw goes front
+// to back and the depth test rejects hidden terrain before it is shaded.
+layout(set = 0, binding = 3, std430) restrict readonly buffer DrawOrder {
+	uint draw_order[];
 };
 
 layout(push_constant, std430) uniform Params {
@@ -69,7 +77,8 @@ void main() {
 	if (i >= params.chunk_count) {
 		return;
 	}
-	const Chunk c = chunks[i];
+	const uint ci = draw_order[i];
+	const Chunk c = chunks[ci];
 	bool visible = (c.info.w & 1u) != 0u && c.info.z > 0u;
 	if (visible) {
 		for (int pi = 0; pi < 6; ++pi) {
@@ -98,9 +107,15 @@ void main() {
 		}
 		visible = !all_hidden;
 	}
-	// Indices are pulled in the vertex shader, so the draw is non-indexed over the chunk's index range,
-	// and first_instance carries the chunk index to gl_InstanceIndex.
-	commands[i] = uvec4(c.info.z, visible ? 1u : 0u, c.info.y, i);
+	// Indexed, so the post-transform cache reuses shared vertices: pulling indices in the vertex shader ran it three
+	// times per triangle. vertex_offset makes gl_VertexIndex absolute in the vertex pool, and first_instance carries
+	// the chunk index to gl_InstanceIndex.
+	const uint o = i * 5u;
+	commands[o] = c.info.z;
+	commands[o + 1u] = visible ? 1u : 0u;
+	commands[o + 2u] = c.info.y;
+	commands[o + 3u] = c.info.x;
+	commands[o + 4u] = ci;
 	if (visible) {
 		atomicAdd(visible_count, 1u);
 		atomicAdd(visible_triangles, c.info.z / 3u);
@@ -178,10 +193,6 @@ const char *VERTEX_SHADER_GLSL = R"(
 layout(set = 0, binding = 0, std430) restrict readonly buffer Vertices {
 	uint vertex_words[];
 };
-// Two 16-bit indices per word, or one 32-bit index per word for chunks flagged wide
-layout(set = 0, binding = 1, std430) restrict readonly buffer Indices {
-	uint index_words[];
-};
 layout(set = 0, binding = 2, std430) restrict readonly buffer Chunks {
 	Chunk chunks[];
 };
@@ -197,7 +208,6 @@ layout(location = 7) flat out uint v_dominant_material; // for palette snapping
 
 // Keep in sync with gpu_driven::PackedVertex
 const uint VERTEX_WORDS = 8u;
-const uint CHUNK_FLAG_WIDE_INDICES = 2u;
 const uint CHUNK_FLAG_FAR = 4u;
 
 vec3 read_vec3(uint i) {
@@ -214,14 +224,8 @@ vec3 decode_oct(vec2 o) {
 
 void main() {
 	const Chunk c = chunks[gl_InstanceIndex];
-	const uint vi = uint(gl_VertexIndex);
-	uint local_index;
-	if ((c.info.w & CHUNK_FLAG_WIDE_INDICES) != 0u) {
-		local_index = index_words[vi];
-	} else {
-		local_index = (index_words[vi >> 1u] >> ((vi & 1u) * 16u)) & 0xffffu;
-	}
-	const uint base = (c.info.x + local_index) * VERTEX_WORDS;
+	// Indexed draw with vertex_offset = the chunk's first vertex, so this is already the absolute vertex
+	const uint base = uint(gl_VertexIndex) * VERTEX_WORDS;
 
 	// Bits 0-5 cell border mask, 6-11 vertex border mask, 12-17 transition sides, 18-31 normal
 	const uint normal_flags = vertex_words[base + 3u];
@@ -628,11 +632,12 @@ constexpr float HORIZON_OCCLUDER_RATIO = 0.9f;
 
 constexpr uint32_t VERTEX_STRIDE = sizeof(gpu_driven::PackedVertex);
 constexpr uint32_t INITIAL_VERTEX_CAPACITY = 256 * 1024;
-// In words (two 16-bit indices each)
+// 32-bit indices
 constexpr uint32_t INITIAL_INDEX_CAPACITY = 1024 * 1024;
-// Chunk.info.w: bit 0 visible, bit 1 wide (32-bit) indices, bit 2 far-field sector, bits 8-15 transition mask
-constexpr uint32_t CHUNK_FLAG_WIDE_INDICES = 2;
+// Chunk.info.w: bit 0 visible, bit 2 far-field sector, bits 8-15 transition mask
 constexpr uint32_t CHUNK_FLAG_FAR = 4;
+// VkDrawIndexedIndirectCommand
+constexpr uint32_t INDIRECT_COMMAND_SIZE = 20;
 constexpr uint32_t INITIAL_CHUNK_CAPACITY = 1024;
 // Used when the scene has no directional light
 const Vector3 FALLBACK_SUN_DIRECTION = Vector3(0.3, 1.0, 0.2).normalized();
@@ -795,9 +800,11 @@ void VoxelGpuDrivenRenderer::_render_thread_free() {
 		free_rid_if_valid(*rd, _render_shader);
 		free_rid_if_valid(*rd, _cull_shader);
 		free_rid_if_valid(*rd, _vertex_buffer);
+		free_rid_if_valid(*rd, _index_array);
 		free_rid_if_valid(*rd, _index_buffer);
 		free_rid_if_valid(*rd, _chunk_buffer);
 		free_rid_if_valid(*rd, _indirect_buffer);
+		free_rid_if_valid(*rd, _order_buffer);
 		free_rid_if_valid(*rd, _style_buffer);
 		free_rid_if_valid(*rd, _scene_buffer);
 		free_rid_if_valid(*rd, _visible_counter_buffer);
@@ -998,7 +1005,7 @@ bool VoxelGpuDrivenRenderer::_ensure_initialized() {
 	_vertex_allocator.grow(INITIAL_VERTEX_CAPACITY);
 	_index_allocator.grow(INITIAL_INDEX_CAPACITY);
 	_vertex_buffer = rd->storage_buffer_create(INITIAL_VERTEX_CAPACITY * VERTEX_STRIDE);
-	_index_buffer = rd->storage_buffer_create(INITIAL_INDEX_CAPACITY * 4);
+	_grow_index_buffer(0, INITIAL_INDEX_CAPACITY);
 	_style_buffer = rd->uniform_buffer_create(sizeof(StyleUBO));
 	_scene_buffer = rd->uniform_buffer_create(sizeof(SceneUBO));
 	_visible_counter_buffer = rd->storage_buffer_create(2 * sizeof(uint32_t));
@@ -1032,6 +1039,27 @@ bool VoxelGpuDrivenRenderer::_grow_buffer(RID &buffer, uint32_t old_size, uint32
 	return true;
 }
 
+// The index pool is a real index buffer (drawn indexed), so it grows through its own create call
+bool VoxelGpuDrivenRenderer::_grow_index_buffer(uint32_t old_count, uint32_t new_count) {
+	RenderingDevice &rd = *RenderingServer::get_singleton()->get_rendering_device();
+	const RID new_buffer = rd.index_buffer_create(new_count, RenderingDevice::INDEX_BUFFER_FORMAT_UINT32);
+	ERR_FAIL_COND_V_MSG(new_buffer.is_null(), false,
+			vformat("VoxelGpuDrivenRenderer: failed to allocate a %d index buffer", new_count));
+	if (_index_array.is_valid()) {
+		rd.free_rid(_index_array);
+	}
+	if (_index_buffer.is_valid()) {
+		if (old_count > 0) {
+			rd.buffer_copy(_index_buffer, new_buffer, 0, 0, old_count * 4);
+		}
+		rd.free_rid(_index_buffer);
+	}
+	_index_buffer = new_buffer;
+	// Chunks address it with first_index, so one array over the whole buffer
+	_index_array = rd.index_array_create(_index_buffer, 0, new_count);
+	return _index_array.is_valid();
+}
+
 void VoxelGpuDrivenRenderer::_ensure_chunk_capacity(uint32_t id) {
 	if (id < _chunk_capacity) {
 		return;
@@ -1042,7 +1070,9 @@ void VoxelGpuDrivenRenderer::_ensure_chunk_capacity(uint32_t id) {
 	}
 	_grow_buffer(_chunk_buffer, _chunk_capacity * sizeof(ChunkGPU), new_capacity * sizeof(ChunkGPU), false);
 	// The indirect buffer is fully rewritten by the cull pass every frame, no need to copy it
-	_grow_buffer(_indirect_buffer, 0, new_capacity * 16, true);
+	_grow_buffer(_indirect_buffer, 0, new_capacity * INDIRECT_COMMAND_SIZE, true);
+	// Rewritten every frame too
+	_grow_buffer(_order_buffer, 0, new_capacity * sizeof(uint32_t), false);
 
 	_chunks.resize(new_capacity);
 	ChunkGPU zero;
@@ -1091,8 +1121,18 @@ void VoxelGpuDrivenRenderer::_apply_set_mesh(Op &op) {
 	}
 
 	const uint32_t vcount = static_cast<uint32_t>(mesh.vertices.size());
-	// The index pool is allocated in words: two 16-bit indices each, or one 32-bit index for wide chunks
-	const uint32_t icount = static_cast<uint32_t>(mesh.index_words.size());
+	// The pool holds 32-bit indices: one index buffer format for every chunk, so they can all be drawn from it.
+	// Chunks packed with 16-bit pairs are widened here.
+	const uint32_t icount = mesh.index_count;
+	thread_local std::vector<uint32_t> wide;
+	const uint32_t *indices = mesh.index_words.data();
+	if (!mesh.wide_indices) {
+		wide.resize(icount);
+		for (uint32_t i = 0; i < icount; ++i) {
+			wide[i] = (mesh.index_words[i >> 1] >> ((i & 1) * 16)) & 0xffff;
+		}
+		indices = wide.data();
+	}
 
 	uint32_t voffset = _vertex_allocator.allocate(vcount);
 	if (voffset == gpu_driven::RangeAllocator::INVALID) {
@@ -1108,7 +1148,7 @@ void VoxelGpuDrivenRenderer::_apply_set_mesh(Op &op) {
 	if (ioffset == gpu_driven::RangeAllocator::INVALID) {
 		const uint32_t old_cap = _index_allocator.get_capacity();
 		const uint32_t new_cap = MAX(old_cap * 2, old_cap + icount);
-		if (!_grow_buffer(_index_buffer, old_cap * 4, new_cap * 4, false)) {
+		if (!_grow_index_buffer(old_cap, new_cap)) {
 			_vertex_allocator.free(voffset, vcount);
 			return;
 		}
@@ -1117,7 +1157,7 @@ void VoxelGpuDrivenRenderer::_apply_set_mesh(Op &op) {
 	}
 
 	rd.buffer_update(_vertex_buffer, voffset * VERTEX_STRIDE, vcount * VERTEX_STRIDE, mesh.vertices.data());
-	rd.buffer_update(_index_buffer, ioffset * 4, icount * 4, mesh.index_words.data());
+	rd.buffer_update(_index_buffer, ioffset * 4, icount * 4, indices);
 
 	ChunkRecord &r = _chunks[op.id];
 	r.vertex_offset = voffset;
@@ -1130,11 +1170,10 @@ void VoxelGpuDrivenRenderer::_apply_set_mesh(Op &op) {
 		g.aabb_min[i] = g.origin[i] + MIN(mesh.aabb_min[i], 0.f);
 		g.aabb_max[i] = g.origin[i] + MAX(mesh.aabb_max[i], 0.f);
 	}
+	// The draw's vertex_offset, first_index and index_count
 	g.info[0] = voffset;
-	// The draw's first_vertex, in index units: gl_VertexIndex addresses indices, not words
-	g.info[1] = mesh.wide_indices ? ioffset : ioffset * 2;
-	g.info[2] = mesh.index_count;
-	g.info[3] = (g.info[3] & ~CHUNK_FLAG_WIDE_INDICES) | (mesh.wide_indices ? CHUNK_FLAG_WIDE_INDICES : 0u);
+	g.info[1] = ioffset;
+	g.info[2] = icount;
 
 	MutexLock lock(_mutex);
 	_stats.uploaded_bytes_total += uint64_t(vcount) * VERTEX_STRIDE + uint64_t(icount) * 4;
@@ -1204,7 +1243,6 @@ bool VoxelGpuDrivenRenderer::_ensure_uniform_sets() {
 	if (_render_uniform_set.is_null() || !rd.uniform_set_is_valid(_render_uniform_set)) {
 		Vector<RenderingDevice::Uniform> uniforms;
 		uniforms.push_back(make_storage_uniform(0, _vertex_buffer));
-		uniforms.push_back(make_storage_uniform(1, _index_buffer));
 		uniforms.push_back(make_storage_uniform(2, _chunk_buffer));
 		RenderingDevice::Uniform style_uniform;
 		style_uniform.uniform_type = RenderingDevice::UNIFORM_TYPE_UNIFORM_BUFFER;
@@ -1223,14 +1261,15 @@ bool VoxelGpuDrivenRenderer::_ensure_uniform_sets() {
 		uniforms.push_back(make_storage_uniform(0, _chunk_buffer));
 		uniforms.push_back(make_storage_uniform(1, _indirect_buffer));
 		uniforms.push_back(make_storage_uniform(2, _visible_counter_buffer));
+		uniforms.push_back(make_storage_uniform(3, _order_buffer));
 		_cull_uniform_set = rd.uniform_set_create(uniforms, _cull_shader, 0);
 	}
 	return _render_uniform_set.is_valid() && _cull_uniform_set.is_valid();
 }
 
 // ponytail: single pass, no depth prepass. A prepass (depth-only, then EQUAL) was measured slower on the planet vista
-// (GPU 4.47 ms vs 4.32 ms, GTX 750 Ti): vertex pulling twice costs more than the overdraw it saves. Revisit with
-// front-to-back chunk ordering if fragment cost grows.
+// (GPU 4.47 ms vs 4.32 ms, GTX 750 Ti): vertex pulling twice costs more than the overdraw it saves. Measured again
+// with front-to-back ordering and indexed draws, 1080p surface view: 4.3 ms without it, 4.9 ms with it.
 RID VoxelGpuDrivenRenderer::_get_render_pipeline(int64_t framebuffer_format, int samples) {
 	if (RID *existing = _render_pipelines.getptr(framebuffer_format)) {
 		return *existing;
@@ -1488,14 +1527,75 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 		pc.horizon[1] = cam_local.y;
 		pc.horizon[2] = cam_local.z;
 		pc.horizon[3] = style.planet_radius > 0.f ? style.planet_radius * HORIZON_OCCLUDER_RATIO : 0.f;
-		pc.chunk_count = _chunk_high_water;
+
+		// Only chunks that pass the same frustum and horizon tests as the cull shader are listed, sorted front to
+		// back, and the indirect draw is issued for exactly those. Front to back: hills behind hills were fully
+		// shaded, then overwritten (~4 ms at a grazing 1080p surface view). Listing only visible chunks: every slot
+		// used to get a command, and on a GTX 750 Ti each indirect command costs front-end time even when empty.
+		// ponytail: full sort every frame, ~4k slots at most (~0.1 ms); sort incrementally if chunk counts grow.
+		const float occluder = pc.horizon[3];
+		const float vh = cam_local.length_squared() - occluder * occluder;
+		_order_keys.clear();
+		for (uint32_t i = 0; i < _chunk_high_water; ++i) {
+			const ChunkGPU &g = _chunks_gpu[i];
+			if (g.info[2] == 0 || (g.info[3] & 1u) == 0) {
+				continue;
+			}
+			bool visible = true;
+			for (int p = 0; p < 6 && visible; ++p) {
+				const float *pl = pc.planes[p];
+				// Corner furthest along the plane normal
+				const float x = pl[0] > 0.f ? g.aabb_max[0] : g.aabb_min[0];
+				const float y = pl[1] > 0.f ? g.aabb_max[1] : g.aabb_min[1];
+				const float z = pl[2] > 0.f ? g.aabb_max[2] : g.aabb_min[2];
+				visible = pl[0] * x + pl[1] * y + pl[2] * z + pl[3] >= 0.f;
+			}
+			if (visible && occluder > 0.f && vh > 0.f) {
+				bool all_hidden = true;
+				for (int k = 0; k < 8 && all_hidden; ++k) {
+					const Vector3 corner((k & 1) ? g.aabb_max[0] : g.aabb_min[0], (k & 2) ? g.aabb_max[1] : g.aabb_min[1],
+							(k & 4) ? g.aabb_max[2] : g.aabb_min[2]);
+					const Vector3 to_corner = corner - cam_local;
+					const float along = -to_corner.dot(cam_local);
+					all_hidden = along > vh && along * along > vh * to_corner.length_squared();
+				}
+				visible = !all_hidden;
+			}
+			if (!visible) {
+				continue;
+			}
+			float d2 = 0.f;
+			for (int k = 0; k < 3; ++k) {
+				const float c = cam_local[k];
+				const float d = c < g.aabb_min[k] ? g.aabb_min[k] - c : (c > g.aabb_max[k] ? c - g.aabb_max[k] : 0.f);
+				d2 += d * d;
+			}
+			_order_keys.push_back({ d2, i });
+		}
+		std::sort(_order_keys.begin(), _order_keys.end());
+		_draw_count = static_cast<uint32_t>(_order_keys.size());
+		_order.resize(_draw_count);
+		for (uint32_t i = 0; i < _draw_count; ++i) {
+			_order[i] = _order_keys[i].second;
+		}
+		if (_draw_count > 0) {
+			rd.buffer_update(_order_buffer, 0, _draw_count * sizeof(uint32_t), _order.data());
+		}
+		pc.chunk_count = _draw_count;
 		pc.pad[0] = pc.pad[1] = pc.pad[2] = 0;
 
+		if (_draw_count == 0) {
+			// Nothing in view, and no cull pass to count it
+			MutexLock lock(_mutex);
+			_stats.visible_chunks = 0;
+			_stats.visible_triangles = 0;
+			return;
+		}
 		RenderingDevice::ComputeListID cl = rd.compute_list_begin();
 		rd.compute_list_bind_compute_pipeline(cl, _cull_pipeline);
 		rd.compute_list_bind_uniform_set(cl, _cull_uniform_set, 0);
 		rd.compute_list_set_push_constant(cl, &pc, sizeof(pc));
-		rd.compute_list_dispatch(cl, (_chunk_high_water + 63) / 64, 1, 1);
+		rd.compute_list_dispatch(cl, (_draw_count + 63) / 64, 1, 1);
 		rd.compute_list_end();
 	}
 
@@ -1581,7 +1681,8 @@ void VoxelGpuDrivenRenderer::_render_callback(int p_callback_type, RenderData *p
 	rd.draw_list_bind_uniform_set(dl, _render_uniform_set, 0);
 	rd.draw_list_bind_uniform_set(dl, radiance_set, 1);
 	rd.draw_list_set_push_constant(dl, &pc, sizeof(pc));
-	rd.draw_list_draw_indirect(dl, false, _indirect_buffer, 0, _chunk_high_water, 16);
+	rd.draw_list_bind_index_array(dl, _index_array);
+	rd.draw_list_draw_indirect(dl, true, _indirect_buffer, 0, _draw_count, INDIRECT_COMMAND_SIZE);
 	rd.draw_list_end();
 
 	{

@@ -50,7 +50,7 @@ Type                                                                            
 [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)          | [run_stream_in_editor](#i_run_stream_in_editor)                                                    | true                                                                         
 [float](https://docs.godotengine.org/en/stable/classes/class_float.html)        | [secondary_lod_distance](#i_secondary_lod_distance)                                                | 48.0                                                                         
 [StreamingSystem](VoxelLodTerrain.md#enumerations)                              | [streaming_system](#i_streaming_system)                                                            | STREAMING_SYSTEM_LEGACY_OCTREE (0)                                           
-[bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)          | [threaded_update_enabled](#i_threaded_update_enabled)                                              | false                                                                        
+[bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)          | [threaded_update_enabled](#i_threaded_update_enabled)                                              | true                                                                         
 [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)          | [use_gpu_generation](#i_use_gpu_generation)                                                        | false                                                                        
 [int](https://docs.godotengine.org/en/stable/classes/class_int.html)            | [view_distance](#i_view_distance)                                                                  | 512                                                                          
 [AABB](https://docs.godotengine.org/en/stable/classes/class_aabb.html)          | [voxel_bounds](#i_voxel_bounds)                                                                    | AABB(-536870900, -536870900, -536870900, 1073741800, 1073741800, 1073741800) 
@@ -290,7 +290,7 @@ To control LOD 0, see [lod_distance](VoxelLodTerrain.md#i_lod_distance).
 
 Selects the underlying algorithm used to determine when to load and unload chunks around viewers as they move around.
 
-### [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)<span id="i_threaded_update_enabled"></span> **threaded_update_enabled** = false
+### [bool](https://docs.godotengine.org/en/stable/classes/class_bool.html)<span id="i_threaded_update_enabled"></span> **threaded_update_enabled** = true
 
 When enabled, this node will run a large part of its update cycle in a separate thread. Otherwise, it will run on the main thread.
 

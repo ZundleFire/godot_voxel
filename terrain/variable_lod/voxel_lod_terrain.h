@@ -521,7 +521,8 @@ private:
 	Ref<VoxelMesher> _mesher;
 
 	// Data stored with a shared pointer so it can be sent to asynchronous tasks
-	bool _threaded_update_enabled = false;
+	// On by default: on the main thread this update cost 20-30 ms per frame while the camera moved on a 40 km planet
+	bool _threaded_update_enabled = true;
 
 	// Reentrancy guard for `refresh_material_from_graph_generator()`. That function may call
 	// `VoxelGeneratorGraph::compile()`, which emits the generator's `changed` signal on success.
