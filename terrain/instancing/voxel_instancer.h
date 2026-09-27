@@ -385,6 +385,9 @@ private:
 	);
 
 	Dictionary _b_debug_get_instance_counts() const;
+	// Debug: per block of a layer, {position: block origin (world), mesh_lod: its current mesh LOD, instances:
+	// PackedVector3Array world positions of its drawn instances, bodies: its collider count}
+	Array debug_get_layer_blocks(int p_item_id);
 
 	static void _bind_methods();
 

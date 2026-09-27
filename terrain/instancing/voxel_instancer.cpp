@@ -3097,6 +3097,32 @@ Dictionary VoxelInstancer::_b_debug_get_instance_counts() const {
 	return d;
 }
 
+Array VoxelInstancer::debug_get_layer_blocks(int p_item_id) {
+	Array out;
+	const Transform3D parent_transform = get_global_transform();
+	const int mesh_block_size = 1 << _parent_mesh_block_size_po2;
+	for (const UniquePtr<Block> &bp : _blocks) {
+		const Block &block = *bp;
+		if (block.layer_id != p_item_id || !block.multimesh_instance.is_valid()) {
+			continue;
+		}
+		const Vector3 origin(block.grid_position * (mesh_block_size << block.lod_index));
+		StdVector<Transform3f> transforms;
+		get_instance_transforms_local(block, transforms);
+		PackedVector3Array positions;
+		for (const Transform3f &t : transforms) {
+			positions.push_back(parent_transform.xform(origin + to_transform3(t).origin));
+		}
+		Dictionary d;
+		d["position"] = parent_transform.xform(origin);
+		d["mesh_lod"] = block.current_mesh_lod;
+		d["instances"] = positions;
+		d["bodies"] = int(block.bodies.size());
+		out.push_back(d);
+	}
+	return out;
+}
+
 void VoxelInstancer::debug_dump_as_scene(String fpath) const {
 	Node *root = debug_dump_as_nodes();
 	ERR_FAIL_COND(root == nullptr);
@@ -3401,6 +3427,7 @@ void VoxelInstancer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("debug_get_block_count"), &VoxelInstancer::debug_get_block_count);
 	ClassDB::bind_method(D_METHOD("debug_get_instance_counts"), &VoxelInstancer::_b_debug_get_instance_counts);
 	ClassDB::bind_method(D_METHOD("debug_dump_as_scene", "fpath"), &VoxelInstancer::debug_dump_as_scene);
+	ClassDB::bind_method(D_METHOD("debug_get_layer_blocks", "item_id"), &VoxelInstancer::debug_get_layer_blocks);
 	ClassDB::bind_method(D_METHOD("debug_set_draw_enabled", "enabled"), &VoxelInstancer::debug_set_draw_enabled);
 	ClassDB::bind_method(D_METHOD("debug_is_draw_enabled"), &VoxelInstancer::debug_is_draw_enabled);
 	ClassDB::bind_method(D_METHOD("debug_set_draw_flag", "flag", "enabled"), &VoxelInstancer::debug_set_draw_flag);
