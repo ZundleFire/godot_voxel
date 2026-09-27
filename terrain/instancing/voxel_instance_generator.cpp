@@ -344,7 +344,8 @@ void filter_instances_by_voxel_materials(
 
 		case VoxelInstanceGenerator::EMIT_FROM_FACES:
 		case VoxelInstanceGenerator::EMIT_FROM_FACES_FAST:
-		case VoxelInstanceGenerator::EMIT_ONE_PER_TRIANGLE: {
+		case VoxelInstanceGenerator::EMIT_ONE_PER_TRIANGLE:
+		case VoxelInstanceGenerator::EMIT_FROM_SITES: {
 #ifdef DEV_ENABLED
 			ZN_ASSERT(instance_barycentrics.size() / 3 == instance_positions.size());
 #endif
@@ -577,6 +578,292 @@ void generate_random_points_from_triangles(
 		}
 
 		area_accumulator -= count_in_triangle * inv_density;
+	}
+}
+
+// Site grids (EMIT_FROM_SITES). On a sphere: an equal-angle cube map, `n` cells across each face; flat: XZ cells.
+struct SiteGrid {
+	float spacing = 4.f;
+	float radius = 0.f; // 0 = flat
+	uint32_t seed = 0;
+	float jitter = 0.35f;
+	Vector2 range;
+
+	int cells_per_face() const {
+		return math::max(1, int(Math::ceil(radius * float(Math::PI) * 0.5f / math::max(spacing, 0.01f))));
+	}
+};
+
+inline uint32_t site_mix(uint32_t x) {
+	x ^= x >> 16;
+	x *= 0x7feb352du;
+	x ^= x >> 15;
+	x *= 0x846ca68bu;
+	x ^= x >> 16;
+	return x;
+}
+
+inline uint32_t site_hash(int face, int i, int j, uint32_t seed) {
+	return site_mix(uint32_t(face) * 0x9E3779B1u ^ site_mix(uint32_t(i) * 0x85EBCA77u ^ site_mix(uint32_t(j) * 0xC2B2AE3Du ^ seed)));
+}
+
+inline float site_unit(uint32_t h) {
+	return float(h >> 8) * (1.f / 16777216.f);
+}
+
+// Coordinates of a direction on cube face `face` (0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z) in [-1, 1], equal-angle.
+// False when the direction doesn't point into that face's half-space.
+inline bool site_face_coords(const Vector3f d, int face, float &a, float &b) {
+	const int axis = face / 2;
+	const float m = (face % 2 == 0 ? 1.f : -1.f) * d[axis];
+	if (m <= 1e-4f) {
+		return false;
+	}
+	const float u = axis == 0 ? d.y : d.x;
+	const float v = axis == 2 ? d.y : d.z;
+	a = Math::atan(u / m) * float(4.0 / Math::PI);
+	b = Math::atan(v / m) * float(4.0 / Math::PI);
+	return true;
+}
+
+inline int site_face_of(const Vector3f d) {
+	const Vector3f ad(Math::abs(d.x), Math::abs(d.y), Math::abs(d.z));
+	if (ad.x >= ad.y && ad.x >= ad.z) {
+		return d.x > 0.f ? 0 : 1;
+	}
+	if (ad.y >= ad.z) {
+		return d.y > 0.f ? 2 : 3;
+	}
+	return d.z > 0.f ? 4 : 5;
+}
+
+inline Vector3f site_face_dir(int face, float a, float b) {
+	const float u = Math::tan(a * float(Math::PI) * 0.25f);
+	const float v = Math::tan(b * float(Math::PI) * 0.25f);
+	const float s = face % 2 == 0 ? 1.f : -1.f;
+	Vector3f d;
+	switch (face / 2) {
+		case 0:
+			d = Vector3f(s, u, v);
+			break;
+		case 1:
+			d = Vector3f(u, s, v);
+			break;
+		default:
+			d = Vector3f(u, v, s);
+			break;
+	}
+	return math::normalized(d);
+}
+
+// A cell's site: its owner value (0..1), and its point (sphere: a unit direction; flat: x, z in .x, .z)
+inline float site_of(const SiteGrid &g, int face, int i, int j, Vector3f &r_point) {
+	const uint32_t h = site_hash(face, i, j, g.seed);
+	const float jx = (site_unit(site_mix(h ^ 0x68E31DA4u)) - 0.5f) * 2.f * g.jitter;
+	const float jy = (site_unit(site_mix(h ^ 0xB5297A4Du)) - 0.5f) * 2.f * g.jitter;
+	if (g.radius > 0.f) {
+		const int n = g.cells_per_face();
+		r_point = site_face_dir(face, (float(i) + 0.5f + jx) / n * 2.f - 1.f, (float(j) + 0.5f + jy) / n * 2.f - 1.f);
+	} else {
+		r_point = Vector3f((float(i) + 0.5f + jx) * g.spacing, 0.f, (float(j) + 0.5f + jy) * g.spacing);
+	}
+	return site_unit(h);
+}
+
+inline bool site_owned(float owner, Vector2 range) {
+	return owner >= range.x && owner < range.y;
+}
+
+// A point (terrain space) near a claimed cell of grid `g` (within `radius` metres)
+bool site_excluded(const SiteGrid &g, const Vector3f p, float radius) {
+	if (g.radius > 0.f) {
+		const Vector3f d = math::normalized(p);
+		const int face = site_face_of(d);
+		float a, b;
+		if (!site_face_coords(d, face, a, b)) {
+			return false;
+		}
+		const int n = g.cells_per_face();
+		const int i0 = int(Math::floor((a + 1.f) * 0.5f * n));
+		const int j0 = int(Math::floor((b + 1.f) * 0.5f * n));
+		for (int j = j0 - 1; j <= j0 + 1; ++j) {
+			for (int i = i0 - 1; i <= i0 + 1; ++i) {
+				if (i < 0 || j < 0 || i >= n || j >= n) {
+					continue;
+				}
+				Vector3f s;
+				if (site_owned(site_of(g, face, i, j, s), g.range) && math::distance(s, d) * g.radius < radius) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	const int i0 = int(Math::floor(p.x / g.spacing));
+	const int j0 = int(Math::floor(p.z / g.spacing));
+	for (int j = j0 - 1; j <= j0 + 1; ++j) {
+		for (int i = i0 - 1; i <= i0 + 1; ++i) {
+			Vector3f s;
+			if (site_owned(site_of(g, 0, i, j, s), g.range) && Math::sqrt(math::squared(s.x - p.x) + math::squared(s.z - p.z)) < radius) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Places instances at the owned sites of `grid` that fall on the mesh: each site's ray from the terrain's origin
+// (sphere) or vertical line (flat) is intersected with the triangles
+void generate_points_at_sites(
+		Span<const Vector3> mesh_vertices,
+		Span<const Vector3> mesh_normals,
+		Span<const int32_t> mesh_indices,
+		const Vector3f block_origin,
+		const SiteGrid &grid,
+		const SiteGrid *exclusion,
+		const float exclusion_radius,
+		StdVector<Vector3f> &out_positions,
+		StdVector<Vector3f> &out_normals,
+		StdVector<uint32_t> *out_indices,
+		StdVector<float> *out_barycentrics
+) {
+	static thread_local StdVector<uint64_t> tls_emitted;
+	tls_emitted.clear();
+	const bool sphere = grid.radius > 0.f;
+	const int n = sphere ? grid.cells_per_face() : 0;
+	const int triangle_count = mesh_indices.size() / 3;
+
+	for (int triangle_index = 0; triangle_index < triangle_count; ++triangle_index) {
+		const uint32_t ii = triangle_index * 3;
+		const int ia = mesh_indices[ii];
+		const int ib = mesh_indices[ii + 1];
+		const int ic = mesh_indices[ii + 2];
+		const Vector3f pa = block_origin + to_vec3f(mesh_vertices[ia]);
+		const Vector3f pb = block_origin + to_vec3f(mesh_vertices[ib]);
+		const Vector3f pc = block_origin + to_vec3f(mesh_vertices[ic]);
+		const Vector3f tn = math::cross(pb - pa, pc - pa);
+		if (math::length_squared(tn) < 1e-12f) {
+			continue;
+		}
+		const Vector3f corners[3] = { pa, pb, pc };
+
+		int faces[3];
+		int face_count = 1;
+		if (sphere) {
+			faces[0] = site_face_of(math::normalized(pa));
+			for (int k = 1; k < 3; ++k) {
+				const int f = site_face_of(math::normalized(corners[k]));
+				bool seen = false;
+				for (int m = 0; m < face_count; ++m) {
+					seen = seen || faces[m] == f;
+				}
+				if (!seen) {
+					faces[face_count++] = f;
+				}
+			}
+		} else {
+			faces[0] = 0;
+		}
+
+		for (int fi = 0; fi < face_count; ++fi) {
+			const int face = faces[fi];
+			// Cells the triangle's projection covers
+			float amin = 1e9f, amax = -1e9f, bmin = 1e9f, bmax = -1e9f;
+			bool ok = true;
+			for (int k = 0; k < 3 && ok; ++k) {
+				float a, b;
+				if (sphere) {
+					ok = site_face_coords(math::normalized(corners[k]), face, a, b);
+					a = (a + 1.f) * 0.5f * n;
+					b = (b + 1.f) * 0.5f * n;
+				} else {
+					a = corners[k].x / grid.spacing;
+					b = corners[k].z / grid.spacing;
+				}
+				amin = math::min(amin, a);
+				amax = math::max(amax, a);
+				bmin = math::min(bmin, b);
+				bmax = math::max(bmax, b);
+			}
+			if (!ok) {
+				continue;
+			}
+			// One cell of slack each way: jitter moves sites across cell borders
+			int i0 = int(Math::floor(amin)) - 1, i1 = int(Math::floor(amax)) + 1;
+			int j0 = int(Math::floor(bmin)) - 1, j1 = int(Math::floor(bmax)) + 1;
+			if (sphere) {
+				i0 = math::max(i0, 0);
+				j0 = math::max(j0, 0);
+				i1 = math::min(i1, n - 1);
+				j1 = math::min(j1, n - 1);
+			}
+			for (int j = j0; j <= j1; ++j) {
+				for (int i = i0; i <= i1; ++i) {
+					Vector3f s;
+					if (!site_owned(site_of(grid, face, i, j, s), grid.range)) {
+						continue;
+					}
+					// Where the site meets this triangle's plane
+					Vector3f p;
+					if (sphere) {
+						const float denom = math::dot(tn, s);
+						if (Math::abs(denom) < 1e-12f) {
+							continue;
+						}
+						const float t = math::dot(tn, pa) / denom;
+						if (t <= 0.f) {
+							continue;
+						}
+						p = s * t;
+					} else {
+						if (Math::abs(tn.y) < 1e-9f) {
+							continue;
+						}
+						// Plane: dot(tn, p - pa) = 0, solved for y at (s.x, s.z)
+						const float y = pa.y - (tn.x * (s.x - pa.x) + tn.z * (s.z - pa.z)) / tn.y;
+						p = Vector3f(s.x, y, s.z);
+					}
+					// Inside the triangle?
+					const Vector3f v0 = pb - pa, v1 = pc - pa, v2 = p - pa;
+					const float d00 = math::dot(v0, v0), d01 = math::dot(v0, v1), d11 = math::dot(v1, v1);
+					const float d20 = math::dot(v2, v0), d21 = math::dot(v2, v1);
+					const float den = d00 * d11 - d01 * d01;
+					if (Math::abs(den) < 1e-12f) {
+						continue;
+					}
+					const float bv = (d11 * d20 - d01 * d21) / den;
+					const float bw = (d00 * d21 - d01 * d20) / den;
+					const float bu = 1.f - bv - bw;
+					if (bu < -1e-5f || bv < -1e-5f || bw < -1e-5f) {
+						continue;
+					}
+					const uint64_t key = (uint64_t(face) << 58) ^ (uint64_t(uint32_t(i)) << 29) ^ uint64_t(uint32_t(j));
+					bool dup = false;
+					for (const uint64_t e : tls_emitted) {
+						dup = dup || e == key;
+					}
+					if (dup) {
+						continue;
+					}
+					tls_emitted.push_back(key);
+					if (exclusion != nullptr && site_excluded(*exclusion, p, exclusion_radius)) {
+						continue;
+					}
+					const Vector3f bary(bu, bv, bw);
+					out_positions.push_back(p - block_origin);
+					out_normals.push_back(math::normalized(math::interpolate_triangle(
+							to_vec3f(mesh_normals[ia]), to_vec3f(mesh_normals[ib]), to_vec3f(mesh_normals[ic]), bary)));
+					if (out_indices != nullptr) {
+						out_indices->push_back(ii);
+					}
+					if (out_barycentrics != nullptr) {
+						out_barycentrics->push_back(bary.x);
+						out_barycentrics->push_back(bary.y);
+						out_barycentrics->push_back(bary.z);
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -1170,6 +1457,33 @@ void VoxelInstanceGenerator::generate_transforms(
 			);
 			break;
 
+		case EMIT_FROM_SITES: {
+			SiteGrid grid;
+			grid.spacing = _site_spacing;
+			grid.radius = up_mode == UP_MODE_SPHERE ? _site_planet_radius : 0.f;
+			grid.seed = uint32_t(_site_seed);
+			grid.jitter = _site_jitter;
+			grid.range = _site_owner_range;
+			SiteGrid exclusion = grid;
+			exclusion.spacing = _site_exclusion_spacing;
+			exclusion.seed = uint32_t(_site_exclusion_seed);
+			exclusion.range = _site_exclusion_range;
+			const Vector3f origin = to_vec3f(Vector3(grid_position)) * block_size;
+			generate_points_at_sites(
+					mesh.vertices,
+					mesh.normals,
+					mesh.indices,
+					origin,
+					grid,
+					_site_exclusion_spacing > 0.f ? &exclusion : nullptr,
+					_site_exclusion_radius,
+					vertex_cache,
+					normal_cache,
+					index_cache_used ? &index_cache : nullptr,
+					barycentrics_used ? &barycentrics : nullptr
+			);
+		} break;
+
 		case EMIT_ONE_PER_TRIANGLE:
 			// Density has no effect here.
 			generate_one_random_point_per_triangle(
@@ -1579,6 +1893,31 @@ void VoxelInstanceGenerator::set_emit_mode(EmitMode mode) {
 VoxelInstanceGenerator::EmitMode VoxelInstanceGenerator::get_emit_mode() const {
 	return _emit_mode;
 }
+
+#define SITE_PROP(type, name, clamp_expr)                                                                           \
+	void VoxelInstanceGenerator::set_##name(type p_value) {                                                        \
+		const type v = clamp_expr;                                                                                 \
+		if (v == _##name) {                                                                                        \
+			return;                                                                                                \
+		}                                                                                                          \
+		_##name = v;                                                                                               \
+		emit_changed();                                                                                            \
+	}                                                                                                              \
+	type VoxelInstanceGenerator::get_##name() const {                                                              \
+		return _##name;                                                                                            \
+	}
+
+SITE_PROP(float, site_spacing, math::max(p_value, 0.05f))
+SITE_PROP(Vector2, site_owner_range, Vector2(math::clamp(p_value.x, 0.f, 1.f), math::clamp(p_value.y, 0.f, 1.f)))
+SITE_PROP(int, site_seed, p_value)
+SITE_PROP(float, site_jitter, math::clamp(p_value, 0.f, 0.5f))
+SITE_PROP(float, site_planet_radius, math::max(p_value, 0.f))
+SITE_PROP(float, site_exclusion_spacing, math::max(p_value, 0.f))
+SITE_PROP(int, site_exclusion_seed, p_value)
+SITE_PROP(Vector2, site_exclusion_range, Vector2(math::clamp(p_value.x, 0.f, 1.f), math::clamp(p_value.y, 0.f, 1.f)))
+SITE_PROP(float, site_exclusion_radius, math::max(p_value, 0.f))
+
+#undef SITE_PROP
 
 void VoxelInstanceGenerator::set_jitter(const float p_jitter) {
 	const float jitter = math::clamp(p_jitter, 0.f, 1.f);
@@ -2275,7 +2614,7 @@ void VoxelInstanceGenerator::_bind_methods() {
 	ADD_GROUP("Emission", "");
 
 	ADD_PROPERTY(
-			PropertyInfo(Variant::INT, "emit_mode", PROPERTY_HINT_ENUM, "Vertices,FacesFast,Faces,OnePerTriangle"),
+			PropertyInfo(Variant::INT, "emit_mode", PROPERTY_HINT_ENUM, "Vertices,FacesFast,Faces,OnePerTriangle,Sites"),
 			"set_emit_mode",
 			"get_emit_mode"
 	);
@@ -2295,6 +2634,22 @@ void VoxelInstanceGenerator::_bind_methods() {
 			"set_triangle_area_threshold",
 			"get_triangle_area_threshold"
 	);
+
+	ADD_GROUP("Sites", "site_");
+#define SITE_BIND(name, variant_type, hint, hint_string)                                                            \
+	ClassDB::bind_method(D_METHOD("set_" #name, "value"), &VoxelInstanceGenerator::set_##name);                     \
+	ClassDB::bind_method(D_METHOD("get_" #name), &VoxelInstanceGenerator::get_##name);                              \
+	ADD_PROPERTY(PropertyInfo(variant_type, #name, hint, hint_string), "set_" #name, "get_" #name);
+	SITE_BIND(site_spacing, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.05,100.0,0.01,or_greater,suffix:m")
+	SITE_BIND(site_owner_range, Variant::VECTOR2, PROPERTY_HINT_NONE, "")
+	SITE_BIND(site_seed, Variant::INT, PROPERTY_HINT_NONE, "")
+	SITE_BIND(site_jitter, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.0,0.5,0.01")
+	SITE_BIND(site_planet_radius, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.0,1000000.0,1.0,or_greater,suffix:m")
+	SITE_BIND(site_exclusion_spacing, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.0,100.0,0.01,or_greater,suffix:m")
+	SITE_BIND(site_exclusion_seed, Variant::INT, PROPERTY_HINT_NONE, "")
+	SITE_BIND(site_exclusion_range, Variant::VECTOR2, PROPERTY_HINT_NONE, "")
+	SITE_BIND(site_exclusion_radius, Variant::FLOAT, PROPERTY_HINT_RANGE, "0.0,100.0,0.01,or_greater,suffix:m")
+#undef SITE_BIND
 
 	ADD_GROUP("Scale", "");
 
@@ -2475,6 +2830,7 @@ void VoxelInstanceGenerator::_bind_methods() {
 	BIND_ENUM_CONSTANT(EMIT_FROM_FACES_FAST);
 	BIND_ENUM_CONSTANT(EMIT_FROM_FACES);
 	BIND_ENUM_CONSTANT(EMIT_ONE_PER_TRIANGLE);
+	BIND_ENUM_CONSTANT(EMIT_FROM_SITES);
 	BIND_ENUM_CONSTANT(EMIT_MODE_COUNT);
 
 	BIND_ENUM_CONSTANT(DISTRIBUTION_LINEAR);

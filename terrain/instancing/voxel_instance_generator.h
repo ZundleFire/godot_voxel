@@ -32,6 +32,13 @@ public:
 		// Slower, but tries to not assume the area of triangles.
 		EMIT_FROM_FACES,
 		EMIT_ONE_PER_TRIANGLE,
+		// At most one instance per cell of a jittered grid shared by every generator using the same spacing and seed,
+		// and only in the cells whose owner value falls in this generator's `site_owner_range`. Generators given
+		// disjoint ranges never place instances at the same spot, whatever LOD or order they generate in: for
+		// foliage that must not overlap (trees, rocks, bushes). Density has no effect: the range sets it (a range of
+		// width w gives w instances per cell). With a site_planet_radius the grid is laid on the sphere (equal-angle
+		// cube map, centred on the terrain's origin); with 0 it is a flat XZ grid.
+		EMIT_FROM_SITES,
 
 		EMIT_MODE_COUNT
 	};
@@ -77,6 +84,28 @@ public:
 
 	void set_emit_mode(EmitMode mode);
 	EmitMode get_emit_mode() const;
+
+	void set_site_spacing(float p_spacing);
+	float get_site_spacing() const;
+	void set_site_owner_range(Vector2 p_range);
+	Vector2 get_site_owner_range() const;
+	void set_site_seed(int p_seed);
+	int get_site_seed() const;
+	void set_site_jitter(float p_jitter);
+	float get_site_jitter() const;
+	void set_site_planet_radius(float p_radius);
+	float get_site_planet_radius() const;
+	// Keep away from another site grid's claimed cells (e.g. bushes from where trees and rocks may stand): sites
+	// within `site_exclusion_radius` of a cell of that grid (spacing, seed) whose owner value is in the range are
+	// dropped. Spacing 0 = off.
+	void set_site_exclusion_spacing(float p_spacing);
+	float get_site_exclusion_spacing() const;
+	void set_site_exclusion_seed(int p_seed);
+	int get_site_exclusion_seed() const;
+	void set_site_exclusion_range(Vector2 p_range);
+	Vector2 get_site_exclusion_range() const;
+	void set_site_exclusion_radius(float p_radius);
+	float get_site_exclusion_radius() const;
 
 	void set_jitter(const float p_jitter);
 	float get_jitter() const;
@@ -203,6 +232,15 @@ private:
 
 	float _density = 0.1f;
 	float _jitter = 1.f;
+	float _site_spacing = 4.f;
+	Vector2 _site_owner_range = Vector2(0.f, 1.f);
+	int _site_seed = 0;
+	float _site_jitter = 0.35f;
+	float _site_planet_radius = 0.f;
+	float _site_exclusion_spacing = 0.f;
+	int _site_exclusion_seed = 0;
+	Vector2 _site_exclusion_range = Vector2(0.f, 0.f);
+	float _site_exclusion_radius = 1.f;
 	float _triangle_area_threshold_lod0 = 0.f;
 	float _vertical_alignment = 1.f;
 	float _min_scale = 1.f;
